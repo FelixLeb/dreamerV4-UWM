@@ -344,6 +344,179 @@ def unified_flowmatching_sampler(
 
 
 @torch.no_grad()
+def unified_action_sampler(
+    denoiser,
+    ctx_latents,              # (B, T_ctx, N_lat, D_lat) — context obs latents
+    ctx_actions,              # (B, T_ctx, n_act) — only used to infer n_act and dtype/device
+    num_pred_steps=1,
+    num_diffusion_steps=4,    # power of two
+    ctx_obs_init_tau=0.5,     # tau for context obs at start (0=pure noise, 1=clean)
+    action_noise_std=1.0,
+):
+    """
+    Action-prediction Euler sampler.
+
+    Setup:
+      - context: obs AND actions both start at noise level `ctx_obs_init_tau`
+        (context actions are partially noised versions of `ctx_actions`) and
+        are denoised together on the context schedule.
+      - horizon: obs and actions both start as pure noise (tau = 0) and are
+        denoised together on the horizon schedule.
+      - The two regions have independent per-step tau and Euler step sizes,
+        so each reaches the clean signal in `num_diffusion_steps` steps from
+        its own starting noise level.
+
+    Returns
+    -------
+    pred_obs : (B, T_total, N_lat, D_lat) — full denoised obs (ctx + horizon)
+    pred_act : (B, T_total, n_act)         — full denoised actions
+    """
+    assert (num_diffusion_steps & (num_diffusion_steps - 1)) == 0, \
+        "num_diffusion_steps must be a power of two"
+    assert 0.0 <= ctx_obs_init_tau < 1.0, \
+        "ctx_obs_init_tau must be in [0, 1)"
+
+    device = ctx_latents.device
+    dtype  = ctx_latents.dtype
+    B, T_ctx, N_lat, D_lat = ctx_latents.shape
+    T_total = T_ctx + num_pred_steps
+    n_act = ctx_actions.shape[-1]
+    ctx_actions = ctx_actions.to(device=device, dtype=dtype)
+
+    num_noise_levels = denoiser.cfg.denoiser.num_noise_levels
+    step_index_tensor = torch.zeros((B, T_total), dtype=torch.long, device=device)
+
+    # ---- obs init ----
+    # horizon: pure noise (tau = 0)
+    z = torch.randn(B, T_total, N_lat, D_lat, device=device, dtype=dtype)
+    # context: partially noised clean latents at tau = ctx_obs_init_tau
+    # z_ctx = (1.0 - ctx_obs_init_tau) * torch.randn_like(ctx_latents) + ctx_obs_init_tau * ctx_latents
+    # z[:, :T_ctx] = z_ctx
+    z[:, :T_ctx] = ctx_latents
+
+    # ---- act init ----
+    # horizon: pure noise (tau = 0)
+    z_act = action_noise_std * torch.randn(B, T_total, n_act, device=device, dtype=dtype)
+    # context: partially noised clean actions at tau = ctx_obs_init_tau (same as ctx obs)
+    a_ctx = (1.0 - ctx_obs_init_tau) * action_noise_std * torch.randn_like(ctx_actions) + ctx_obs_init_tau * ctx_actions
+    z_act[:, :T_ctx] = a_ctx
+
+    # Per-region step sizes (each region traverses its own tau range in N steps)
+    horizon_step_size = 1.0 / num_diffusion_steps
+    ctx_step_size     = (1.0 - ctx_obs_init_tau) / num_diffusion_steps
+
+    for k in range(num_diffusion_steps):
+        # Per-region current tau (obs and actions share the same per-region schedule)
+        tau_horizon = k / num_diffusion_steps
+        tau_ctx     = ctx_obs_init_tau + (1.0 - ctx_obs_init_tau) * (k / num_diffusion_steps)
+
+        tau_horizon_idx = get_noise_index(tau_horizon, num_noise_levels)
+        tau_ctx_idx     = get_noise_index(tau_ctx,     num_noise_levels)
+
+        obs_sigma_idx = torch.full((B, T_total), tau_horizon_idx, dtype=torch.long, device=device)
+        obs_sigma_idx[:, :T_ctx] = tau_ctx_idx
+
+        act_sigma_idx = torch.full((B, T_total), tau_horizon_idx, dtype=torch.long, device=device)
+        act_sigma_idx[:, :T_ctx] = tau_ctx_idx
+
+        z_hat, act_hat = denoiser(
+            noisy_act    = z_act,
+            noisy_obs    = z,
+            obs_sigma_idx= obs_sigma_idx,
+            obs_step_idx = step_index_tensor,
+            act_sigma_idx= act_sigma_idx,
+            act_step_idx = step_index_tensor,
+        )
+        act_hat = act_hat.squeeze(-2)
+
+        # Independent Euler integration: context region (obs+act) and horizon region (obs+act)
+        denom_horizon = max(1.0 - tau_horizon, 1e-5)
+        denom_ctx     = max(1.0 - tau_ctx,     1e-5)
+
+        v_obs_horizon = (z_hat[:, T_ctx:] - z[:, T_ctx:]) / denom_horizon
+        v_obs_ctx     = (z_hat[:, :T_ctx] - z[:, :T_ctx]) / denom_ctx
+        v_act_horizon = (act_hat[:, T_ctx:] - z_act[:, T_ctx:]) / denom_horizon
+        v_act_ctx     = (act_hat[:, :T_ctx] - z_act[:, :T_ctx]) / denom_ctx
+
+        z    [:, T_ctx:] = z    [:, T_ctx:] + v_obs_horizon * horizon_step_size
+        z    [:, :T_ctx] = z    [:, :T_ctx] + v_obs_ctx     * ctx_step_size
+        z_act[:, T_ctx:] = z_act[:, T_ctx:] + v_act_horizon * horizon_step_size
+        z_act[:, :T_ctx] = z_act[:, :T_ctx] + v_act_ctx     * ctx_step_size
+
+    return z, z_act
+
+
+@torch.no_grad()
+def unified_video_sampler(
+    denoiser,
+    noisy_latents,             # (B, T_total, N_lat, D_lat) — unified noisy sequence (ctx + horizon)
+    current_tau,               # scalar in [0, 1): current noise level of noisy_latents
+    n_act,                     # action dimension
+    num_diffusion_steps=4,     # power of two; traverses (1 - current_tau) in this many Euler steps
+    action_noise_std=1.0,
+    use_shortcut=False,        # if True, use shortcut step_idx; else flowmatching (step_idx=0)
+):
+    """
+    Video-mode Euler sampler.
+
+    Treats the entire sequence (context + horizon) as one unified latent at a
+    single current noise level `current_tau`. Denoising is applied uniformly
+    to every frame — no context/horizon split, no partial conditioning.
+    Actions are pure noise for all frames throughout the trajectory, and the
+    action noise-level conditioning signal is set to "pure noise" (tau = 0).
+
+    Returns
+    -------
+    pred_latents : (B, T_total, N_lat, D_lat) — denoised video latents
+    """
+    assert (num_diffusion_steps & (num_diffusion_steps - 1)) == 0, \
+        "num_diffusion_steps must be a power of two"
+    assert 0.0 <= current_tau < 1.0, "current_tau must be in [0, 1)"
+
+    device = noisy_latents.device
+    dtype  = noisy_latents.dtype
+    B, T_total = noisy_latents.shape[:2]
+
+    num_noise_levels = denoiser.cfg.denoiser.num_noise_levels
+
+    step_size = (1.0 - current_tau) / num_diffusion_steps
+    if use_shortcut:
+        denoising_step_index = get_step_index(1.0 / num_diffusion_steps, num_noise_levels)
+    else:
+        denoising_step_index = 0
+    step_index_tensor = torch.full(
+        (B, T_total), denoising_step_index, dtype=torch.long, device=device
+    )
+
+    z = noisy_latents.clone().to(device=device, dtype=dtype)
+
+    # Actions: pure noise everywhere, with tau=0 conditioning signal
+    z_act = action_noise_std * torch.randn(B, T_total, n_act, device=device, dtype=dtype)
+    act_sigma_idx = torch.zeros((B, T_total), dtype=torch.long, device=device)
+
+    for k in range(num_diffusion_steps):
+        tau_k = current_tau + (1.0 - current_tau) * (k / num_diffusion_steps)
+        tau_k_idx = get_noise_index(tau_k, num_noise_levels)
+
+        obs_sigma_idx = torch.full((B, T_total), tau_k_idx, dtype=torch.long, device=device)
+
+        z_hat, _ = denoiser(
+            noisy_act    = z_act,
+            noisy_obs    = z,
+            obs_sigma_idx= obs_sigma_idx,
+            obs_step_idx = step_index_tensor,
+            act_sigma_idx= act_sigma_idx,
+            act_step_idx = step_index_tensor,
+        )
+
+        denom = max(1.0 - tau_k, 1e-5)
+        v_obs = (z_hat - z) / denom
+        z = z + v_obs * step_size
+
+    return z
+
+
+@torch.no_grad()
 def worldmodel_dynamics_flowmatching_no_cache(
     denoiser,
     ctx_latents,              # (B, T_ctx, N_lat, D_lat)  — context obs frames

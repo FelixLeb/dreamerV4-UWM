@@ -41,6 +41,7 @@ train:
   clip_grad_norm: 1.0
 
 wandb:
+  enable: true
   api_key: null
   project: "dreamer-v4-tokenizer"
   run_name: null
