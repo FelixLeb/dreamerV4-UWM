@@ -47,10 +47,21 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 # ---------------------------------------------------------------------------
 
 def build_dataloader(cfg, rank, world_size):
+    # Loader always delivers max_sequence_length frames per sample; the
+    # trainer decides per accumulation window whether to consume the whole
+    # long batch or slice it down to context_length. Batch size on the
+    # loader follows long_seq_batch_per_gpu — short steps subsample inside
+    # train_epoch.
+    long_bs = int(cfg.train.get("long_seq_batch_per_gpu", cfg.train.batch_per_gpu))
+    short_bs = int(cfg.train.batch_per_gpu)
+    assert long_bs >= short_bs, (
+        f"long_seq_batch_per_gpu ({long_bs}) must be >= batch_per_gpu ({short_bs}); "
+        "short steps subsample from the long-batch tensor."
+    )
     loader, sampler, _ = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
         window_size=cfg.denoiser.max_sequence_length,
-        batch_size=cfg.train.batch_per_gpu,
+        batch_size=long_bs,
         rank=rank,
         world_size=world_size,
         num_workers=cfg.train.num_workers,
@@ -80,9 +91,14 @@ def build_models(cfg, device, local_rank):
     else:
         denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
 
+    fc_noise = cfg.train.get("forcing_context_noise", {})
     diffuser = UWMForwardProcess(
         max_diff_steps=cfg.denoiser.num_noise_levels,
         mode_weights=OmegaConf.to_container(cfg.train.mode_weights, resolve=True),
+        forcing_context_noise_bias=float(fc_noise.get("bias", 0.0)),
+        forcing_context_noise_alpha=float(fc_noise.get("alpha", 0.5)),
+        forcing_context_noise_beta=float(fc_noise.get("beta", 2.0)),
+        forcing_mask_actions=bool(cfg.train.get("forcing_mask_actions", False)),
         device=device,
     )
 
@@ -163,6 +179,46 @@ def train_epoch(
     denoiser.train()
     train_sampler.set_epoch(epoch)
 
+    # --- Batch-length branch selection (Dreamer-V4 paper) ---
+    # Loader delivers (B_long, T_long) where T_long = max_sequence_length.
+    # Per accumulation window, sample a 3-way categorical branch:
+    #   long  → consume (B_long, T_long) as-is (exercises windowed-temporal
+    #           attention; requires max_seq > ctx_len to do anything useful).
+    #   image → reshape (B_long, T_long, …) → (B_long*T_long, 1, …), then
+    #           trim to image_batch_per_gpu. Each frame becomes an
+    #           independent length-1 sequence; temporal attention is a no-op.
+    #           force_mode='video' in the forward process pins actions to
+    #           pure noise and applies state loss across the (T=1) sequence —
+    #           unconditional single-frame generation for start-frame cold
+    #           start.
+    #   short → random-crop along T to context_length, take batch_per_gpu
+    #           samples (today's default behavior).
+    # Branch is fixed across all micro-batches in one optimizer step so the
+    # gradient is coherent and metrics are unambiguous to attribute.
+    short_bs = int(cfg.train.batch_per_gpu)
+    long_bs = int(cfg.train.get("long_seq_batch_per_gpu", short_bs))
+    image_bs = int(cfg.train.get("image_batch_per_gpu", short_bs))
+    ctx_len = int(cfg.denoiser.context_length)
+    max_seq = int(cfg.denoiser.max_sequence_length)
+    long_seq_prob = float(cfg.train.get("long_seq_prob", 0.0))
+    image_prob = float(cfg.train.get("image_prob", 0.0))
+    assert ctx_len <= max_seq, (
+        f"context_length ({ctx_len}) must be <= max_sequence_length ({max_seq})"
+    )
+    # Long branch only fires when it can actually produce T > ctx_len.
+    effective_long_prob = long_seq_prob if max_seq > ctx_len else 0.0
+    assert 0.0 <= image_prob <= 1.0
+    assert effective_long_prob + image_prob <= 1.0 + 1e-6, (
+        f"effective_long_prob ({effective_long_prob}) + image_prob "
+        f"({image_prob}) must be <= 1"
+    )
+    # Image branch trims from the reshaped pool of long_bs * max_seq frames.
+    max_image_rows = long_bs * max_seq
+    assert image_bs <= max_image_rows, (
+        f"image_batch_per_gpu ({image_bs}) exceeds available rows "
+        f"(long_seq_batch_per_gpu * max_sequence_length = {max_image_rows})"
+    )
+
     epoch_start = time.perf_counter()
     epoch_loss_sum = 0.0
     num_updates = 0
@@ -172,6 +228,7 @@ def train_epoch(
     accum_obs_flow = 0.0
     accum_act_flow = 0.0
     accum_total = 0.0
+    accum_branch = "short"  # set on the first micro of each window
 
     data_start = time.perf_counter()
 
@@ -188,6 +245,61 @@ def train_epoch(
         # Slice to configured action dims and add token dimension: (B, T, A) -> (B, T, 1, A)
         actions = actions.to(torch.bfloat16)[:, :, :cfg.denoiser.n_actions].unsqueeze(-2)
 
+        # --- Branch decision for this accumulation window ---
+        # Sampled on rank 0 and broadcast so every rank takes the same path
+        # (otherwise DDP all-reduce would mix different effective batch sizes).
+        # Categorical over {long=0, image=1, short=2}. Mutually exclusive so
+        # each gradient step is attributable to exactly one recipe.
+        if micro_idx == 0:
+            if rank == 0:
+                r = torch.rand(1).item()
+                if r < effective_long_prob:
+                    code = 0
+                elif r < effective_long_prob + image_prob:
+                    code = 1
+                else:
+                    code = 2
+                branch_code_t = torch.tensor(
+                    [code], device=device, dtype=torch.long,
+                )
+            else:
+                branch_code_t = torch.zeros(1, device=device, dtype=torch.long)
+            dist.broadcast(branch_code_t, src=0)
+            accum_branch = ("long", "image", "short")[int(branch_code_t.item())]
+
+            # Random crop start — short branch only.
+            if accum_branch == "short" and max_seq > ctx_len:
+                if rank == 0:
+                    start_t = torch.randint(
+                        0, max_seq - ctx_len + 1, (1,),
+                        device=device, dtype=torch.long,
+                    )
+                else:
+                    start_t = torch.zeros(1, device=device, dtype=torch.long)
+                dist.broadcast(start_t, src=0)
+                crop_start = int(start_t.item())
+            else:
+                crop_start = 0
+
+        # --- Apply branch slicing ---
+        if accum_branch == "short":
+            images = images[:short_bs, crop_start:crop_start + ctx_len]
+            actions = actions[:short_bs, crop_start:crop_start + ctx_len]
+        elif accum_branch == "image":
+            # Flatten time into batch — (B_long, T_long, …) → (B_long*T_long,
+            # 1, …) — so every frame is an independent length-1 sequence.
+            # Temporal attention has nothing to attend to; the model learns
+            # the marginal image distribution. force_mode='video' below pins
+            # actions to pure noise and applies state loss across the T=1
+            # sequence, matching the paper's "30% videos as separate images"
+            # recipe for unconditioned start-frame generation.
+            B_in, T_in = images.shape[:2]
+            images = images.reshape(B_in * T_in, 1, *images.shape[2:])
+            actions = actions.reshape(B_in * T_in, 1, *actions.shape[2:])
+            images = images[:image_bs]
+            actions = actions[:image_bs]
+        # long: leave (B_long, T_long) untouched
+
         torch.cuda.synchronize(device)
         step_start = time.perf_counter()
 
@@ -200,9 +312,13 @@ def train_epoch(
                 z_clean = tokenizer.encode(images).detach().clone()
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            diffused_info = diffuser(z_clean, actions)
+            diffused_info = diffuser(
+                z_clean, actions,
+                force_mode="video" if accum_branch == "image" else None,
+            )
             obs_flow_loss, act_flow_loss = compute_uwm_loss(
-                diffused_info, denoiser, device=device
+                diffused_info, denoiser, device=device,
+                loss_weighting=str(cfg.train.get("loss_weighting", "ramp")),
             )
             loss_micro = (
                 obs_flow_loss + act_flow_loss
@@ -229,14 +345,28 @@ def train_epoch(
 
             if rank == 0:
                 lr = scheduler.get_last_lr()[0]
+                # Combined curves (both branches) for an at-a-glance view.
                 tb_writer.add_scalar("train/total_loss", sync_loss, global_update)
                 tb_writer.add_scalar("train/obs_flow_loss", accum_obs_flow, global_update)
                 tb_writer.add_scalar("train/act_flow_loss", accum_act_flow, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
+                # Branch-namespaced curves. Sparse by design — only one of
+                # {short, long, image} updates per step. Losses across
+                # branches are not magnitude-comparable (different effective
+                # receptive field, different T-dependent schedules, image
+                # mode zeros the action loss).
+                ns = f"train/{accum_branch}"
+                tb_writer.add_scalar(f"{ns}/total_loss", sync_loss, global_update)
+                tb_writer.add_scalar(f"{ns}/obs_flow_loss", accum_obs_flow, global_update)
+                tb_writer.add_scalar(f"{ns}/act_flow_loss", accum_act_flow, global_update)
+                # Categorical branch trace: 0=long, 1=image, 2=short.
+                _branch_code = {"long": 0, "image": 1, "short": 2}[accum_branch]
+                tb_writer.add_scalar("train/branch_code", _branch_code, global_update)
 
                 if global_update % cfg.print_every == 0:
                     print(
                         f"  [step {global_update}]"
+                        f"  [{accum_branch}]"
                         f"  loss: {sync_loss:.4f}"
                         f"  obs: {accum_obs_flow:.4f}"
                         f"  act: {accum_act_flow:.4f}"
@@ -267,9 +397,12 @@ def train_epoch(
 
     epoch_time = time.perf_counter() - epoch_start
     avg_loss = epoch_loss_sum / num_updates if num_updates > 0 else 0.0
-    total_frames = (
-        cfg.train.batch_per_gpu * cfg.denoiser.max_sequence_length * len(train_loader)
-    )
+    # Loader I/O throughput — uses long_bs * max_seq because the loader
+    # always pulls long-shaped tensors (short steps subsample/crop, but the
+    # bytes were still moved). This is a data-pipeline metric, not a
+    # train-effective-frames metric.
+    long_bs = int(cfg.train.get("long_seq_batch_per_gpu", cfg.train.batch_per_gpu))
+    total_frames = long_bs * cfg.denoiser.max_sequence_length * len(train_loader)
     epoch_fps = total_frames / epoch_time
 
     if rank == 0:

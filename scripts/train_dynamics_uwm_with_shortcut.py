@@ -101,10 +101,14 @@ def build_models(cfg, device, local_rank):
         denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
 
     flow_bias = float(cfg.train.shortcut.flow_bias)
+    fc_noise = cfg.train.get("forcing_context_noise", {})
     diffuser = ShortcutUWMForwardProcess(
         max_diff_steps=cfg.denoiser.num_noise_levels,
         mode_weights=OmegaConf.to_container(cfg.train.mode_weights, resolve=True),
         flow_bias=flow_bias,
+        forcing_context_noise_bias=float(fc_noise.get("bias", 0.0)),
+        forcing_context_noise_alpha=float(fc_noise.get("alpha", 0.5)),
+        forcing_context_noise_beta=float(fc_noise.get("beta", 2.0)),
         device=device,
     )
 
@@ -240,6 +244,7 @@ def train_epoch(
             obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss = (
                 compute_bootstrap_uwm_loss(
                     diffused_info, denoiser, device=device, teacher=teacher,
+                    loss_weighting=str(cfg.train.get("loss_weighting", "ramp")),
                 )
             )
             loss_micro = (

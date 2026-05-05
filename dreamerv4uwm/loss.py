@@ -7,14 +7,33 @@ import torch.distributed as dist
 import random
 
 
-def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
+def loss_weight(tau: torch.Tensor, scheme: str = 'ramp') -> torch.Tensor:
     """
-    Eq. (8): w(τ) = 0.9 τ + 0.1
+    Per-element loss weighting over the noise schedule.
+
+    Convention: τ=1 is clean, τ=0 is pure noise (see forward-process classes).
+
+    Schemes:
+      - 'ramp':    w(τ) = 0.9 τ + 0.1   (flow-matching default; down-weights
+                   the noisy end 10×, favoring easy clean-ish samples).
+      - 'uniform': w(τ) = 1             (equal weight everywhere — use when
+                   you need strong gradient in the very-noisy regime, e.g.
+                   training for masked-context / unconditional generation).
 
     tau: (B, T) or broadcastable shape
     returns: same shape as tau
     """
-    return 0.9 * tau + 0.1
+    if scheme == 'ramp':
+        return 0.9 * tau + 0.1
+    elif scheme == 'uniform':
+        return torch.ones_like(tau)
+    else:
+        raise ValueError(f"Unknown loss weighting scheme: {scheme!r}")
+
+
+def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
+    """Back-compat alias; prefer loss_weight(tau, scheme='ramp')."""
+    return loss_weight(tau, scheme='ramp')
 
 class RMSLossScaler:
     """
@@ -59,12 +78,17 @@ class UWMForwardProcess(nn.Module):
                  max_diff_steps=32,
                  action_noise_std: float = 1.,
                  mode_weights: Optional[dict] = None,
+                 forcing_context_noise_bias: float = 0.0,
+                 forcing_context_noise_alpha: float = 0.5,
+                 forcing_context_noise_beta: float = 2.0,
+                 forcing_mask_actions: bool = False,
                  device='cpu'):
         super().__init__()
         self.max_diff_steps = max_diff_steps
         self.device = device
         self.action_noise_std = action_noise_std
-        self.modes = ['policy', 'video', 'wm', 'id', 'forcing']
+        self.forcing_mask_actions = forcing_mask_actions
+        self.modes = ['policy', 'video', 'wm', 'id', 'forcing', 'action_only']
         if mode_weights is not None:
             weights = [float(mode_weights.get(m, 0.0)) for m in self.modes]
         else:
@@ -72,8 +96,31 @@ class UWMForwardProcess(nn.Module):
         total = sum(weights)
         assert total > 0, "At least one mode must have a positive weight"
         self.mode_probs = [w / total for w in weights]
+        # Biased context-τ sampling in `forcing` mode. With prob `bias` the
+        # context (chunk-0) τ for both streams is redrawn from Beta(α, β); the
+        # horizon chunk is unaffected. α<β tilts mass toward τ≈0 (pure noise),
+        # giving the model explicit training on very-corrupted-context rollouts.
+        assert 0.0 <= forcing_context_noise_bias <= 1.0
+        self.forcing_context_noise_bias = float(forcing_context_noise_bias)
+        self.forcing_context_noise_alpha = float(forcing_context_noise_alpha)
+        self.forcing_context_noise_beta = float(forcing_context_noise_beta)
 
-    def sample_step_noise(self, batch_size, seq_len):
+    def _maybe_bias_context_tau(self, ctx_tau: torch.Tensor) -> torch.Tensor:
+        """Per-element Bernoulli mixture: with prob `bias`, replace τ with a
+        Beta(α, β) draw quantized to the max_diff_steps grid. Used only for
+        the context chunk of `forcing` mode."""
+        B = ctx_tau.shape[0]
+        use_low = torch.rand(B, device=self.device) < self.forcing_context_noise_bias
+        beta_dist = torch.distributions.Beta(
+            torch.tensor(self.forcing_context_noise_alpha, device=self.device),
+            torch.tensor(self.forcing_context_noise_beta, device=self.device),
+        )
+        beta_samples = beta_dist.sample((B,))
+        biased_idx = (beta_samples * self.max_diff_steps).long().clamp(max=self.max_diff_steps - 1)
+        biased_tau = biased_idx.float() / self.max_diff_steps
+        return torch.where(use_low, biased_tau, ctx_tau)
+
+    def sample_step_noise(self, batch_size, seq_len, force_mode: Optional[str] = None):
         B, T = batch_size, seq_len
         # Diffusion forcing noise level
         state_tau_d = torch.randint(0, self.max_diff_steps, (B,T)).to(self.device)
@@ -81,9 +128,21 @@ class UWMForwardProcess(nn.Module):
 
         action_tau_d = torch.randint(0, self.max_diff_steps, (B,T)).to(self.device)
         action_tau = action_tau_d/self.max_diff_steps
-        
-        context_length=torch.randint(1, T-1, (1,)).item() # Choose a random context length
-        mode = random.choices(self.modes, weights=self.mode_probs, k=1)[0]
+
+        # torch.randint(1, T-1, ...) requires T >= 3. T=1 is the image-mode
+        # path (force_mode='video', context_length unused by the video
+        # schedule); T=2 is not used today but guarded for safety.
+        if T <= 2:
+            context_length = max(0, T - 1)
+        else:
+            context_length = torch.randint(1, T-1, (1,)).item()
+        if force_mode is not None:
+            assert force_mode in self.modes, (
+                f"force_mode {force_mode!r} not in modes {self.modes}"
+            )
+            mode = force_mode
+        else:
+            mode = random.choices(self.modes, weights=self.mode_probs, k=1)[0]
         if mode == 'policy':
             # context: clean state, clean action ; chunk: noisy state, noisy action
             state_tau[:, :context_length] =  0.9999                               
@@ -91,17 +150,20 @@ class UWMForwardProcess(nn.Module):
             state_tau[:, context_length:] = state_tau[:, context_length].unsqueeze(-1)    
             action_tau[:, context_length:] = action_tau[:, context_length].unsqueeze(-1) 
         elif mode =='video':
-            # context: clean state, noisy action ; chunk: noisy state, noisy action
-            state_tau[:, :context_length] =  0.9999                               
-            action_tau[:, :context_length] = 0.                                
-            state_tau[:, context_length:] = state_tau[:, context_length].unsqueeze(-1)    
-            action_tau[:, context_length:] = 0. 
+            # Unconditioned video generation: identical state τ across context
+            # AND horizon (single τ per batch element), action fully masked
+            # (τ=0, pure noise) everywhere. Loss is computed on states across
+            # the FULL sequence — see compute_uwm_loss.
+            state_tau[:] = state_tau[:, 0].unsqueeze(-1)
+            action_tau[:] = 0.
         elif mode=='wm':
-            # context: clean state, clean action ; chunk: noisy state, clean action
-            state_tau[:, :context_length] =  0.9999                               
-            action_tau[:, :context_length] = 0.9999                                
-            state_tau[:, context_length:] = state_tau[:, context_length].unsqueeze(-1)    
-            action_tau[:, context_length:] = 0.9999 
+            # context: noisy state (random τ broadcast across ctx), clean action;
+            # horizon: noisy state (independent random τ broadcast across hor), clean action.
+            # Context τ and horizon τ are sampled independently per batch element.
+            state_tau[:, :context_length] = state_tau[:, 0].unsqueeze(-1)
+            action_tau[:, :context_length] = 0.9999
+            state_tau[:, context_length:] = state_tau[:, context_length].unsqueeze(-1)
+            action_tau[:, context_length:] = 0.9999
         elif mode=='id':
             # context: clean state, noisy action ; chunk: clean state, noisy action
             state_tau[:, :context_length] =  0.9999                               
@@ -109,11 +171,31 @@ class UWMForwardProcess(nn.Module):
             state_tau[:, context_length:] =  0.9999   
             action_tau[:, context_length:] = action_tau[:, context_length].unsqueeze(-1)
         elif mode=='forcing':
-            # Chunked diffusion forcing mode
-            # context: state and action with noise level 1 ; state and action with noise level 2
-            state_tau[:, :context_length] =  state_tau[:, 0].unsqueeze(-1)                          
-            action_tau[:, :context_length] = action_tau[:, 0].unsqueeze(-1)
-            state_tau[:, context_length:] =  state_tau[:, context_length].unsqueeze(-1)   
+            # Progressive Temporal Denoising: linearly decreasing τ across T.
+            # Frame 0 = cleanest (highest τ), frame T-1 = noisiest (lowest τ).
+            # Causal attention grounds later noisy frames on earlier clean ones,
+            # resolving the cold-start problem without breaking causality.
+            # Both streams share the same progressive schedule.
+            pair = torch.sort(torch.randint(
+                0, self.max_diff_steps, (B, 2), device=self.device,
+            ), dim=1)[0]
+            high_idx = pair[:, 1:2]  # (B, 1) — cleaner end  → frame 0
+            low_idx  = pair[:, 0:1]  # (B, 1) — noisier end  → frame T-1
+            slope = torch.linspace(0, 1, steps=T, device=self.device).unsqueeze(0)  # (1, T)
+            progressive_idx = (high_idx + slope * (low_idx - high_idx)).long()
+            progressive_idx = progressive_idx.clamp(0, self.max_diff_steps - 1)
+            progressive_tau = progressive_idx.float() / self.max_diff_steps
+            state_tau  = progressive_tau
+            action_tau = progressive_tau if not self.forcing_mask_actions else torch.zeros_like(progressive_tau)
+            context_length = 1
+        elif mode=='action_only':
+            # Conditional action policy baseline: clean context (state & action),
+            # horizon state fully masked (τ=0, pure noise), horizon action sampled.
+            # Loss is action-only on the horizon — the model must produce actions
+            # from the clean context alone with no state info on the horizon.
+            state_tau[:, :context_length] = 0.9999
+            action_tau[:, :context_length] = 0.9999
+            state_tau[:, context_length:] = 0.0
             action_tau[:, context_length:] = action_tau[:, context_length].unsqueeze(-1)
         else:
             raise NotImplementedError
@@ -128,10 +210,13 @@ class UWMForwardProcess(nn.Module):
         self,
         z_clean: torch.Tensor,     # (B, T, N_lat, D_lat)
         a_clean: torch.Tensor,     # (B, T, N_act_tokens, n_actions)   (raw actions from dataset)
+        force_mode: Optional[str] = None,
     ):
         B, T, N_lat, D_lat = z_clean.shape
         device = z_clean.device
-        obs_diff, act_diff, context_length, mode = self.sample_step_noise(B, T)
+        obs_diff, act_diff, context_length, mode = self.sample_step_noise(
+            B, T, force_mode=force_mode,
+        )
         
         # observation forward diffusion
         z0 = torch.randn_like(z_clean)
@@ -157,13 +242,15 @@ class UWMForwardProcess(nn.Module):
             "act_tau": act_diff["tau"],
             "act_tau_idx": act_diff["tau_idx"],
             "context_length": context_length,
-            "mode": mode
+            "mode": mode,
+            "forcing_mask_actions": self.forcing_mask_actions if mode == 'forcing' else False,
         }
     
 def compute_uwm_loss(
     info: dict,
     denoiser: DreamerV4Denoiser,
-    device='cpu', 
+    device='cpu',
+    loss_weighting: str = 'ramp',
 ):
     
     # --- obs ---
@@ -194,8 +281,11 @@ def compute_uwm_loss(
 
     obs_flow_sq = (z_hat - obs_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
     act_flow_sq = (a_hat - act_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
-    w_obs      = ramp_weight(info['obs_tau'].squeeze())           # (B, T)
-    w_act      = ramp_weight(info['act_tau'].squeeze())           # (B, T)
+    # Note: no .squeeze() here — info['obs_tau'] is already (B, T). At T=1 a
+    # naive squeeze collapses (B, 1) → (B,) and then (B, 1) * (B,) broadcasts
+    # to (B, B). Harmless at T>1 today but wrong for image-mode reshapes.
+    w_obs      = loss_weight(info['obs_tau'], scheme=loss_weighting)  # (B, T)
+    w_act      = loss_weight(info['act_tau'], scheme=loss_weighting)  # (B, T)
 
     mode = info['mode']
     context_length = info['context_length']
@@ -203,11 +293,13 @@ def compute_uwm_loss(
         obs_flow_loss = (obs_flow_sq*w_obs)[:, context_length:].mean()
         act_flow_loss = (act_flow_sq*w_act)[:, context_length:].mean()
     elif mode=='video':
-        obs_flow_loss = (obs_flow_sq*w_obs)[:, context_length:].mean()
+        # Unconditioned video generation: state loss across the FULL sequence,
+        # action stream zeroed out.
+        obs_flow_loss = (obs_flow_sq*w_obs).mean()
         act_flow_loss = (act_flow_sq*w_act).mean()*0.
 
     elif mode=='wm':
-        obs_flow_loss = (obs_flow_sq*w_obs)[:, context_length:].mean()
+        obs_flow_loss = (obs_flow_sq*w_obs).mean()
         act_flow_loss = (act_flow_sq*w_act).mean()*0.
 
     elif mode=='id':
@@ -216,10 +308,16 @@ def compute_uwm_loss(
 
     elif mode=='forcing':
         obs_flow_loss = (obs_flow_sq*w_obs).mean()
-        act_flow_loss = (act_flow_sq*w_act).mean()
+        if info.get('forcing_mask_actions', False):
+            act_flow_loss = (act_flow_sq*w_act).mean()*0.
+        else:
+            act_flow_loss = (act_flow_sq*w_act).mean()
+    elif mode=='action_only':
+        obs_flow_loss = (obs_flow_sq*w_obs).mean()*0.
+        act_flow_loss = (act_flow_sq*w_act)[:, context_length:].mean()
     else:
         raise NotImplementedError
-        
+
     return obs_flow_loss, act_flow_loss
 
 
@@ -239,6 +337,9 @@ class ShortcutUWMForwardProcess(nn.Module):
                  action_noise_std: float = 1.,
                  mode_weights: Optional[dict] = None,
                  flow_bias: float = 0.25,
+                 forcing_context_noise_bias: float = 0.0,
+                 forcing_context_noise_alpha: float = 0.5,
+                 forcing_context_noise_beta: float = 2.0,
                  device='cpu'):
         super().__init__()
         assert (max_diff_steps & (max_diff_steps - 1)) == 0, "max_diff_steps must be a power of 2"
@@ -258,6 +359,29 @@ class ShortcutUWMForwardProcess(nn.Module):
         total = sum(weights)
         assert total > 0, "At least one mode must have a positive weight"
         self.mode_probs = [w / total for w in weights]
+        # See UWMForwardProcess for the rationale — identical mechanism on the
+        # dyadic grid. Context (chunk-0) τ-index is redrawn from Beta(α, β)
+        # with probability `bias`, then quantized to the current step's grid.
+        assert 0.0 <= forcing_context_noise_bias <= 1.0
+        self.forcing_context_noise_bias = float(forcing_context_noise_bias)
+        self.forcing_context_noise_alpha = float(forcing_context_noise_alpha)
+        self.forcing_context_noise_beta = float(forcing_context_noise_beta)
+
+    def _sample_biased_dyadic_chunk(self, step_index, num_tau_levels):
+        """Draw (tau_idx, tau_half_idx) for a single chunk with τ ~ Beta(α, β),
+        quantized to the current dyadic grid. Returns tensors of shape (B, 1)
+        matching the layout used in `sample_step_noise`."""
+        B = step_index.shape[0]
+        beta_dist = torch.distributions.Beta(
+            torch.tensor(self.forcing_context_noise_alpha, device=self.device),
+            torch.tensor(self.forcing_context_noise_beta, device=self.device),
+        )
+        beta_samples = beta_dist.sample((B, 1))
+        m = torch.floor(beta_samples * 0.9999 * num_tau_levels).long()
+        tau_idx = m * (2 ** step_index)
+        delta = (2 ** step_index) // 2
+        tau_half_idx = torch.clamp(tau_idx + delta, min=0, max=self.num_noise_levels - 1)
+        return tau_idx, tau_half_idx
 
     def _sample_dyadic_tau(self, B, step_index_raw, num_tau_levels):
         """
@@ -347,9 +471,12 @@ class ShortcutUWMForwardProcess(nn.Module):
             self._fill_schedule(action_idx, action_half_idx, context_length,
                                 CLEAN, a0, CLEAN, ah0)
         elif mode == 'video':
-            # context: clean obs, noisy act | horizon: noisy obs, noisy act
+            # Unconditioned video generation: identical state τ across context
+            # AND horizon (single chunk-0 dyadic draw broadcast everywhere);
+            # action fully masked (τ_idx=NOISY) throughout. Loss is computed
+            # on states across the FULL sequence — see compute_bootstrap_uwm_loss.
             self._fill_schedule(state_idx, state_half_idx, context_length,
-                                CLEAN, o0, CLEAN, oh0)
+                                o0, o0, oh0, oh0)
             self._fill_schedule(action_idx, action_half_idx, context_length,
                                 NOISY, NOISY, NOISY, NOISY)
         elif mode == 'wm':
@@ -365,11 +492,27 @@ class ShortcutUWMForwardProcess(nn.Module):
             self._fill_schedule(action_idx, action_half_idx, context_length,
                                 a0, a0, ah0, ah0)
         elif mode == 'forcing':
-            # chunk 0 noise for context, chunk 1 noise for horizon
-            self._fill_schedule(state_idx, state_half_idx, context_length,
-                                o0, o1, oh0, oh1)
-            self._fill_schedule(action_idx, action_half_idx, context_length,
-                                a0, a1, ah0, ah1)
+            # Progressive Temporal Denoising on the dyadic grid.
+            # Frame 0 = cleanest (highest idx), frame T-1 = noisiest (lowest idx).
+            # Both streams share the same per-frame progressive schedule; the
+            # shortcut step size d (and half-step delta) is still per-batch.
+            delta = (2 ** step_index) // 2  # (B, 1)
+            pair = torch.sort(torch.randint(
+                0, self.num_noise_levels, (B, 2), device=self.device,
+            ), dim=1)[0]
+            high_idx = pair[:, 1:2]  # (B, 1) — cleaner end  → frame 0
+            low_idx  = pair[:, 0:1]  # (B, 1) — noisier end  → frame T-1
+            slope = torch.linspace(0, 1, steps=T, device=self.device).unsqueeze(0)
+            progressive_idx = (high_idx + slope * (low_idx - high_idx)).long()
+            progressive_idx = progressive_idx.clamp(0, self.num_noise_levels - 1)
+            progressive_half_idx = (progressive_idx + delta).clamp(
+                0, self.num_noise_levels - 1,
+            )
+            state_idx[:]       = progressive_idx
+            state_half_idx[:]  = progressive_half_idx
+            action_idx[:]      = progressive_idx
+            action_half_idx[:] = progressive_half_idx
+            context_length = 1
         else:
             raise NotImplementedError
 
@@ -433,6 +576,7 @@ def compute_bootstrap_uwm_loss(
     denoiser: DreamerV4Denoiser,
     device='cpu',
     teacher: Optional[DreamerV4Denoiser] = None,
+    loss_weighting: str = 'ramp',
 ):
     """
     Shortcut / bootstrap loss for the unified world model (two streams: obs + act).
@@ -550,8 +694,8 @@ def compute_bootstrap_uwm_loss(
     # =================================================
     # 3) Per-element losses
     # =================================================
-    w_obs = ramp_weight(obs_tau)                        # (B, T)
-    w_act = ramp_weight(act_tau)                        # (B, T)
+    w_obs = loss_weight(obs_tau, scheme=loss_weighting)  # (B, T)
+    w_act = loss_weight(act_tau, scheme=loss_weighting)  # (B, T)
 
     # --- flow branch (step_index == 0): x-prediction MSE ---
     obs_flow_sq = (z_hat - x).pow(2).mean(dim=(-1, -2))           # (B, T)
@@ -584,14 +728,13 @@ def compute_bootstrap_uwm_loss(
         obs_boot_loss = ((obs_boot_sq * w_obs)[:, context_length:] * mask_l).sum() / n_b
         act_boot_loss = ((act_boot_sq * w_act)[:, context_length:] * mask_l).sum() / n_b
     elif mode == 'video':
-        # obs on horizon, act zeroed
-        mask_s = mask_small[:, context_length:]
-        mask_l = mask_large[:, context_length:]
-        n_f = mask_s.sum().clamp_min(1.0)
-        n_b = mask_l.sum().clamp_min(1.0)
-        obs_flow_loss = ((obs_flow_sq * w_obs)[:, context_length:] * mask_s).sum() / n_f
+        # Unconditioned video generation: state loss across the FULL sequence
+        # (context + horizon, identical τ), action stream zeroed out.
+        n_f = mask_small.sum().clamp_min(1.0)
+        n_b = mask_large.sum().clamp_min(1.0)
+        obs_flow_loss = (obs_flow_sq * w_obs * mask_small).sum() / n_f
         act_flow_loss = (act_flow_sq * w_act).mean() * 0.
-        obs_boot_loss = ((obs_boot_sq * w_obs)[:, context_length:] * mask_l).sum() / n_b
+        obs_boot_loss = (obs_boot_sq * w_obs * mask_large).sum() / n_b
         act_boot_loss = (act_boot_sq * w_act).mean() * 0.
     elif mode == 'wm':
         # obs on horizon, act zeroed
