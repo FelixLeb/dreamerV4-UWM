@@ -227,8 +227,11 @@ def train_epoch(
 
     accum_obs_flow = 0.0
     accum_act_flow = 0.0
+    accum_reward = 0.0
     accum_total = 0.0
     accum_branch = "short"  # set on the first micro of each window
+    train_reward = bool(cfg.denoiser.get("train_reward_model", False))
+    reward_weight = float(cfg.train.get("reward_weight", 1.0))
 
     data_start = time.perf_counter()
 
@@ -244,6 +247,15 @@ def train_epoch(
         images = images.to(torch.bfloat16)
         # Slice to configured action dims and add token dimension: (B, T, A) -> (B, T, 1, A)
         actions = actions.to(torch.bfloat16)[:, :, :cfg.denoiser.n_actions].unsqueeze(-2)
+        # Reward field is dataset-optional. When present we keep fp32 — symlog
+        # CE underflows in bf16 and we cast logits in compute_reward_mtp_loss
+        # back to fp32 anyway. Squeeze a trailing singleton if shards were
+        # written as (..., 1).
+        rewards = batch.get("reward", None)
+        if rewards is not None:
+            rewards = rewards.to(device, non_blocking=True).float()
+            if rewards.dim() == 3 and rewards.shape[-1] == 1:
+                rewards = rewards.squeeze(-1)
 
         # --- Branch decision for this accumulation window ---
         # Sampled on rank 0 and broadcast so every rank takes the same path
@@ -285,6 +297,8 @@ def train_epoch(
         if accum_branch == "short":
             images = images[:short_bs, crop_start:crop_start + ctx_len]
             actions = actions[:short_bs, crop_start:crop_start + ctx_len]
+            if rewards is not None:
+                rewards = rewards[:short_bs, crop_start:crop_start + ctx_len]
         elif accum_branch == "image":
             # Flatten time into batch — (B_long, T_long, …) → (B_long*T_long,
             # 1, …) — so every frame is an independent length-1 sequence.
@@ -298,6 +312,8 @@ def train_epoch(
             actions = actions.reshape(B_in * T_in, 1, *actions.shape[2:])
             images = images[:image_bs]
             actions = actions[:image_bs]
+            if rewards is not None:
+                rewards = rewards.reshape(B_in * T_in, 1)[:image_bs]
         # long: leave (B_long, T_long) untouched
 
         torch.cuda.synchronize(device)
@@ -316,18 +332,25 @@ def train_epoch(
                 z_clean, actions,
                 force_mode="video" if accum_branch == "image" else None,
             )
-            obs_flow_loss, act_flow_loss = compute_uwm_loss(
+            losses = compute_uwm_loss(
                 diffused_info, denoiser, device=device,
                 loss_weighting=str(cfg.train.get("loss_weighting", "ramp")),
+                rewards=rewards if train_reward else None,
             )
-            loss_micro = (
-                obs_flow_loss + act_flow_loss
-            ) / cfg.train.accum_grad_steps
+            obs_flow_loss = losses["obs_flow_loss"]
+            act_flow_loss = losses["act_flow_loss"]
+            reward_loss = losses["reward_loss"]
+            total_loss = obs_flow_loss + act_flow_loss
+            if reward_loss is not None:
+                total_loss = total_loss + reward_weight * reward_loss
+            loss_micro = total_loss / cfg.train.accum_grad_steps
 
         loss_micro.backward()
 
         accum_obs_flow += obs_flow_loss.mean().item()
         accum_act_flow += act_flow_loss.mean().item()
+        if reward_loss is not None:
+            accum_reward += reward_loss.item()
         accum_total += loss_micro.item()
 
         # --- Optimizer step at end of accumulation window ---
@@ -349,6 +372,8 @@ def train_epoch(
                 tb_writer.add_scalar("train/total_loss", sync_loss, global_update)
                 tb_writer.add_scalar("train/obs_flow_loss", accum_obs_flow, global_update)
                 tb_writer.add_scalar("train/act_flow_loss", accum_act_flow, global_update)
+                if train_reward:
+                    tb_writer.add_scalar("train/reward_loss", accum_reward, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
                 # Branch-namespaced curves. Sparse by design — only one of
                 # {short, long, image} updates per step. Losses across
@@ -359,6 +384,8 @@ def train_epoch(
                 tb_writer.add_scalar(f"{ns}/total_loss", sync_loss, global_update)
                 tb_writer.add_scalar(f"{ns}/obs_flow_loss", accum_obs_flow, global_update)
                 tb_writer.add_scalar(f"{ns}/act_flow_loss", accum_act_flow, global_update)
+                if train_reward:
+                    tb_writer.add_scalar(f"{ns}/reward_loss", accum_reward, global_update)
                 # Categorical branch trace: 0=long, 1=image, 2=short.
                 _branch_code = {"long": 0, "image": 1, "short": 2}[accum_branch]
                 tb_writer.add_scalar("train/branch_code", _branch_code, global_update)
@@ -389,6 +416,7 @@ def train_epoch(
 
             accum_obs_flow = 0.0
             accum_act_flow = 0.0
+            accum_reward = 0.0
             accum_total = 0.0
 
         torch.cuda.synchronize(device)

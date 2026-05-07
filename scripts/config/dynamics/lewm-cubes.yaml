@@ -29,8 +29,11 @@ denoiser:
   num_noise_levels: 128
   n_actions: 5
   is_causal: true
-  latent_attends_action: false
   layer_types: [spatial, temporal, spatial, temporal]
+  # Reward / MTP head. Off by default → no agent token, no extra params,
+  # bit-equivalent to runs without these fields.
+  train_reward_model: false
+  mtp_length: 8
 
 train:
   device: 'cuda:0'
@@ -60,6 +63,8 @@ train:
   # losses. 'ramp' = 0.9τ+0.1 (default, favors clean end); 'uniform' = 1 (equal
   # weight across the full schedule — use when training the heavily-noisy regime).
   loss_weighting: ramp
+  # Multiplier on reward MTP loss when denoiser.train_reward_model=true. Ignored otherwise.
+  reward_weight: 1.0
   mode_weights:
     policy: 1.0
     video: 0.0

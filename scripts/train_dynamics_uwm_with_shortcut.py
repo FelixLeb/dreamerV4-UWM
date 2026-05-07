@@ -211,7 +211,10 @@ def train_epoch(
     accum_act_flow = 0.0
     accum_obs_boot = 0.0
     accum_act_boot = 0.0
+    accum_reward = 0.0
     accum_total = 0.0
+    train_reward = bool(cfg.denoiser.get("train_reward_model", False))
+    reward_weight = float(cfg.train.get("reward_weight", 1.0))
 
     data_start = time.perf_counter()
 
@@ -227,6 +230,11 @@ def train_epoch(
         images = images.to(torch.bfloat16)
         # Slice to configured action dims and add token dimension: (B, T, A) -> (B, T, 1, A)
         actions = actions.to(torch.bfloat16)[:, :, :cfg.denoiser.n_actions].unsqueeze(-2)
+        rewards = batch.get("reward", None)
+        if rewards is not None:
+            rewards = rewards.to(device, non_blocking=True).float()
+            if rewards.dim() == 3 and rewards.shape[-1] == 1:
+                rewards = rewards.squeeze(-1)
 
         torch.cuda.synchronize(device)
         step_start = time.perf_counter()
@@ -241,15 +249,20 @@ def train_epoch(
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             diffused_info = diffuser(z_clean, actions)
-            obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss = (
-                compute_bootstrap_uwm_loss(
-                    diffused_info, denoiser, device=device, teacher=teacher,
-                    loss_weighting=str(cfg.train.get("loss_weighting", "ramp")),
-                )
+            losses = compute_bootstrap_uwm_loss(
+                diffused_info, denoiser, device=device, teacher=teacher,
+                loss_weighting=str(cfg.train.get("loss_weighting", "ramp")),
+                rewards=rewards if train_reward else None,
             )
-            loss_micro = (
-                obs_flow_loss + act_flow_loss + obs_boot_loss + act_boot_loss
-            ) / cfg.train.accum_grad_steps
+            obs_flow_loss = losses["obs_flow_loss"]
+            act_flow_loss = losses["act_flow_loss"]
+            obs_boot_loss = losses["obs_boot_loss"]
+            act_boot_loss = losses["act_boot_loss"]
+            reward_loss = losses["reward_loss"]
+            total_loss = obs_flow_loss + act_flow_loss + obs_boot_loss + act_boot_loss
+            if reward_loss is not None:
+                total_loss = total_loss + reward_weight * reward_loss
+            loss_micro = total_loss / cfg.train.accum_grad_steps
 
         loss_micro.backward()
 
@@ -257,6 +270,8 @@ def train_epoch(
         accum_act_flow += act_flow_loss.item()
         accum_obs_boot += obs_boot_loss.item()
         accum_act_boot += act_boot_loss.item()
+        if reward_loss is not None:
+            accum_reward += reward_loss.item()
         accum_total += loss_micro.item()
 
         # --- Optimizer step at end of accumulation window ---
@@ -280,6 +295,8 @@ def train_epoch(
                 tb_writer.add_scalar("train/act_flow_loss", accum_act_flow, global_update)
                 tb_writer.add_scalar("train/obs_boot_loss", accum_obs_boot, global_update)
                 tb_writer.add_scalar("train/act_boot_loss", accum_act_boot, global_update)
+                if train_reward:
+                    tb_writer.add_scalar("train/reward_loss", accum_reward, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
 
                 if global_update % cfg.print_every == 0:
@@ -311,6 +328,7 @@ def train_epoch(
             accum_act_flow = 0.0
             accum_obs_boot = 0.0
             accum_act_boot = 0.0
+            accum_reward = 0.0
             accum_total = 0.0
 
         torch.cuda.synchronize(device)

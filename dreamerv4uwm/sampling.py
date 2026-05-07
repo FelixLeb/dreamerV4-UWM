@@ -144,7 +144,7 @@ def forward_dynamics_flowmatching_no_cache(
         tau_index_tensor = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
         tau_index_tensor[:, :T_ctx] = tau_cond_idx   # context frames stay at tau_c
 
-        z_hat, act_hat = denoiser(
+        z_hat, act_hat, _ = denoiser(
             noisy_act    = z_act,
             noisy_obs    = z,
             obs_sigma_idx= tau_index_tensor,
@@ -301,7 +301,7 @@ def unified_flowmatching_sampler(
             act_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
             act_sigma_idx[:, :T_ctx] = tau_cond_idx
 
-        z_hat, act_hat = denoiser(
+        z_hat, act_hat, _ = denoiser(
             noisy_act    = z_act,
             noisy_obs    = z,
             obs_sigma_idx= obs_sigma_idx,
@@ -419,7 +419,7 @@ def unified_action_sampler(
         act_sigma_idx = torch.full((B, T_total), tau_horizon_idx, dtype=torch.long, device=device)
         act_sigma_idx[:, :T_ctx] = tau_ctx_idx
 
-        z_hat, act_hat = denoiser(
+        z_hat, act_hat, _ = denoiser(
             noisy_act    = z_act,
             noisy_obs    = z,
             obs_sigma_idx= obs_sigma_idx,
@@ -500,7 +500,7 @@ def unified_video_sampler(
 
         obs_sigma_idx = torch.full((B, T_total), tau_k_idx, dtype=torch.long, device=device)
 
-        z_hat, _ = denoiser(
+        z_hat, _, _ = denoiser(
             noisy_act    = z_act,
             noisy_obs    = z,
             obs_sigma_idx= obs_sigma_idx,
@@ -578,7 +578,7 @@ def worldmodel_dynamics_flowmatching_no_cache(
         obs_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
         obs_sigma_idx[:, :T_ctx] = tau_cond_idx   # context obs stays at tau_c
 
-        z_hat, _ = denoiser(
+        z_hat, _, _ = denoiser(
             noisy_act    = clean_act,
             noisy_obs    = z,
             obs_sigma_idx= obs_sigma_idx,
@@ -705,7 +705,7 @@ def unified_shortcut_sampler(
             act_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
             act_sigma_idx[:, :T_ctx] = tau_cond_idx
 
-        z_hat, act_hat = denoiser(
+        z_hat, act_hat, _ = denoiser(
             noisy_act    = z_act,
             noisy_obs    = z,
             obs_sigma_idx= obs_sigma_idx,

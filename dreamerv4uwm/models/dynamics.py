@@ -8,83 +8,181 @@ from .blocks import EfficientTransformerBlock, LayerType
 from omegaconf import DictConfig, OmegaConf
 
 import torch
-def build_spatial_attention_mask(n_latent: int, n_register: int, n_image_control: int, n_action_control: int, n_action: int, latent_attends_action: bool = False) -> torch.Tensor:
+
+
+class SymlogTwoHotHead(nn.Module):
+    """Symlog-space two-hot classification head over a fixed bucket grid.
+
+    Predicts a scalar via classification: logits over `num_buckets` evenly spaced
+    in symlog space across [min_val, max_val]. `get_targets` returns the
+    (low_idx, low_weight, high_idx, high_weight) tuple for the two-hot CE target.
     """
-    Builds the spatial attention mask for one frame of the unified world model.
-    
-    Token sequence order: [Z (latent), Reg (register), IC (image control), AC (action control), A (action)]
-    
-    Mask convention: True = CAN attend, False = CANNOT attend (will be converted to -inf in attention)
-    
-    Rules:
-        - Z    attends to: Z, Reg, IC           (+ AC, A when latent_attends_action=True)
-        - Reg  attends to: Z, Reg, IC         (scratchpad is part of state group)
-        - IC   attends to: IC                 (control token, fixed input)
-        - AC   attends to: AC                 (control token, fixed input)
-        - A    attends to: Z, Reg, IC, AC, A  (policy sees everything except it cannot affect state)
-    
+
+    def __init__(self, input_dim: int, num_buckets: int = 255, min_val: float = -20.0, max_val: float = 20.0):
+        """Build the head.
+
+        Args:
+            input_dim:   feature dim of the activations fed to `forward`.
+            num_buckets: number of bins; logits have this width.
+            min_val, max_val: symlog-space range covered by the bucket grid.
+                Targets outside this range are clipped, not extrapolated.
+        """
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.min_val = min_val
+        self.max_val = max_val
+        self.linear = nn.Linear(input_dim, num_buckets)
+        buckets = torch.linspace(min_val, max_val, num_buckets)
+        self.register_buffer("buckets", buckets)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project features to per-bucket logits.
+
+        Args:
+            x: feature tensor of shape (..., input_dim). Leading dims are
+               preserved; in this codebase typically (B, T, D).
+
+        Returns:
+            logits of shape (..., num_buckets).
+        """
+        return self.linear(x)
+
+    @staticmethod
+    def to_symlog(x: torch.Tensor) -> torch.Tensor:
+        """Compress real values into symlog space: sign(x) * log(|x| + 1).
+
+        Used to handle a wide reward range without dedicating most buckets to
+        the tails. Linear near zero, log-scaled away from zero.
+        """
+        return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+    @staticmethod
+    def from_symlog(x: torch.Tensor) -> torch.Tensor:
+        """Inverse of `to_symlog`: sign(x) * (exp(|x|) - 1)."""
+        return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+    def get_targets(self, rewards: torch.Tensor):
+        """Build two-hot targets from raw rewards.
+
+        Maps each reward into symlog space, locates it on the bucket grid, and
+        returns the (low_idx, low_weight, high_idx, high_weight) tuple that
+        scatters unit mass linearly between adjacent buckets.
+
+        Out-of-range rewards are clamped to the edge buckets — the head cannot
+        represent values beyond [min_val, max_val] in symlog space.
+
+        Edge case: when a target lands exactly on a bucket index, naive
+        `high - low` weights collapse to 0/0. We force all mass onto `low` in
+        that case (also covers the post-clamp case where low == high == edge).
+
+        Args:
+            rewards: real-space reward tensor of any shape S (commonly (B, T, L)
+                in MTP usage, or (B, T) for a single-step head).
+
+        Returns:
+            tuple (low, low_weight, high, high_weight), each of shape S:
+                low, high       — long tensors, bucket indices in [0, num_buckets-1].
+                low_weight, high_weight — float tensors, weights summing to 1
+                                           per element (two-hot mass).
+        """
+        y = self.to_symlog(rewards)
+        width = (self.max_val - self.min_val) / (self.num_buckets - 1)
+        indices = (y - self.min_val) / width
+        indices = indices.clamp(0, self.num_buckets - 1)
+
+        low = indices.floor().long()
+        high = indices.ceil().long()
+        low_weight = high.float() - indices
+        high_weight = indices - low.float()
+
+        mask = (low == high)
+        low_weight[mask] = 1.0
+        high_weight[mask] = 0.0
+
+        return low, low_weight, high, high_weight
+
+
+class RewardMTPHead(nn.Module):
+    """Multi-token prediction head: L parallel reward predictions per timestep.
+
+    A shared MLP trunk maps each task embedding to a hidden vector, then L
+    independent `SymlogTwoHotHead` heads each emit logits for one future
+    horizon offset (predicting r_{t+0}, r_{t+1}, ..., r_{t+L-1}).
+
+    The L heads do not share output weights — each learns its own decoder over
+    the bucket grid — but they share the trunk so the per-step cost stays
+    bounded as L grows.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 512,
+        mtp_length: int = 8,
+        num_buckets: int = 255,
+    ):
+        """Build the MTP head.
+
+        Args:
+            input_dim:   feature dim of the per-timestep embedding fed to `forward`
+                         (in this codebase, the agent-token slice of the denoiser
+                         output, dim = `model_dim`).
+            hidden_dim:  width of the shared trunk.
+            mtp_length:  number of future-reward heads L.
+            num_buckets: bucket-grid width passed to each `SymlogTwoHotHead`.
+        """
+        super().__init__()
+        self.mtp_length = mtp_length
+        self.hidden = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.heads = nn.ModuleList([
+            SymlogTwoHotHead(hidden_dim, num_buckets) for _ in range(mtp_length)
+        ])
+
+    def forward(self, h_t: torch.Tensor) -> torch.Tensor:
+        """Predict L bucketized reward distributions per timestep.
+
+        Args:
+            h_t: per-timestep agent embedding of shape (B, T, input_dim).
+
+        Returns:
+            logits of shape (B, T, L, num_buckets), where dim 2 indexes the
+            future horizon offset and dim 3 indexes bucket logits. Apply
+            log-softmax over the last dim before computing two-hot CE.
+        """
+        x = self.hidden(h_t)
+        outputs = [head(x) for head in self.heads]
+        return torch.stack(outputs, dim=2)
+
+
+def build_agent_isolation_mask(n_world: int) -> torch.Tensor:
+    """Spatial-attention mask that isolates a trailing read-only agent token.
+
+    The token sequence per frame is laid out as `[world_tokens..., agent]`,
+    where `world_tokens` is the existing `[Z, Reg, IC, AC, A]` block of length
+    `n_world`. The agent token sits at index `n_world` (the last position).
+
+    Polarity (matches the float-mask convention used by AxialAttention: 0.0 =
+    allowed, -inf = blocked):
+        - Agent row (last): can attend to everything → all zeros.
+        - World rows: cannot attend to the agent column → -inf at the last col.
+        - All other cells: 0.0 — i.e. inside the world block we leave attention
+          fully open, matching the `spatial_mask=None` path used when the
+          reward head is disabled. So toggling `train_reward_model` adds
+          *only* agent isolation, no other change to spatial attention.
+
     Args:
-        n_latent:        number of image latent tokens (Z)
-        n_register:      number of register tokens (Reg)
-        n_image_control: number of image diffusion control tokens (IC), typically 1
-        n_action_control:number of action diffusion control tokens (AC), typically 1
-        n_action:        number of action tokens (A)
-    
+        n_world: number of world (non-agent) tokens per frame.
+
     Returns:
-        mask: BoolTensor of shape [N, N] where N = sum of all token counts.
-              True  = allowed to attend.
-              False = blocked (will be -inf in softmax).
+        float mask of shape (n_world + 1, n_world + 1).
     """
-    n_total = n_latent + n_register + n_image_control + n_action_control + n_action
-
-    # Compute slice indices for each group
-    z_start,   z_end   = 0,                                    n_latent
-    reg_start, reg_end = z_end,                                z_end   + n_register
-    ic_start,  ic_end  = reg_end,                              reg_end + n_image_control
-    ac_start,  ac_end  = ic_end,                               ic_end  + n_action_control
-    a_start,   a_end   = ac_end,                               ac_end  + n_action
-
-    # Start fully blocked
-    mask_bool = torch.zeros(n_total, n_total, dtype=torch.bool)
-
-    # Helper to open a block in the mask: rows [r0:r1] can attend to cols [c0:c1]
-    def allow(r0, r1, c0, c1):
-        mask_bool[r0:r1, c0:c1] = True
-    # --- State Group (Z, Reg) ---
-    # Z attends to: Z, Reg, IC (+ optionally AC, A when latent_attends_action=True)
-    allow(z_start,   z_end,   z_start,   z_end)    # Z   -> Z
-    allow(z_start,   z_end,   reg_start, reg_end)   # Z   -> Reg
-    allow(z_start,   z_end,   ic_start,  ic_end)    # Z   -> IC
-    if latent_attends_action:
-        allow(z_start,   z_end,   ac_start,  ac_end)    # Z   -> AC
-        allow(z_start,   z_end,   a_start,   a_end)     # Z   -> A
-
-    # Reg attends to everything
-    allow(reg_start, reg_end, z_start,   z_end)     # Reg -> Z
-    allow(reg_start, reg_end, reg_start, reg_end)   # Reg -> Reg
-    allow(reg_start, reg_end, ic_start,  ic_end)    # Reg -> IC
-    allow(reg_start, reg_end, ac_start,  ac_end)    # Reg -> AC
-    allow(reg_start, reg_end, a_start,   a_end)     # Reg -> A
-
-    # --- Control Tokens ---
-    # IC attends to: IC only
-    allow(ic_start,  ic_end,  ic_start,  ic_end)    # IC  -> IC
-
-    # AC attends to: AC only
-    allow(ac_start,  ac_end,  ac_start,  ac_end)    # AC  -> AC
-
-    # --- Action Group (A) ---
-    # A attends to: Z, Reg, IC, AC, A  (policy sees full state + both noise levels + itself)
-    allow(a_start,   a_end,   z_start,   z_end)     # A   -> Z
-    allow(a_start,   a_end,   reg_start, reg_end)   # A   -> Reg
-    allow(a_start,   a_end,   ic_start,  ic_end)    # A   -> IC
-    allow(a_start,   a_end,   ac_start,  ac_end)    # A   -> AC
-    allow(a_start,   a_end,   a_start,   a_end)     # A   -> A
-    mask_float = torch.zeros_like(mask_bool, dtype=torch.float32)
-    # block where false, allow where true
-    mask_float[mask_bool] = 0.0    # allowed attend = 0.
-    mask_float[~mask_bool] = float('-inf')  # blocked attend = -inf
-    return mask_float
+    n_total = n_world + 1
+    mask = torch.zeros(n_total, n_total, dtype=torch.float32)
+    mask[:n_world, n_world] = float('-inf')  # block agent column for world rows
+    return mask
 
 
 class DiscreteEmbedder(nn.Module):
@@ -124,8 +222,14 @@ class DreamerV4DenoiserCfg:
     n_actions: int = 0  # number of action components
     dual_stream: bool = False
     is_causal: bool = False  # whether to use causal masking in the transformer (should be False for standard denoising, True for stepwise inference)
-    latent_attends_action: bool = False  # whether latent (Z) tokens can directly attend to action (A, AC) tokens
     layer_types: Optional[List[str]] = None  # list of layer types, e.g. ["spatial", "temporal", "spatial", "temporal"]; defaults to alternating spatial/temporal
+    # Reward / MTP head. Off by default → bit-equivalent to runs without these
+    # fields. When on, a read-only agent token is appended per frame and an MTP
+    # head produces L=`mtp_length` future-reward predictions per timestep.
+    train_reward_model: bool = False
+    mtp_length: int = 8
+    reward_hidden_dim: int = 512
+    reward_num_buckets: int = 255
 
 class DreamerV4Denoiser(nn.Module):
     """
@@ -154,6 +258,12 @@ class DreamerV4Denoiser(nn.Module):
                                    cfg.num_latent_tokens + \
                                    cfg.num_register_tokens + \
                                     2 # noise level + shortcut tokens (obs + act) that are combined into a single control token each
+        # World-token count BEFORE the optional agent token. Used to size the
+        # agent-isolation mask. Keep this value sourced from
+        # num_modality_tokens so future modality-count changes flow through.
+        self.num_world_tokens = self.num_modality_tokens
+        if cfg.train_reward_model:
+            self.num_modality_tokens += 1  # appended agent token
         if cfg.layer_types is not None:
             self.layer_types = [LayerType(t) for t in cfg.layer_types]
         else:
@@ -189,15 +299,26 @@ class DreamerV4Denoiser(nn.Module):
         self.action_input_proj = nn.Linear(cfg.n_actions, cfg.model_dim)
         # Initialize learnable tokens
         nn.init.normal_(self.register_tokens, std=0.02)
-        dynamics_spatial_mask = build_spatial_attention_mask(
-            n_latent=cfg.num_latent_tokens,
-            n_register=cfg.num_register_tokens,
-            n_image_control=1,
-            n_action_control=1,
-            n_action=cfg.num_action_tokens,
-            latent_attends_action=cfg.latent_attends_action,
-        )
-        self.register_buffer("dynamics_spatial_mask", dynamics_spatial_mask, persistent=False)
+
+        # --- Optional reward head + read-only agent token ---
+        if cfg.train_reward_model:
+            # (1, 1, 1, D): broadcasts to (B, T, 1, D) at forward time. Init
+            # scale matches the reference implementation.
+            self.agent_token = nn.Parameter(
+                torch.randn(1, 1, 1, cfg.model_dim) * 0.02
+            )
+            self.reward_head = RewardMTPHead(
+                input_dim=cfg.model_dim,
+                hidden_dim=cfg.reward_hidden_dim,
+                mtp_length=cfg.mtp_length,
+                num_buckets=cfg.reward_num_buckets,
+            )
+            agent_spatial_mask = build_agent_isolation_mask(self.num_world_tokens)
+            self.register_buffer("agent_spatial_mask", agent_spatial_mask, persistent=False)
+        else:
+            self.register_parameter("agent_token", None)
+            self.reward_head = None
+            self.agent_spatial_mask = None
 
     def forward(
         self,
@@ -235,28 +356,49 @@ class DreamerV4Denoiser(nn.Module):
         act_tokens = self.action_input_proj(noisy_act).unsqueeze(-2)  # (B, T, 1, D_model)
 
         # --- Concatenate tokens:
-        #[obs_tokens : register_tokens : obs_diff_control_token : act_diff_control_token : action_tokens]
+        #[obs_tokens : register_tokens : obs_diff_control_token : act_diff_control_token : action_tokens (: agent_token)]
         # obs_tokens       : (B, T, N_lat,   D)
         # reg_tokens       : (B, T, S_r,     D)
         # obs_diff_control_token : (B, T, 1,       D)
         # act_diff_control_token : (B, T, 1,       D)
         # act_tokens       : (B, T, S_a,     D)
+        # agent_token (opt): (B, T, 1,       D)
         x = torch.cat(
             [obs_tokens, reg_tokens, obs_diff_control_token, act_diff_control_token, act_tokens],
             dim=-2,  # token dimension
         )  # x: (B, T, N_lat + S_r + 1 + S_a, D_model)
 
+        if self.cfg.train_reward_model:
+            agent_part = self.agent_token.expand(B, T, -1, -1)  # (B, T, 1, D)
+            x = torch.cat([x, agent_part], dim=-2)              # (..., +1)
+
         # --- Transformer dynamics ---
+        # Spatial layers consume `spatial_mask`; temporal layers ignore it
+        # (see EfficientTransformerLayer.forward — the mask kwarg is only
+        # threaded into the spatial branch). So passing the agent-isolation
+        # mask to every block gives the right "spatial-only" semantics for
+        # free, and `None` preserves today's exact behavior.
+        # Cast the mask to the activation dtype so SDPA kernels don't fault
+        # under bf16 autocast.
+        if self.cfg.train_reward_model:
+            spatial_mask = self.agent_spatial_mask.to(dtype=x.dtype)
+        else:
+            spatial_mask = None
         for layer in self.layers:
-            # x = layer(x, spatial_mask=self.dynamics_spatial_mask)
-            x = layer(x, spatial_mask=None) # No spatial masking
+            x = layer(x, spatial_mask=spatial_mask)
 
         # --- Project back to latent dim, return only latent slice ---
-        # x: (B, T, N_lat + S_r + 1 + S_a, D_model) -> (B, T, N_lat + ..., D_latent)
-        obs_output = self.obs_projector(x[:, :, :self.cfg.num_latent_tokens, :])  # (B, T, N_lat, D_latent)
-        act_output = self.action_projector(x[:, :, -self.cfg.num_action_tokens:, :])  # (B, T, S_a, n_actions)
-        # observation and action denoising scores: (B, T, N_lat, D_latent)
-        return obs_output, act_output
+        if self.cfg.train_reward_model:
+            world_x = x[:, :, :-1, :]                                # drop agent col
+            agent_x = x[:, :, -1, :]                                  # (B, T, D)
+            obs_output = self.obs_projector(world_x[:, :, :self.cfg.num_latent_tokens, :])
+            act_output = self.action_projector(world_x[:, :, -self.cfg.num_action_tokens:, :])
+            pred_rewards = self.reward_head(agent_x)                  # (B, T, L, K)
+            return obs_output, act_output, pred_rewards
+        else:
+            obs_output = self.obs_projector(x[:, :, :self.cfg.num_latent_tokens, :])  # (B, T, N_lat, D_latent)
+            act_output = self.action_projector(x[:, :, -self.cfg.num_action_tokens:, :])  # (B, T, S_a, n_actions)
+            return obs_output, act_output, None
     
     def forward_step(self, 
                      action: torch.Tensor, 

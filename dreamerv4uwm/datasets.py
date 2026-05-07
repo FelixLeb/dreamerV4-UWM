@@ -50,10 +50,13 @@ class ShardedHDF5Dataset(Dataset):
         # Build window index across all shards
         self.windows = []
         self.episode_lengths = []  # Store all episode lengths for analysis
+        self.has_rewards = False
 
         for shard_idx, shard_file in enumerate(self.shard_files):
             with h5py.File(shard_file, 'r') as f:
                 num_episodes = f.attrs['num_episodes']
+                if shard_idx == 0:
+                    self.has_rewards = 'rewards' in f
                 try:
                     lengths = f['episode_lengths'][:]
                 except:
@@ -115,13 +118,17 @@ class ShardedHDF5Dataset(Dataset):
                     actions = f['actions_rel'][ep_idx, start:end]
             except:
                 actions = f['actions'][ep_idx, start:end]
+            rewards = f['rewards'][ep_idx, start:end] if self.has_rewards else None
 
         # Convert to PyTorch
         images = torch.from_numpy(images).float() / 255.0
         images = images.permute(0, 3, 1, 2)
         actions = torch.from_numpy(actions)
-        
-        return {'image': images, 'action': actions}
+
+        out = {'image': images, 'action': actions}
+        if rewards is not None:
+            out['reward'] = torch.from_numpy(rewards).float()
+        return out
 
 
     def get_episode_length_statistics(self):

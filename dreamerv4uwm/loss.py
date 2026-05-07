@@ -2,9 +2,76 @@ import math
 from typing import Optional, List
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .models.dynamics import DreamerV4Denoiser
 import torch.distributed as dist
 import random
+
+
+# Symlog two-hot bucket range. Must match SymlogTwoHotHead's defaults in
+# dreamerv4uwm/models/dynamics.py — the loss bucketizes targets onto the same
+# grid the model's heads project onto. If those defaults are ever made
+# cfg-tunable, plumb the same values here.
+_REWARD_SYMLOG_MIN = -20.0
+_REWARD_SYMLOG_MAX = 20.0
+
+
+def _two_hot_targets(rewards: torch.Tensor, num_buckets: int):
+    """Compute two-hot bucket targets in symlog space.
+
+    Returns (low, low_w, high, high_w), each the same shape as `rewards`. low
+    and high are long tensors of bucket indices; low_w/high_w are floats
+    summing to 1 per element. Clamps OOR rewards to the edge buckets and
+    handles the bucket-edge `low == high` case (mass goes onto `low`).
+    """
+    y = torch.sign(rewards) * torch.log(torch.abs(rewards) + 1.0)  # symlog
+    width = (_REWARD_SYMLOG_MAX - _REWARD_SYMLOG_MIN) / (num_buckets - 1)
+    indices = (y - _REWARD_SYMLOG_MIN) / width
+    indices = indices.clamp(0, num_buckets - 1)
+    low = indices.floor().long()
+    high = indices.ceil().long()
+    low_w = high.float() - indices
+    high_w = indices - low.float()
+    edge = (low == high)
+    low_w = torch.where(edge, torch.ones_like(low_w), low_w)
+    high_w = torch.where(edge, torch.zeros_like(high_w), high_w)
+    return low, low_w, high, high_w
+
+
+def compute_reward_mtp_loss(
+    pred_rewards: torch.Tensor,    # (B, T, L, K) logits
+    rewards: torch.Tensor,          # (B, T) raw scalar rewards
+) -> torch.Tensor:
+    """Multi-token-prediction two-hot CE on bucketized symlog rewards.
+
+    Builds targets target_{t, l} = rewards[t + l] for l in [0, L), with
+    out-of-window positions masked out.
+
+    Casts logits to fp32 before log-softmax — bf16 underflows on the
+    one-bucket-wide weights. Returns a scalar mean over valid (t, l) pairs.
+
+    Returns 0.0 when T == 0.
+    """
+    B, T, L, K = pred_rewards.shape
+    if T == 0:
+        return pred_rewards.new_zeros(())
+
+    # Roll rewards into per-(t, l) targets via right-padded unfold.
+    padded = F.pad(rewards, (0, L - 1))                          # (B, T + L - 1)
+    targets = padded.unfold(dimension=1, size=L, step=1)[:, :T]  # (B, T, L)
+
+    # Validity: drop (t, l) pairs that overshoot the window.
+    t_idx = torch.arange(T, device=rewards.device).view(1, T, 1)
+    l_idx = torch.arange(L, device=rewards.device).view(1, 1, L)
+    valid = ((t_idx + l_idx) < T).expand(B, T, L).float()
+
+    low, low_w, high, high_w = _two_hot_targets(targets, num_buckets=K)
+    logp = F.log_softmax(pred_rewards.float(), dim=-1)            # fp32 cast
+    nll = -(
+        low_w * logp.gather(-1, low.unsqueeze(-1)).squeeze(-1)
+        + high_w * logp.gather(-1, high.unsqueeze(-1)).squeeze(-1)
+    )
+    return (nll * valid).sum() / valid.sum().clamp_min(1.0)
 
 
 def loss_weight(tau: torch.Tensor, scheme: str = 'ramp') -> torch.Tensor:
@@ -251,8 +318,20 @@ def compute_uwm_loss(
     denoiser: DreamerV4Denoiser,
     device='cpu',
     loss_weighting: str = 'ramp',
+    rewards: Optional[torch.Tensor] = None,
 ):
-    
+    """Returns a dict with keys:
+        - obs_flow_loss : scalar
+        - act_flow_loss : scalar
+        - reward_loss   : scalar or None (None when train_reward_model=False)
+
+    `rewards` is a (B, T) tensor of raw scalar rewards. Required when
+    `denoiser.cfg.train_reward_model` is True; ignored otherwise. Always
+    matches the time axis of `info['x']` — caller's responsibility to slice
+    rewards to the same window as the latents/actions when running on the
+    image branch (T=1) or when cropping.
+    """
+
     # --- obs ---
     x = info["x"]
     B, T, N_lat, D_lat = x.shape
@@ -266,14 +345,14 @@ def compute_uwm_loss(
 
     step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
 
-    z_hat, a_hat = denoiser(
+    z_hat, a_hat, pred_rewards = denoiser(
         noisy_act=a_tau.squeeze(-2),  # (B,T,A) — denoiser expects (B,T,n_actions)
         noisy_obs=x_tau,
         obs_sigma_idx=obs_tau_idx,
         obs_step_idx=step_idx,
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
-    )  # a_hat: (B,T,1,A)
+    )  # a_hat: (B,T,1,A); pred_rewards: (B,T,L,K) or None
 
     # X-prediction targets: directly regress clean signal
     obs_x_target = x                    # (B, T, N_lat, D_lat)
@@ -318,7 +397,21 @@ def compute_uwm_loss(
     else:
         raise NotImplementedError
 
-    return obs_flow_loss, act_flow_loss
+    # --- reward MTP loss (only when the head exists) ---
+    reward_loss = None
+    if pred_rewards is not None:
+        if rewards is None:
+            raise RuntimeError(
+                "denoiser was built with train_reward_model=True but "
+                "compute_uwm_loss was called without `rewards`."
+            )
+        reward_loss = compute_reward_mtp_loss(pred_rewards, rewards)
+
+    return {
+        "obs_flow_loss": obs_flow_loss,
+        "act_flow_loss": act_flow_loss,
+        "reward_loss": reward_loss,
+    }
 
 
 
@@ -577,6 +670,7 @@ def compute_bootstrap_uwm_loss(
     device='cpu',
     teacher: Optional[DreamerV4Denoiser] = None,
     loss_weighting: str = 'ramp',
+    rewards: Optional[torch.Tensor] = None,
 ):
     """
     Shortcut / bootstrap loss for the unified world model (two streams: obs + act).
@@ -589,7 +683,10 @@ def compute_bootstrap_uwm_loss(
     (typically an EMA copy of the student). If `teacher is None` the student itself is
     used in no-grad / eval mode (self-bootstrapped target).
 
-    Returns: obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss  (all scalars)
+    Returns a dict: {obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss,
+    reward_loss}. `reward_loss` is None unless the denoiser was built with
+    `train_reward_model=True`. Reward MTP is computed only on the big-step
+    (student) forward — the half-step target forwards discard the third return.
     """
     # --- unpack info from ShortcutUWMForwardProcess.forward() ---
     x = info["x"]                                      # (B, T, N_lat, D_lat) clean obs
@@ -641,7 +738,7 @@ def compute_bootstrap_uwm_loss(
             restore_student_train = True
 
         # --- first half-step: f(x_τ, τ, d/2) ---
-        f1_obs, f1_act = target_net(
+        f1_obs, f1_act, _ = target_net(
             noisy_act=a_tau_det.squeeze(-2),
             noisy_obs=x_tau_det,
             obs_sigma_idx=obs_tau_idx,
@@ -659,7 +756,7 @@ def compute_bootstrap_uwm_loss(
 
         # tau indices at τ + d/2  (already computed by forward process)
         # --- second half-step: f(z', τ+d/2, d/2) ---
-        f2_obs, f2_act = target_net(
+        f2_obs, f2_act, _ = target_net(
             noisy_act=a_prime.squeeze(-2),
             noisy_obs=z_prime,
             obs_sigma_idx=obs_tau_plus_half_idx,
@@ -682,7 +779,7 @@ def compute_bootstrap_uwm_loss(
     # =================================================
     # 2) Big-step prediction (gradient tracked)
     # =================================================
-    z_hat, a_hat = denoiser(
+    z_hat, a_hat, pred_rewards = denoiser(
         noisy_act=a_tau_det.squeeze(-2),
         noisy_obs=x_tau_det,
         obs_sigma_idx=obs_tau_idx,
@@ -765,4 +862,20 @@ def compute_bootstrap_uwm_loss(
     else:
         raise NotImplementedError
 
-    return obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss
+    # --- reward MTP loss (only when the head exists) ---
+    reward_loss = None
+    if pred_rewards is not None:
+        if rewards is None:
+            raise RuntimeError(
+                "denoiser was built with train_reward_model=True but "
+                "compute_bootstrap_uwm_loss was called without `rewards`."
+            )
+        reward_loss = compute_reward_mtp_loss(pred_rewards, rewards)
+
+    return {
+        "obs_flow_loss": obs_flow_loss,
+        "act_flow_loss": act_flow_loss,
+        "obs_boot_loss": obs_boot_loss,
+        "act_boot_loss": act_boot_loss,
+        "reward_loss": reward_loss,
+    }
