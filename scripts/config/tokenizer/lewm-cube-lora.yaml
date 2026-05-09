@@ -1,0 +1,58 @@
+# @package _global_
+defaults:
+ - /dataset: lewm-cube
+
+reload_checkpoint: null
+# REQUIRED for LoRA finetuning: path to the pretrained tokenizer checkpoint
+tokenizer_ckpt: /home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/tokenizer_ckpts/soar.pt
+output_dir: checkpoints/tokenizer-lora/lewm-cube/${now:%Y-%m-%d_%H-%M-%S}
+plot_every: 1000
+print_every: 100
+log_every: 25
+save_every: 1000
+seed: 42
+
+tokenizer:
+  dual_stream: false
+  num_modality_tokens: 256
+  num_latent_tokens: 256
+  context_length: 32
+  max_sequence_length: 32
+  model_dim: 1024
+  latent_dim: 32
+  enc_num_layers: 4
+  dec_num_layers: 4
+  n_heads: 16
+  n_kv_heads: 16
+  dropout_prob: 0.0
+  qk_norm: false
+  patch_size: 16
+
+train:
+  use_compile: false   # PEFT + torch.compile is fragile; keep off for LoRA finetuning
+  num_epochs: 10       # finetuning is short; tune as needed
+  batch_per_gpu: 2
+  grad_accum_steps: 2
+  lr: 3e-4             # LoRA tolerates higher LR than full finetuning
+  weight_decay: 0.0
+  num_workers: 12
+  lpips_weight: 0.2
+  mixed_precision: true
+  enable_fast_matmul: true
+  clip_grad_norm: 1.0
+
+# LoRA / PEFT configuration — wraps both encoder and decoder
+lora:
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  bias: "none"
+  target_modules: "all-linear"   # both encoder + decoder linear layers; switch to ["W_q","W_v"] for less capacity
+  modules_to_save: null
+  save_merged_final: true
+
+wandb:
+  enable: true
+  api_key: null
+  project: "dreamer-v4-tokenizer-lora"
+  run_name: cube-lora

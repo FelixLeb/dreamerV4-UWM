@@ -258,61 +258,54 @@ class DreamerV4Denoiser(nn.Module):
         # observation and action denoising scores: (B, T, N_lat, D_latent)
         return obs_output, act_output
     
-    def forward_step(self, 
-                     action: torch.Tensor, 
-                     noisy_z: torch.Tensor, 
-                     sigma_idx: torch.Tensor, 
-                     step_idx: torch.Tensor,
-                     start_step_idx: int,
-                     update_cache: bool = True):
-        
-        B, T, N_lat, D_latent = noisy_z.shape
+    def forward_step(
+        self,
+        noisy_act: torch.Tensor,           # (B, T, n_actions)
+        noisy_obs: torch.Tensor,           # (B, T, N_latent, D_latent)
+        obs_sigma_idx: torch.Tensor,       # (B, T) long
+        obs_step_idx: torch.Tensor,        # (B, T) long
+        act_sigma_idx: torch.Tensor,       # (B, T) long
+        act_step_idx: torch.Tensor,        # (B, T) long
+        start_step_idx: int,
+        update_cache: bool = True,
+    ):
+        """KV-cached counterpart to `forward()` for autoregressive sampling.
 
-        # --- Encode diffusion τ and shortcut d into single control token ---
-        # diff_step_token: (B, T, 1, D_model)
-        diff_step_token = self.diffusion_embedder(sigma_idx).unsqueeze(-2)
-        # shortcut_token : (B, T, 1, D_model)
-        shortcut_token = self.shortcut_embedder(step_idx).unsqueeze(-2)
+        Token layout, projections, and outputs mirror `forward()` exactly; only
+        the temporal layers are run via their cached `forward_step` path.
+        """
+        B, T, N_lat, D_latent = noisy_obs.shape
 
-        # concat along channels: (B, T, 1, 2*D_model) -> (B, T, 1, D_model)
-        diff_control_token = torch.cat([shortcut_token, diff_step_token], dim=-1)
-        diff_control_token = self.diff_control_proj(diff_control_token)  # (B, T, 1, D_model)
+        obs_diff_step_token = self.obs_diffusion_embedder(obs_sigma_idx).unsqueeze(-2)
+        obs_shortcut_token  = self.obs_shortcut_embedder(obs_step_idx).unsqueeze(-2)
+        act_diff_step_token = self.act_diffusion_embedder(act_sigma_idx).unsqueeze(-2)
+        act_shortcut_token  = self.act_shortcut_embedder(act_step_idx).unsqueeze(-2)
 
-        # --- Register tokens replicated per time step ---
-        # reg_tokens: (1, 1, S_r, D) -> (B, T, S_r, D)
+        obs_diff_control_token = torch.cat([obs_shortcut_token, obs_diff_step_token], dim=-1)
+        obs_diff_control_token = self.obs_diff_control_proj(obs_diff_control_token)
+        act_diff_control_token = torch.cat([act_shortcut_token, act_diff_step_token], dim=-1)
+        act_diff_control_token = self.act_diff_control_proj(act_diff_control_token)
+
         reg_tokens = self.register_tokens.expand(B, T, -1, -1)
+        obs_tokens = self.latent_projector(noisy_obs)
+        act_tokens = self.action_input_proj(noisy_act).unsqueeze(-2)
 
-        # --- Action tokens: base + encoded components ---
-        # base_action_tokens: (1, 1, S_a, D) -> (B, T, S_a, D)
-        base_action_tokens = self.action_tokens.expand(B, T, -1, -1)
-        if action is not None:
-            action_offsets = self.action_proj(action).unsqueeze(-2) #ToDo: Make this more general 
-            act_tokens = base_action_tokens[:, :action_offsets.shape[1]] + action_offsets
-        else:
-            act_tokens = base_action_tokens
-
-        # --- Project latents to model dim ---
-        # latent_proj: (B, T, N_lat, D_model)
-        latent_proj = self.latent_projector(noisy_z)
-
-        # --- Concatenate tokens:
-        #[latent_tokens : register_tokens : diff_control_token : action_tokens]
-        # latent_proj      : (B, T, N_lat,   D)
-        # reg_tokens       : (B, T, S_r,     D)
-        # diff_control_tok : (B, T, 1,       D)
-        # act_tokens       : (B, T, S_a,     D)
         x = torch.cat(
-            [latent_proj, reg_tokens, diff_control_token, act_tokens],
-            dim=-2,  # token dimension
-        )  # x: (B, T, N_lat + S_r + 1 + S_a, D_model)
-        # 3. Apply Layers
-        for i, layer in enumerate(self.layers):
-            x = layer.forward_step(x, start_step_idx=start_step_idx, spatial_mask=None, update_cache=update_cache)
+            [obs_tokens, reg_tokens, obs_diff_control_token, act_diff_control_token, act_tokens],
+            dim=-2,
+        )
 
-        # 4. Output
-        x = self.output_projector(x)
-        # denoised latents: (B, T, N_lat, D_latent)
-        return x[:, :, :self.cfg.num_latent_tokens, :]
+        for layer in self.layers:
+            x = layer.forward_step(
+                x,
+                start_step_idx=start_step_idx,
+                spatial_mask=None,
+                update_cache=update_cache,
+            )
+
+        obs_output = self.obs_projector(x[:, :, :self.cfg.num_latent_tokens, :])
+        act_output = self.action_projector(x[:, :, -self.cfg.num_action_tokens:, :])
+        return obs_output, act_output
     
     def init_cache(self, batch_size: int, device: torch.device, context_length: int, dtype: torch.dtype):
         """Initializes KV caches for all temporal layers."""

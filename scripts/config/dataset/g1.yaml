@@ -1,0 +1,18 @@
+data_dir: null                # to be set on the command line
+shard_glob: "*.h5"
+img_key: images               # key in the hdf5 shards holding image frames
+action_key: null
+state_key: null
+reward_key: null
+is_done_key: null
+bgr_to_rgb: false
+overlapping: true
+pushT_backward_compatibility: false
+
+# Resize raw images to this (H, W) via F.interpolate before returning them.
+# Must satisfy image_size // tokenizer.patch_size == sqrt(num_modality_tokens).
+resolution: [256, 256]
+resize_mode: bilinear
+
+split_seed: 123
+train_episodes_fraction: 0.9

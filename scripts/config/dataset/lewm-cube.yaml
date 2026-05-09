@@ -1,0 +1,6 @@
+dt: 0.1
+resolution: [256, 256]
+load_to_ram: true
+data_dir: /media/mim-server/Volume1/lewm/sharded/cube
+split_seed: 123
+train_episodes_fraction: 1.0

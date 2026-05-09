@@ -740,114 +740,256 @@ def unified_shortcut_sampler(
 
 
 
-import time
 class AutoRegressiveForwardDynamics:
-    def __init__(self, 
-                 denoiser, 
-                 tokenizer, 
-                 context_length=32, 
-                 max_forward_steps = 5000,
-                 context_cond_tau=0.9, 
+    """KV-cached autoregressive sampler for the UWM two-stream flowmatching denoiser.
+
+    Modes
+    -----
+    'wm'     : world-model. The caller supplies the next action at each `step()`;
+               the action is treated as clean (sigma = clean_idx) and only the
+               next observation is denoised. Context actions are also clean.
+    'policy' : policy. `step()` takes no input; the next observation and the
+               next action are denoised jointly. Context actions are slightly
+               noised at the same `tau_cond` as context observations to match
+               policy-mode training.
+
+    Only the flow-matching denoiser path is supported here: `step_idx` is held at
+    0 (finest step, ↔ d_min) throughout.
+    """
+
+    def __init__(self,
+                 denoiser,
+                 tokenizer,
+                 mode='wm',
+                 context_length=32,
+                 max_forward_steps=5000,
+                 context_cond_tau=0.9,
                  denoising_step_count=4,
-                 device="cuda", 
+                 device="cuda",
                  dtype=torch.float32):
-        
+        assert mode in ('wm', 'policy'), f"mode must be 'wm' or 'policy', got '{mode}'"
+
         self.denoiser = denoiser
         self.tokenizer = tokenizer
+        self.mode = mode
         self.device = device
         self.dtype = dtype
         self.context_length = context_length
         self.context_cond_tau = context_cond_tau
         self.denoising_step_count = denoising_step_count
         self.max_forward_steps = max_forward_steps
-        self.current_frame_index = 0        
-    
+        self.current_frame_index = 0
+
+        N = denoiser.cfg.denoiser.num_noise_levels
+        assert (denoising_step_count & (denoising_step_count - 1)) == 0, \
+            "denoising_step_count must be a power of two"
+        assert N % denoising_step_count == 0, \
+            "num_noise_levels must be a multiple of denoising_step_count"
+        self.num_noise_levels = N
+        self.cond_tau_idx = get_noise_index(context_cond_tau, N)
+        self.clean_idx = N - 1
+        self.flow_step_idx = 0  # flowmatching: always finest step (d_min)
+        self.n_act = denoiser.cfg.denoiser.n_actions
+
+    # ------------------------------------------------------------------
+    # context priming
+    # ------------------------------------------------------------------
     @torch.no_grad
-    def reset(self, imgs_init, actions_init=None):
-        
-        self.current_frame_index=0
-        self.actions_ctx = actions_init.to(device=self.device, dtype=self.dtype) if actions_init is not None else None
-        batch_size = imgs_init.shape[0]
+    def reset(self, imgs_init, actions_init):
+        """Prime the denoiser + tokenizer KV caches with the context window.
 
-        # Encode the context to compute the context tokens
-        latents = self.tokenizer.encode(imgs_init)
+        Args
+        ----
+        imgs_init    : (B, T_ctx, C, H, W)
+        actions_init : (B, T_ctx, n_act) — required for both modes.
+        """
+        assert actions_init is not None, "actions_init is required for both wm and policy modes"
 
-        self.current_z = latents[:, -1].unsqueeze(1)
-        latents_cond = latents.clone()
-        self.latents_cond = latents_cond
-        #Initialize the tokenizer decoder KV cache
-        self.tokenizer.init_cache(batch_size, context_length=self.context_length, device=self.device, dtype=self.dtype)
-        self.tokenizer.decode_step(latents_cond,
-                                            start_step_idx = 0,
-                                            update_cache = True)
-        
-        #Initialize the dynamics KV cache
-        self.denoiser.init_cache(batch_size, context_length=self.context_length, device=self.device, dtype=self.dtype)    
-        latents_cond = (1.0 - self.context_cond_tau) * torch.randn_like(latents_cond).to(latents_cond.device) + self.context_cond_tau * latents_cond
-        self.cond_tau_idx = get_noise_index(self.context_cond_tau, self.denoiser.cfg.denoiser.num_noise_levels)
-        tau_index_tensor = torch.full(
-            (batch_size, latents_cond.shape[1]),
-            self.cond_tau_idx,
-            dtype=torch.long,
-            device=self.device,
-        )
-        step_size = 1./self.denoising_step_count
-        denoising_step_index = get_step_index(step_size, self.denoiser.cfg.denoiser.num_noise_levels)
-        step_index_tensor = torch.full(
-            (batch_size, latents_cond.shape[1]),
-            denoising_step_index,
-            dtype=torch.long,
-            device=self.device,
-        )
+        self.current_frame_index = 0
+        actions_ctx = actions_init.to(device=self.device, dtype=self.dtype)
+
+        latents = self.tokenizer.encode(imgs_init)  # (B, T_ctx, N_lat, D_lat)
+        B, T_ctx = latents.shape[:2]
+        assert actions_ctx.shape[:2] == (B, T_ctx), \
+            f"actions_init shape {tuple(actions_ctx.shape)} inconsistent with imgs_init T_ctx={T_ctx}"
+
+        self.current_z = latents[:, -1:].clone()
+        self.current_act = actions_ctx[:, -1:].clone()
+
+        # ---- tokenizer decoder cache: prime with clean context latents ----
+        self.tokenizer.init_cache(batch_size=B,
+                                  context_length=self.context_length,
+                                  device=self.device,
+                                  dtype=self.dtype)
+        self.tokenizer.decode_step(latents.clone(),
+                                   start_step_idx=0,
+                                   update_cache=True)
+
+        # ---- denoiser cache: prime with slightly-noised obs (and noised actions in policy mode) ----
+        self.denoiser.init_cache(batch_size=B,
+                                 context_length=self.context_length,
+                                 device=self.device,
+                                 dtype=self.dtype)
+
+        latents_cond = (1.0 - self.context_cond_tau) * torch.randn_like(latents) \
+                       + self.context_cond_tau * latents
+
+        if self.mode == 'policy':
+            actions_cond = (1.0 - self.context_cond_tau) * torch.randn_like(actions_ctx) \
+                           + self.context_cond_tau * actions_ctx
+            act_sigma_val = self.cond_tau_idx
+        else:  # 'wm'
+            actions_cond = actions_ctx
+            act_sigma_val = self.clean_idx
+
+        obs_sigma_idx = torch.full((B, T_ctx), self.cond_tau_idx, dtype=torch.long, device=self.device)
+        act_sigma_idx = torch.full((B, T_ctx), act_sigma_val, dtype=torch.long, device=self.device)
+        step_idx = torch.full((B, T_ctx), self.flow_step_idx, dtype=torch.long, device=self.device)
+
         self.denoiser.forward_step(
-                            noisy_z = latents_cond,
-                            sigma_idx=tau_index_tensor,
-                            step_idx=step_index_tensor,
-                            action=self.actions_ctx,
-                            start_step_idx = 0,
-                            update_cache = True)
-            
-        self.current_frame_index += latents_cond.shape[1]
+            noisy_act=actions_cond,
+            noisy_obs=latents_cond,
+            obs_sigma_idx=obs_sigma_idx,
+            obs_step_idx=step_idx,
+            act_sigma_idx=act_sigma_idx,
+            act_step_idx=step_idx,
+            start_step_idx=0,
+            update_cache=True,
+        )
 
+        self.current_frame_index = T_ctx
+
+    # ------------------------------------------------------------------
+    # one autoregressive step
+    # ------------------------------------------------------------------
     @torch.no_grad
     def step(self, actions_t=None):
-        if actions_t is not None:
-            actions_t = actions_t.to(self.device).to(self.dtype)
-        B, _, N, D = self.current_z.shape
-        z_t = torch.randn(B, 1, N, D, device=self.device, dtype=self.dtype)
-        step_length = 1 / self.denoising_step_count
-        step_length_idx = get_step_index(step_length, self.denoiser.cfg.denoiser.num_noise_levels)
-        
-        for i in range(self.denoising_step_count):
-            tau_curr = i / self.denoising_step_count
-            curr_tau_idx = get_noise_index(tau_curr, self.denoiser.cfg.denoiser.num_noise_levels)
-            tau_idxs = torch.full((B, 1), curr_tau_idx, dtype=torch.long, device=self.device)
-            step_idxs = torch.full((B, 1), step_length_idx, dtype=torch.long, device=self.device)
-            
-            pred = self.denoiser.forward_step(
-                action=actions_t, noisy_z=z_t, sigma_idx=tau_idxs,
-                step_idx=step_idxs, start_step_idx=self.current_frame_index, update_cache=False
+        """Sample one frame.
+
+        wm mode    : `actions_t` (shape (B, n_act) or (B, 1, n_act)) is required.
+                     Returns the predicted image (B, C, H, W).
+        policy mode: `actions_t` must be None.
+                     Returns (image, action) where action has shape (B, n_act).
+        """
+        if self.mode == 'wm':
+            assert actions_t is not None, "wm mode requires `actions_t`"
+            return self._step_wm(actions_t)
+        assert actions_t is None, "policy mode does not accept `actions_t`"
+        return self._step_policy()
+
+    def _step_wm(self, actions_t):
+        actions_t = actions_t.to(device=self.device, dtype=self.dtype)
+        if actions_t.ndim == 2:
+            actions_t = actions_t.unsqueeze(1)  # (B, 1, n_act)
+
+        B, _, N_lat, D_lat = self.current_z.shape
+        N = self.num_noise_levels
+        stride = N // self.denoising_step_count
+        step_size = 1.0 / self.denoising_step_count
+
+        z_obs = torch.randn(B, 1, N_lat, D_lat, device=self.device, dtype=self.dtype)
+        step_idx = torch.full((B, 1), self.flow_step_idx, dtype=torch.long, device=self.device)
+        act_sigma_idx = torch.full((B, 1), self.clean_idx, dtype=torch.long, device=self.device)
+
+        for k in range(self.denoising_step_count):
+            tau_idx = k * stride
+            tau = tau_idx / float(N)
+            obs_sigma_idx = torch.full((B, 1), tau_idx, dtype=torch.long, device=self.device)
+
+            obs_pred, _ = self.denoiser.forward_step(
+                noisy_act=actions_t,
+                noisy_obs=z_obs,
+                obs_sigma_idx=obs_sigma_idx,
+                obs_step_idx=step_idx,
+                act_sigma_idx=act_sigma_idx,
+                act_step_idx=step_idx,
+                start_step_idx=self.current_frame_index,
+                update_cache=False,
             )
-            z_t = z_t + (pred - z_t) / max(1.0 - tau_curr, 1e-5) * step_length
+            denom = max(1.0 - tau, 1e-5)
+            v_obs = (obs_pred - z_obs) / denom
+            z_obs = z_obs + v_obs * step_size
 
+        # commit cache: noise predicted obs to tau_cond; action stays clean
+        cor_z = (1.0 - self.context_cond_tau) * torch.randn_like(z_obs) + self.context_cond_tau * z_obs
+        commit_obs_sigma = torch.full((B, 1), self.cond_tau_idx, dtype=torch.long, device=self.device)
 
-        tau_idxs = torch.full((B, 1), self.cond_tau_idx, dtype=torch.long, device=self.device)
-        d_min_idx = get_step_index(1./self.denoiser.cfg.denoiser.num_noise_levels, self.denoiser.cfg.denoiser.num_noise_levels)
-        step_idxs = torch.full((B, 1), d_min_idx, dtype=torch.long, device=self.device)
-        
-        seq_cor_tau = torch.full((B, 1, 1, 1), self.context_cond_tau, dtype=torch.bfloat16, device=self.device)
-        eps = torch.randn_like(z_t)
-        cor_z_t = (1. - seq_cor_tau) * eps + seq_cor_tau * z_t
-            
         self.denoiser.forward_step(
-            action=actions_t, noisy_z=cor_z_t, sigma_idx=tau_idxs,
-            step_idx=step_idxs, start_step_idx=self.current_frame_index, update_cache=True
+            noisy_act=actions_t,
+            noisy_obs=cor_z,
+            obs_sigma_idx=commit_obs_sigma,
+            obs_step_idx=step_idx,
+            act_sigma_idx=act_sigma_idx,
+            act_step_idx=step_idx,
+            start_step_idx=self.current_frame_index,
+            update_cache=True,
         )
 
-        imgs_recon = self.tokenizer.decode_step(z_t,
-                                                           start_step_idx = self.current_frame_index,
-                                                           update_cache = True)
-        
-        self.current_z = z_t.clone()
+        imgs_recon = self.tokenizer.decode_step(z_obs,
+                                                start_step_idx=self.current_frame_index,
+                                                update_cache=True)
+
+        self.current_z = z_obs.clone()
+        self.current_act = actions_t.clone()
         self.current_frame_index += 1
-        return imgs_recon[:,0, ...]
+        return imgs_recon[:, 0, ...]
+
+    def _step_policy(self):
+        B, _, N_lat, D_lat = self.current_z.shape
+        N = self.num_noise_levels
+        stride = N // self.denoising_step_count
+        step_size = 1.0 / self.denoising_step_count
+
+        z_obs = torch.randn(B, 1, N_lat, D_lat, device=self.device, dtype=self.dtype)
+        z_act = torch.randn(B, 1, self.n_act, device=self.device, dtype=self.dtype)
+        step_idx = torch.full((B, 1), self.flow_step_idx, dtype=torch.long, device=self.device)
+
+        for k in range(self.denoising_step_count):
+            tau_idx = k * stride
+            tau = tau_idx / float(N)
+            obs_sigma_idx = torch.full((B, 1), tau_idx, dtype=torch.long, device=self.device)
+            act_sigma_idx = torch.full((B, 1), tau_idx, dtype=torch.long, device=self.device)
+
+            obs_pred, act_pred = self.denoiser.forward_step(
+                noisy_act=z_act,
+                noisy_obs=z_obs,
+                obs_sigma_idx=obs_sigma_idx,
+                obs_step_idx=step_idx,
+                act_sigma_idx=act_sigma_idx,
+                act_step_idx=step_idx,
+                start_step_idx=self.current_frame_index,
+                update_cache=False,
+            )
+            act_pred = act_pred.squeeze(-2)  # (B, 1, n_act)
+
+            denom = max(1.0 - tau, 1e-5)
+            v_obs = (obs_pred - z_obs) / denom
+            v_act = (act_pred - z_act) / denom
+            z_obs = z_obs + v_obs * step_size
+            z_act = z_act + v_act * step_size
+
+        # commit cache: noise both predicted obs and action to tau_cond
+        cor_z = (1.0 - self.context_cond_tau) * torch.randn_like(z_obs) + self.context_cond_tau * z_obs
+        cor_act = (1.0 - self.context_cond_tau) * torch.randn_like(z_act) + self.context_cond_tau * z_act
+        commit_obs_sigma = torch.full((B, 1), self.cond_tau_idx, dtype=torch.long, device=self.device)
+        commit_act_sigma = torch.full((B, 1), self.cond_tau_idx, dtype=torch.long, device=self.device)
+
+        self.denoiser.forward_step(
+            noisy_act=cor_act,
+            noisy_obs=cor_z,
+            obs_sigma_idx=commit_obs_sigma,
+            obs_step_idx=step_idx,
+            act_sigma_idx=commit_act_sigma,
+            act_step_idx=step_idx,
+            start_step_idx=self.current_frame_index,
+            update_cache=True,
+        )
+
+        imgs_recon = self.tokenizer.decode_step(z_obs,
+                                                start_step_idx=self.current_frame_index,
+                                                update_cache=True)
+
+        self.current_z = z_obs.clone()
+        self.current_act = z_act.clone()
+        self.current_frame_index += 1
+        return imgs_recon[:, 0, ...], z_act[:, 0, ...]

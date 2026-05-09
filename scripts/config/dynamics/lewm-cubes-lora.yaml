@@ -1,0 +1,81 @@
+# @package _global_
+defaults:
+ - /tokenizer: /pushT
+
+dual_stream: false
+# REQUIRED for LoRA finetuning: path to the pretrained dynamics checkpoint
+dynamics_ckpt: /home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/dynamics/lewm-cubes/joint/250000.pt
+reload_checkpoint: null
+output_dir: checkpoints/dynamics-lora/${now:%Y-%m-%d_%H-%M-%S}
+plot_every: 1000
+print_every: 100
+log_every: 25
+save_every: 2000
+seed: 42
+
+denoiser:
+  dual_stream: false
+  num_action_tokens: 1
+  num_latent_tokens: 256
+  num_register_tokens: 4
+  context_length: 64
+  max_sequence_length: 64
+  model_dim: 768
+  latent_dim: 32
+  n_layers: 6
+  n_heads: 12
+  n_kv_heads: 12
+  dropout_prob: 0.0
+  qk_norm: false
+  num_noise_levels: 128
+  n_actions: 5
+  is_causal: true
+  latent_attends_action: false
+  layer_types: [spatial, temporal, spatial, temporal]
+  train_reward_model: false   # if true, append agent token + reward MTP head
+  mtp_length: 8                # number of future-step rewards predicted from each frame
+
+train:
+  device: 'cuda:0'
+  use_compile: false   # PEFT + torch.compile is fragile; keep off for LoRA finetuning
+  num_epochs: 20       # finetuning is short; tune as needed
+  batch_per_gpu: 4
+  long_seq_batch_per_gpu: 4
+  long_seq_prob: 0.0
+  context_length: 64
+  accum_grad_steps: 1
+  lr: 3e-4             # LoRA tolerates higher LR than full finetuning
+  weight_decay: 0.0    # weight decay on LoRA matrices is usually disabled
+  num_workers: 12
+  lpips_weight: 0.2
+  num_training_steps: 1e7
+  mixed_precision: false
+  enable_fast_matmul: true
+  clip_grad_norm: 1.0
+  mode_weights:
+    policy: 0.0
+    video: 0.0
+    wm: 1.0
+    id: 0.0
+    forcing: 0.0
+  video_pretraining: false
+  absolute_actions: false
+  shortcut:
+    flow_bias: 0.25
+    ema_decay: 0.999
+  reward_weight: 1.0  # ignored when denoiser.train_reward_model=false
+
+# LoRA / PEFT configuration
+lora:
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  bias: "none"                   # "none" | "all" | "lora_only"
+  target_modules: "all-linear"   # str shortcut OR list of suffix names, e.g. ["W_q","W_v"]
+  modules_to_save: null          # optional list of module names to fully finetune (no LoRA)
+  save_merged_final: true        # at end of training, save a merged full state_dict for plug-and-play with load_denoiser
+
+wandb:
+  enable: true
+  project: "UWM-dynamics-lora"
+  run_name: null

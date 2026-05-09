@@ -31,6 +31,8 @@ denoiser:
   is_causal: true
   latent_attends_action: false
   layer_types: [spatial, temporal, spatial, temporal]
+  train_reward_model: false   # if true, append agent token + reward MTP head
+  mtp_length: 8                # number of future-step rewards predicted from each frame
 
 train:
   device: 'cuda:0'
@@ -59,6 +61,7 @@ train:
   shortcut:
     flow_bias: 0.25   # P(step_index_raw = max_pow2) → forces flow branch. Remaining mass uniform over bootstrap rungs.
     ema_decay: 0.999  # EMA decay for the teacher used in the bootstrap target.
+  reward_weight: 1.0  # ignored when denoiser.train_reward_model=false
 
 wandb:
   enable: true
