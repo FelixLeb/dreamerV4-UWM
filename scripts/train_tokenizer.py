@@ -217,6 +217,7 @@ def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD"
 # ---------------------------------------------------------------------------
 
 def build_dataloaders(cfg, rank, world_size):
+    dataset_kind = cfg.dataset.get("kind", "sharded_hdf5")
     train_loader, train_sampler, _ = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
         window_size=cfg.tokenizer.max_sequence_length,
@@ -231,6 +232,7 @@ def build_dataloaders(cfg, rank, world_size):
         split_seed=cfg.dataset.split_seed,
         shuffle=True,
         drop_last=True,
+        kind=dataset_kind,
     )
 
     test_loader, test_sampler, _ = create_distributed_dataloader(
@@ -247,6 +249,7 @@ def build_dataloaders(cfg, rank, world_size):
         split_seed=cfg.dataset.split_seed,
         shuffle=False,
         drop_last=False,
+        kind=dataset_kind,
     )
 
     return train_loader, train_sampler, test_loader, test_sampler

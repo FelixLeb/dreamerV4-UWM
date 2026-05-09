@@ -154,8 +154,280 @@ class ShardedHDF5Dataset(Dataset):
             'percentile_95': float(np.percentile(lengths, 95)),
             'percentile_99': float(np.percentile(lengths, 99)),
         }
-        
+
         return stats
+
+
+class G1ChunkDataset(Dataset):
+    """
+    Dataset over the G1 world-model chunked HDF5 layout
+    (`/scratch/rk4342/datasets/G1/wm/`).
+
+    Layout differs from `ShardedHDF5Dataset`: each `chunk_XXXX.h5` is a flat
+    per-frame store (no episode dim, no `episode_lengths`) with `images
+    (T,256,256,3) uint8 BGR`, `commands (T,22) float32`, `dones (T,) float32`,
+    and `source_rrd (T,) vlen utf-8`. Episode boundaries are inferred per-chunk
+    from `dones==1` (last frame of a source `.rrd`) and `source_rrd`
+    transitions. We do not stitch episodes across chunk seams — windows that
+    would cross a chunk boundary are dropped (the README notes this loses at
+    most ~228 * window_size frames, negligible vs. 593k total).
+
+    Returns `{'image': (T,3,H,W) float in [0,1] RGB, 'action': (T, 22)}`.
+    BGR→RGB flip happens here. Action is the full 22-dim `commands` vector;
+    downstream loss code crops to `cfg.denoiser.n_actions` if needed.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        window_size: int,
+        stride: int = 1,
+        split: str = "train",
+        train_fraction: float = 0.9,
+        split_seed: int = 42,
+        shuffle_windows: bool = True,
+    ):
+        self.data_dir = Path(data_dir)
+        self.window_size = window_size
+        self.stride = stride
+        self.split = split
+        self.shuffle_windows = shuffle_windows
+
+        self.chunk_paths = sorted(self.data_dir.glob("chunk_*.h5"))
+        if not self.chunk_paths:
+            raise FileNotFoundError(
+                f"No chunk_*.h5 files found in {self.data_dir}"
+            )
+
+        # Build a flat episode list across all chunks. Each episode is a
+        # contiguous run of frames within a single chunk that shares the
+        # same source_rrd and ends at either dones==1 or the last frame
+        # before a source_rrd transition.
+        all_episodes = []  # list of (chunk_idx, start_t, end_t_exclusive)
+        for chunk_idx, p in enumerate(self.chunk_paths):
+            with h5py.File(p, "r") as f:
+                T = f["dones"].shape[0]
+                if T == 0:
+                    continue
+                dones = f["dones"][:]
+                source_rrd = f["source_rrd"][:]
+
+            ep_start = 0
+            for t in range(T):
+                is_done = dones[t] > 0.5
+                next_changes_rrd = (t + 1 < T) and (
+                    source_rrd[t + 1] != source_rrd[t]
+                )
+                if is_done or next_changes_rrd or t == T - 1:
+                    all_episodes.append((chunk_idx, ep_start, t + 1))
+                    ep_start = t + 1
+
+        # Reproducible per-episode train/test split.
+        rng = np.random.default_rng(split_seed)
+        perm = rng.permutation(len(all_episodes))
+        num_train = int(train_fraction * len(all_episodes))
+        if split == "train":
+            keep_idx = set(perm[:num_train].tolist())
+        elif split == "test":
+            keep_idx = set(perm[num_train:].tolist())
+        else:
+            raise ValueError(f"Unknown split: {split}")
+
+        # Build window list across kept episodes.
+        self.windows = []  # list of (chunk_idx, t0)
+        self.episode_lengths = []
+        kept_ep_count = 0
+        for ep_i, (chunk_idx, e_start, e_end) in enumerate(all_episodes):
+            ep_len = e_end - e_start
+            self.episode_lengths.append(ep_len)
+            if ep_i not in keep_idx:
+                continue
+            kept_ep_count += 1
+            for t0 in range(e_start, e_end - window_size + 1, stride):
+                self.windows.append((chunk_idx, t0))
+
+        if self.shuffle_windows:
+            random.shuffle(self.windows)
+
+        self.has_rewards = False
+        print(
+            f"G1[{split}]: {len(self.windows)} windows from {kept_ep_count} "
+            f"episodes (of {len(all_episodes)} total) across "
+            f"{len(self.chunk_paths)} chunks"
+        )
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        chunk_idx, t0 = self.windows[idx]
+        path = self.chunk_paths[chunk_idx]
+        end = t0 + self.window_size
+
+        with h5py.File(
+            path, "r", rdcc_nbytes=128 * 1024 * 1024, rdcc_nslots=int(1e6)
+        ) as f:
+            images = f["images"][t0:end]            # (T, H, W, 3) uint8 BGR
+            commands = f["commands"][t0:end]        # (T, 22) float32
+
+        # BGR -> RGB; .copy() to drop the negative-stride view torch can't take.
+        images = images[..., ::-1].copy()
+        images = torch.from_numpy(images).float().div_(255.0)
+        images = images.permute(0, 3, 1, 2)
+        actions = torch.from_numpy(commands.copy())
+
+        return {"image": images, "action": actions}
+
+    def get_episode_length_statistics(self):
+        lengths = np.array(self.episode_lengths)
+        return {
+            "total_episodes": int(len(lengths)),
+            "total_timesteps": int(np.sum(lengths)),
+            "min_length": int(np.min(lengths)),
+            "max_length": int(np.max(lengths)),
+            "mean_length": float(np.mean(lengths)),
+            "median_length": float(np.median(lengths)),
+            "std_length": float(np.std(lengths)),
+        }
+
+
+class MixedDemoPlayDataset(Dataset):
+    """50/50 mix of demo + play windows with synthesized per-frame rewards.
+
+    Holds two `ShardedHDF5Dataset` instances (one demo, one play). Each
+    `__getitem__` flips a fair coin and draws a window from the chosen
+    subset; the returned dict is augmented with a synthesized `'reward'`
+    tensor of shape `(window_size,)`:
+
+        - play  → `play_reward` everywhere (default 0.0).
+        - demo  → `demo_reward` everywhere (default 1.0), except the last
+                  `goal_frames` frames of the source episode → `goal_reward`
+                  (default 20.0).
+
+    Goal frames are computed in *absolute episode frame* coords using
+    `episode_lengths`, so the mask is correct even if a shard pads multiple
+    episodes to a common max length.
+
+    Demo-window sampling has a `terminal_bias` knob (default 0.5): with that
+    probability, the demo branch picks a window whose `start` equals the
+    terminal start (`ep_length - window_size`), guaranteeing the goal frames
+    are present in the window. Without this bias, in long demo episodes the
+    `+goal_reward` signal is heavily diluted (e.g. `window_size=64`, demo
+    length 150 → only ~13% of random window starts overlap the last 5
+    frames). The remaining `1 - terminal_bias` of demo draws are uniformly
+    random over the demo's windows, which preserves coverage of mid-episode
+    states and prevents the head from collapsing onto pure positional cues.
+
+    This class is a stop-gap label-free signal for fine-tuning the reward MTP
+    head before real per-frame rewards are written into the shards. The
+    play=0 / demo=1 prior actively biases the head against high-reward
+    predictions on play-distribution states, so treat early reward-loss
+    curves as "the pipeline works", not "the head learned reward."
+    """
+
+    def __init__(
+        self,
+        demo_data_dir: str,
+        play_data_dir: str,
+        window_size: int,
+        stride: int = 1,
+        split: str = "train",
+        train_fraction: float = 0.9,
+        split_seed: int = 42,
+        shuffle_windows: bool = True,
+        absolute_actions: bool = False,
+        goal_reward: float = 20.0,
+        demo_reward: float = 1.0,
+        play_reward: float = 0.0,
+        goal_frames: int = 5,
+        terminal_bias: float = 0.5,
+    ):
+        assert 0.0 <= terminal_bias <= 1.0, (
+            f"terminal_bias must be in [0, 1], got {terminal_bias}"
+        )
+        common = dict(
+            window_size=window_size,
+            stride=stride,
+            split=split,
+            train_fraction=train_fraction,
+            split_seed=split_seed,
+            shuffle_windows=shuffle_windows,
+            absolute_actions=absolute_actions,
+        )
+        self.demo = ShardedHDF5Dataset(data_dir=demo_data_dir, **common)
+        self.play = ShardedHDF5Dataset(data_dir=play_data_dir, **common)
+        self.window_size = int(window_size)
+        self.goal_reward = float(goal_reward)
+        self.demo_reward = float(demo_reward)
+        self.play_reward = float(play_reward)
+        self.goal_frames = int(goal_frames)
+        self.terminal_bias = float(terminal_bias)
+
+        # (shard_idx, ep_idx) -> ep_length lookup for the demo dataset, used
+        # to identify goal frames in absolute-frame coords.
+        self._demo_ep_length: dict = {}
+        for shard_idx, shard_file in enumerate(self.demo.shard_files):
+            with h5py.File(shard_file, 'r') as f:
+                try:
+                    lengths = f['episode_lengths'][:]
+                except Exception:
+                    lengths = np.array([f['episode_lengths'][()]])
+            for ep_idx, L in enumerate(lengths):
+                self._demo_ep_length[(int(shard_idx), int(ep_idx))] = int(L)
+
+        # Pre-index the "terminal" windows of the demo dataset — those whose
+        # `start == ep_length - window_size`, i.e. the window covers exactly
+        # the last `window_size` frames and is guaranteed to contain the
+        # goal-frame slice. Used by the terminal-bias sampling branch.
+        self._demo_terminal_indices = [
+            i
+            for i, (shard_idx, ep_idx, start) in enumerate(self.demo.windows)
+            if int(start)
+            == self._demo_ep_length[(int(shard_idx), int(ep_idx))] - self.window_size
+        ]
+
+        # Always emits 'reward' — the training script keys off batch contents
+        # to decide whether to call the reward loss.
+        self.has_rewards = True
+
+    def __len__(self):
+        return len(self.demo) + len(self.play)
+
+    def __getitem__(self, idx):
+        # 50/50 random per-call mixing — idx is consumed by the sampler /
+        # DataLoader iteration count but the actual window choice is
+        # randomized within the worker.
+        if random.random() < 0.5:
+            # Demo branch: with probability `terminal_bias`, pick a window
+            # that's guaranteed to contain the goal frames; otherwise sample
+            # uniformly. Falls back to uniform if there are no terminal
+            # windows in the kept split (shouldn't happen in practice).
+            if (
+                self._demo_terminal_indices
+                and random.random() < self.terminal_bias
+            ):
+                inner_idx = random.choice(self._demo_terminal_indices)
+            else:
+                inner_idx = random.randrange(len(self.demo))
+            sample = self.demo[inner_idx]
+            shard_idx, ep_idx, start = self.demo.windows[inner_idx]
+            ep_length = self._demo_ep_length[(int(shard_idx), int(ep_idx))]
+            t = torch.arange(self.window_size, dtype=torch.long)
+            abs_frame = t + int(start)
+            is_goal = abs_frame >= (ep_length - self.goal_frames)
+            reward = torch.full(
+                (self.window_size,), self.demo_reward, dtype=torch.float32,
+            )
+            reward[is_goal] = self.goal_reward
+        else:
+            inner_idx = random.randrange(len(self.play))
+            sample = self.play[inner_idx]
+            reward = torch.full(
+                (self.window_size,), self.play_reward, dtype=torch.float32,
+            )
+        sample['reward'] = reward
+        return sample
+
 
 # class PushTDataset(Dataset):
 #     """
@@ -808,20 +1080,41 @@ def create_distributed_dataloader(
     shuffle: bool = True,
     drop_last: bool = True,
     absolute_actions: bool = False,
+    kind: str = "sharded_hdf5",
 ):
     """
-    Create DataLoader with DistributedSampler for sharded HDF5 dataset.
+    Create DataLoader with DistributedSampler.
+
+    `kind` selects the dataset layout:
+      - 'sharded_hdf5' (default): legacy per-episode sharded layout
+        (`metadata.json` + `shard_XXXX.h5` with `images (N,T,H,W,C)`).
+      - 'g1_chunked': flat per-frame G1 chunks (`chunk_XXXX.h5`); episode
+        boundaries inferred from `dones` and `source_rrd`. `absolute_actions`
+        is ignored in this branch.
     """
-    # Create the dataset with a fixed split
-    dataset = ShardedHDF5Dataset(
-        data_dir=data_dir,
-        window_size=window_size,
-        stride=stride,
-        split=split,
-        train_fraction=train_fraction,
-        split_seed=split_seed,
-        absolute_actions=absolute_actions,
-    )
+    if kind == "sharded_hdf5":
+        dataset = ShardedHDF5Dataset(
+            data_dir=data_dir,
+            window_size=window_size,
+            stride=stride,
+            split=split,
+            train_fraction=train_fraction,
+            split_seed=split_seed,
+            absolute_actions=absolute_actions,
+        )
+    elif kind == "g1_chunked":
+        dataset = G1ChunkDataset(
+            data_dir=data_dir,
+            window_size=window_size,
+            stride=stride,
+            split=split,
+            train_fraction=train_fraction,
+            split_seed=split_seed,
+        )
+    else:
+        raise ValueError(
+            f"Unknown dataset kind: {kind!r} (expected 'sharded_hdf5' or 'g1_chunked')"
+        )
 
     # Create DistributedSampler
     sampler = DistributedSampler(
@@ -846,6 +1139,71 @@ def create_distributed_dataloader(
     )
 
     return dataloader, sampler, dataset
+
+
+def create_distributed_demo_play_dataloader(
+    demo_data_dir: str,
+    play_data_dir: str,
+    window_size: int,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    num_workers: int = 4,
+    stride: int = 1,
+    seed: int = 42,
+    split: str = "train",
+    train_fraction: float = 0.9,
+    split_seed: int = 42,
+    shuffle: bool = True,
+    drop_last: bool = True,
+    absolute_actions: bool = False,
+    goal_reward: float = 20.0,
+    demo_reward: float = 1.0,
+    play_reward: float = 0.0,
+    goal_frames: int = 5,
+    terminal_bias: float = 0.5,
+):
+    """DataLoader over a 50/50 mix of demo + play windows with synthesized rewards.
+
+    See `MixedDemoPlayDataset` for the reward synthesis convention. Mirrors
+    `create_distributed_dataloader` in shape — DistributedSampler + DataLoader
+    with the same defaults — so it can be a drop-in swap in training scripts.
+    """
+    dataset = MixedDemoPlayDataset(
+        demo_data_dir=demo_data_dir,
+        play_data_dir=play_data_dir,
+        window_size=window_size,
+        stride=stride,
+        split=split,
+        train_fraction=train_fraction,
+        split_seed=split_seed,
+        absolute_actions=absolute_actions,
+        goal_reward=goal_reward,
+        demo_reward=demo_reward,
+        play_reward=play_reward,
+        goal_frames=goal_frames,
+        terminal_bias=terminal_bias,
+    )
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=shuffle,
+        seed=seed,
+        drop_last=drop_last,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=drop_last,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+    return dataloader, sampler, dataset
+
 
 if __name__ == "__main__":
     import argparse

@@ -62,6 +62,7 @@ def build_dataloader(cfg, rank, world_size):
         shuffle=True,
         drop_last=True,
         absolute_actions=cfg.train.absolute_actions,
+        kind=cfg.dataset.get("kind", "sharded_hdf5"),
     )
     return loader, sampler
 
