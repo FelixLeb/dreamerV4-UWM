@@ -1,0 +1,8 @@
+kind: g1_chunked
+dt: 0.1
+resolution: [256, 256]
+load_to_ram: false
+data_dir: /scratch/rk4342/datasets/G1/wm
+split_seed: 123
+train_episodes_fraction: 0.9
+absolute_actions: false

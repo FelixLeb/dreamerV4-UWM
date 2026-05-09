@@ -1,0 +1,92 @@
+# @package _global_
+defaults:
+ - /tokenizer: /g1_wm
+
+dual_stream: false
+dynamics_ckpt: null
+reload_checkpoint: null
+output_dir: checkpoints/dynamics/g1_wm/${now:%Y-%m-%d_%H-%M-%S}
+plot_every: 1000
+print_every: 2000
+log_every: 25
+save_every: 50000
+seed: 42
+
+denoiser:
+  dual_stream: false
+  num_action_tokens: 1
+  num_latent_tokens: 256       # must match tokenizer.num_latent_tokens
+  num_register_tokens: 4
+  context_length: 64
+  max_sequence_length: 96      # short/long branch trains beyond context_length
+  model_dim: 768
+  latent_dim: 32               # must match tokenizer.latent_dim
+  n_layers: 6
+  n_heads: 12
+  n_kv_heads: 12
+  dropout_prob: 0.0
+  qk_norm: false
+  num_noise_levels: 128
+  n_actions: 22                # G1 commands: 3 base vel + 17 upper-body + 2 triggers
+  is_causal: true
+  layer_types: [spatial, temporal, spatial, temporal]
+  # Reward / MTP head off (separate work item).
+  train_reward_model: false
+  mtp_length: 8
+  # NOTE: the reference recipe slurm sets `denoiser.latent_attends_action=true`
+  # but no consumer of that key exists in the codebase today (CLAUDE.md confirms
+  # `spatial_mask=None` is used regardless). Omitted here to avoid carrying a
+  # dead config field; behavior is identical.
+
+train:
+  device: 'cuda:0'
+  use_compile: true
+  num_epochs: 100
+
+  # Short/long mixed-batch training (Dreamer-V4 length-generalization trick).
+  # Loader batches at long_seq_batch_per_gpu × max_sequence_length; with prob
+  # long_seq_prob the long shape is used, otherwise random ctx_len crop.
+  batch_per_gpu: 4
+  long_seq_batch_per_gpu: 4
+  long_seq_prob: 0.15
+  # Image branch (Dreamer-V4 "30% as images"): reshape (B, T) -> (B*T, 1) for
+  # unconditional single-frame training. Cheap; bump image_batch_per_gpu later.
+  image_prob: 0.25
+  image_batch_per_gpu: 64
+  context_length: 64
+
+  accum_grad_steps: 1
+  lr: 1e-4
+  num_workers: 12
+  lpips_weight: 0.2
+  num_training_steps: 1e7
+  mixed_precision: false
+  enable_fast_matmul: true
+  clip_grad_norm: 1.0
+  # `uniform` (not `ramp`) — ramp down-weights the noisy end which is the wrong
+  # bias for forcing/mode-3 training.
+  loss_weighting: uniform
+  reward_weight: 1.0
+  # Best recipe so far: forcing dominates, wm has 2× weight; everything else 0.
+  mode_weights:
+    policy: 0
+    video: 0
+    wm: 2
+    id: 0
+    forcing: 1
+    action_only: 0
+  forcing_mask_actions: false  # actions co-noised with state in forcing mode
+  video_pretraining: false
+  absolute_actions: false      # ignored by g1_chunked loader; kept for shape compat
+  forcing_context_noise:
+    bias: 0.0
+    alpha: 0.5
+    beta: 2.0
+  shortcut:
+    flow_bias: 0.75
+    ema_decay: 0.0
+
+wandb:
+  enable: true
+  project: "UWM-G1"
+  run_name: null

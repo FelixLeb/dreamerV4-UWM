@@ -99,8 +99,12 @@ class CausalTokenizerEncoder(nn.Module):
         for layer in self.layers:
             x = layer(x, spatial_mask=self.spatial_mask)
 
-        # Project to latent_dim and squash
-        x = self.output_nonlinearity(self.output_proj(x))
+        # Project to latent_dim and squash. Force fp32 for the final
+        # projection + tanh: under bf16 autocast, the backward `1 - tanh^2(x)`
+        # underflows to 0 for |x| > ~3 (vs ~9 in fp32), which silently kills
+        # gradient flow through the bottleneck.
+        with torch.autocast(device_type="cuda", enabled=False):
+            x = self.output_nonlinearity(self.output_proj(x.float()))
 
         # Split back into [patch_tokens, latent_tokens]
         S_mod = self.cfg.num_modality_tokens

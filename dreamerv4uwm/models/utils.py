@@ -17,14 +17,14 @@ def load_tokenizer(cfg: DictConfig, device: torch.device, max_num_forward_steps=
 
 
 @torch.no_grad()
-def load_denoiser(cfg: DictConfig, device: torch.device, max_num_forward_steps=None, model_key="model") -> nn.Module:
+def load_denoiser(cfg: DictConfig, device: torch.device, max_num_forward_steps=None, model_key="model", strict=True) -> nn.Module:
     """
     Load DreamerV4 denoiser from checkpoint.
     """
     denoiser = DenoiserWrapper(cfg, max_num_forward_steps=max_num_forward_steps).to(device)
     state = torch.load(cfg.dynamics_ckpt, map_location=device)
     sd = state[model_key]
-    denoiser.load_state_dict(sd, strict=True)
+    denoiser.load_state_dict(sd, strict=strict)
     return denoiser
 
 

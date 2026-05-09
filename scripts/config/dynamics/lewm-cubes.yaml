@@ -1,15 +1,15 @@
 # @package _global_
 defaults:
- - /tokenizer: /pushT
+ - /tokenizer: /soar
 
 dual_stream: false
 dynamics_ckpt: null 
 reload_checkpoint: null
 output_dir: checkpoints/dynamics/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
-print_every: 100
+print_every: 2000
 log_every: 25
-save_every: 2000
+save_every: 50000
 seed: 42
 
 denoiser:
@@ -18,7 +18,7 @@ denoiser:
   num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
   context_length: 64          # The context length for the dynamics model
-  max_sequence_length: 64      # The maximum temporal horizon of the tokenizer during training
+  max_sequence_length: 96      # The maximum temporal horizon of the tokenizer during training
   model_dim: 768              # The dimension of the transformer latents
   latent_dim: 32              # The dimention of the encoder output latents (z)
   n_layers: 6           # Causal tokenizer encoder depth
@@ -29,19 +29,28 @@ denoiser:
   num_noise_levels: 128
   n_actions: 5
   is_causal: true
-  latent_attends_action: false
   layer_types: [spatial, temporal, spatial, temporal]
-  train_reward_model: false   # if true, append agent token + reward MTP head
-  mtp_length: 8                # number of future-step rewards predicted from each frame
+  # Reward / MTP head. Off by default → no agent token, no extra params,
+  # bit-equivalent to runs without these fields.
+  train_reward_model: false
+  mtp_length: 8
 
 train:
   device: 'cuda:0'
   use_compile: true
   num_epochs: 100
+  
   batch_per_gpu: 4
   long_seq_batch_per_gpu: 4
-  long_seq_prob: 0.0
+  long_seq_prob: 0.15
+  # Image branch: reshape (B_long, T_long) → (B_long*T_long, 1) and trim to
+  # image_batch_per_gpu for unconditional single-frame training. Defaults
+  # off (image_prob=0) to preserve today's behavior.
+  image_prob: 0.25
+  image_batch_per_gpu: 64
   context_length: 64
+
+
   accum_grad_steps: 1
   lr: 1e-4
   num_workers: 12
@@ -50,18 +59,33 @@ train:
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
+  # Per-τ loss weighting scheme applied to both flow and (if shortcut) bootstrap
+  # losses. 'ramp' = 0.9τ+0.1 (default, favors clean end); 'uniform' = 1 (equal
+  # weight across the full schedule — use when training the heavily-noisy regime).
+  loss_weighting: ramp
+  # Multiplier on reward MTP loss when denoiser.train_reward_model=true. Ignored otherwise.
+  reward_weight: 1.0
   mode_weights:
-    policy: 0.0
+    policy: 1.0
     video: 0.0
-    wm: 1.0
+    wm: 2.0
     id: 0.0
-    forcing: 0.0
+    forcing: 1.0
+    action_only: 0.0
+  forcing_mask_actions: false  # When true, action τ is pinned to 0 (pure noise) and action loss is zeroed in forcing mode — video-only progressive forcing.
   video_pretraining: false # Set the action to zero in doing video pretraining
   absolute_actions: false # Whether to use absolute actions (actions_abs) instead of relative actions (actions_rel)
+  forcing_context_noise:
+    # In `forcing` mode, with probability `bias` the context-chunk τ (for both
+    # obs and act, independently) is redrawn from Beta(alpha, beta). alpha<beta
+    # tilts mass toward τ≈0 (pure-noise context), giving the model explicit
+    # training for generation from heavily-masked contexts. bias=0 disables.
+    bias: 0.0
+    alpha: 0.5
+    beta: 2.0
   shortcut:
-    flow_bias: 0.25   # P(step_index_raw = max_pow2) → forces flow branch. Remaining mass uniform over bootstrap rungs.
-    ema_decay: 0.999  # EMA decay for the teacher used in the bootstrap target.
-  reward_weight: 1.0  # ignored when denoiser.train_reward_model=false
+    flow_bias: 0.75   # P(step_index_raw = max_pow2) → forces flow branch. Remaining mass uniform over bootstrap rungs.
+    ema_decay: 0.0  # EMA decay for the teacher used in the bootstrap target.
 
 wandb:
   enable: true
