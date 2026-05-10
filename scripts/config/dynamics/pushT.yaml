@@ -48,8 +48,6 @@ train:
   # off (image_prob=0) to preserve today's behavior.
   image_prob: 0.25
   image_batch_per_gpu: 64
-  context_length: 64
-
 
   accum_grad_steps: 1
   lr: 1e-4

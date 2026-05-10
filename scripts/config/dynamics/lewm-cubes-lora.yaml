@@ -42,7 +42,6 @@ train:
   batch_per_gpu: 4
   long_seq_batch_per_gpu: 4
   long_seq_prob: 0.0
-  context_length: 64
   accum_grad_steps: 1
   lr: 3e-4             # LoRA tolerates higher LR than full finetuning
   weight_decay: 0.0    # weight decay on LoRA matrices is usually disabled

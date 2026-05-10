@@ -48,7 +48,6 @@ train:
   num_epochs: 20             # head fine-tuning is fast — fewer epochs than full WM training
 
   batch_per_gpu: 8           # window_size = context_length here, so we can fit more per batch than the WM script's `batch_per_gpu`
-  context_length: 64
 
   accum_grad_steps: 1
   lr: 3e-4                   # head with random init likes a slightly higher LR than the 1e-4 used for full WM training

@@ -220,11 +220,35 @@ class Attention(nn.Module):
             A: (B, n_heads, T_q, T_k) attention weights
         """
         # During inference where q is only for one frame, is_causal=True means your only query is at index i=0,
-        #  so it can attend to only key 0 — not all past keys. Hence, we set is_causal=False in that case to allow attending to all cached keys.     
+        #  so it can attend to only key 0 — not all past keys. Hence, we set is_causal=False in that case to allow attending to all cached keys.
         if q.shape[-2] == 1:
              is_causal = False
         else:
              is_causal = causal
+        # T_q=T_k=1 path: avoid F.scaled_dot_product_attention because flash-attn
+        # backward IMAs on seq_len=1 on Blackwell, and the `sdpa_kernel` context
+        # isn't honored under torch.compile in the current PyTorch. Compute the
+        # same math manually (Q@K^T → softmax → V → W_o). This keeps W_q, W_k
+        # (and self.g if qk_norm is on) in the autograd graph so DDP doesn't
+        # see them as unused. Analytical gradients through W_q/W_k on T=1 are
+        # exactly zero (softmax over one element is constant 1), so this is
+        # mathematically equivalent to the SDPA path.
+        if (q.shape[-2] == 1 and k.shape[-2] == 1
+                and kv_cache is None
+                and self.n_kv_heads == self.n_heads):
+            B_, T_, _ = q.shape  # T_ == 1
+            Q_ = self.W_q(q).view(B_, T_, self.n_heads, self.dk).transpose(1, 2)
+            K_ = self.W_k(k).view(B_, T_, self.n_heads, self.dk).transpose(1, 2)
+            V_ = self.W_v(v).view(B_, T_, self.n_heads, self.dk).transpose(1, 2)
+            if self.qk_norm:
+                Q_ = F.normalize(Q_, dim=-1)
+                K_ = F.normalize(K_, dim=-1)
+                Q_ = self.g * Q_
+            scores = (Q_ @ K_.transpose(-2, -1)) * (self.dk ** -0.5)  # (B, H, 1, 1)
+            weights = F.softmax(scores, dim=-1)
+            attn = weights @ V_  # (B, H, 1, dk)
+            out = attn.transpose(1, 2).contiguous().view(B_, T_, self.d)
+            return self.W_o(out)
         # if mask is not None and mask.dtype not in (torch.bool, torch.float32, torch.float16, torch.bfloat16):
         #     mask = mask.to(torch.bool)
         B, T_q, _ = q.shape
@@ -486,9 +510,9 @@ class EfficientTransformerLayer(nn.Module):
                     q_position_ids=position_ids,
                 )
             else:
-                h = self.attn(h, h, h, dim=1, 
+                h = self.attn(h, h, h, dim=1,
                             mask=None,
-                            causal=self.is_causal, 
+                            causal=self.is_causal,
                             kv_cache = kv_cache,
                             update_cache=update_cache,
                             kv_position_ids=position_ids,

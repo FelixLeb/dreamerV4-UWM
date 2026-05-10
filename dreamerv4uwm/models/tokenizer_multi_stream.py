@@ -325,7 +325,7 @@ class DreamerV4Encoder(nn.Module):
 
     def patchify(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = x.shape
-        x = x.view(B * T, C, H, W)
+        x = x.reshape(B * T, C, H, W)
         tok = self.patch_embed(x)
         tok = tok.flatten(2).transpose(1, 2)
         return tok.view(B, T, self.Np, self.d)
