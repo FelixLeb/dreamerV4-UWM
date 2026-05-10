@@ -47,21 +47,23 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 # ---------------------------------------------------------------------------
 
 def build_dataloader(cfg, rank, world_size):
-    # Loader always delivers max_sequence_length frames per sample; the
-    # trainer decides per accumulation window whether to consume the whole
-    # long batch or slice it down to context_length. Batch size on the
-    # loader follows long_seq_batch_per_gpu — short steps subsample inside
-    # train_epoch.
+    # Loader always delivers max_sequence_length frames per sample. Each
+    # branch consumes a different shape:
+    #   long  → slices to [:long_bs] from the loader's tensor
+    #   short → slices to [:short_bs] and crops T to short_sequence_length
+    #   image → flattens (loader_bs × max_seq) and slices to image_bs
+    # The loader's batch size is therefore max(short_bs, long_bs) so either
+    # branch can be served from the same physical batch. When short_bs > long_bs
+    # this slightly inflates I/O on long-branch micro-batches (extra rows are
+    # discarded) but lets you train cheap-T short batches at a larger row count
+    # than the long branch would fit.
     long_bs = int(cfg.train.get("long_seq_batch_per_gpu", cfg.train.batch_per_gpu))
     short_bs = int(cfg.train.batch_per_gpu)
-    assert long_bs >= short_bs, (
-        f"long_seq_batch_per_gpu ({long_bs}) must be >= batch_per_gpu ({short_bs}); "
-        "short steps subsample from the long-batch tensor."
-    )
+    loader_bs = max(short_bs, long_bs)
     loader, sampler, _ = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
         window_size=cfg.denoiser.max_sequence_length,
-        batch_size=long_bs,
+        batch_size=loader_bs,
         rank=rank,
         world_size=world_size,
         num_workers=cfg.train.num_workers,
@@ -184,7 +186,7 @@ def train_epoch(
     # Loader delivers (B_long, T_long) where T_long = max_sequence_length.
     # Per accumulation window, sample a 3-way categorical branch:
     #   long  → consume (B_long, T_long) as-is (exercises windowed-temporal
-    #           attention; requires max_seq > ctx_len to do anything useful).
+    #           attention; requires max_seq > short_seq_len to do anything useful).
     #   image → reshape (B_long, T_long, …) → (B_long*T_long, 1, …), then
     #           trim to image_batch_per_gpu. Each frame becomes an
     #           independent length-1 sequence; temporal attention is a no-op.
@@ -192,32 +194,39 @@ def train_epoch(
     #           pure noise and applies state loss across the (T=1) sequence —
     #           unconditional single-frame generation for start-frame cold
     #           start.
-    #   short → random-crop along T to context_length, take batch_per_gpu
-    #           samples (today's default behavior).
+    #   short → random-crop along T to short_sequence_length (defaults to
+    #           context_length), take batch_per_gpu samples.
     # Branch is fixed across all micro-batches in one optimizer step so the
     # gradient is coherent and metrics are unambiguous to attribute.
     short_bs = int(cfg.train.batch_per_gpu)
     long_bs = int(cfg.train.get("long_seq_batch_per_gpu", short_bs))
     image_bs = int(cfg.train.get("image_batch_per_gpu", short_bs))
-    ctx_len = int(cfg.denoiser.context_length)
+    # Loader fetches max(short_bs, long_bs) rows; each branch slices its share.
+    loader_bs = max(short_bs, long_bs)
+    # Short-branch crop length. Decoupled from `denoiser.context_length` (which
+    # only sets the temporal-attention window) so the short-branch T can be
+    # tuned independently. Lives under `train:` because it's a data-pipeline
+    # knob, not a model knob; falls back to context_length for backward compat.
+    short_seq_len = int(cfg.train.get("short_sequence_length", cfg.denoiser.context_length))
     max_seq = int(cfg.denoiser.max_sequence_length)
     long_seq_prob = float(cfg.train.get("long_seq_prob", 0.0))
     image_prob = float(cfg.train.get("image_prob", 0.0))
-    assert ctx_len <= max_seq, (
-        f"context_length ({ctx_len}) must be <= max_sequence_length ({max_seq})"
+    assert short_seq_len <= max_seq, (
+        f"short_sequence_length ({short_seq_len}) must be <= max_sequence_length ({max_seq})"
     )
-    # Long branch only fires when it can actually produce T > ctx_len.
-    effective_long_prob = long_seq_prob if max_seq > ctx_len else 0.0
+    # Long branch only fires when it can actually produce T > short_seq_len.
+    effective_long_prob = long_seq_prob if max_seq > short_seq_len else 0.0
     assert 0.0 <= image_prob <= 1.0
     assert effective_long_prob + image_prob <= 1.0 + 1e-6, (
         f"effective_long_prob ({effective_long_prob}) + image_prob "
         f"({image_prob}) must be <= 1"
     )
-    # Image branch trims from the reshaped pool of long_bs * max_seq frames.
-    max_image_rows = long_bs * max_seq
+    # Image branch trims from the reshaped pool of loader_bs * max_seq frames.
+    max_image_rows = loader_bs * max_seq
     assert image_bs <= max_image_rows, (
         f"image_batch_per_gpu ({image_bs}) exceeds available rows "
-        f"(long_seq_batch_per_gpu * max_sequence_length = {max_image_rows})"
+        f"(max(batch_per_gpu, long_seq_batch_per_gpu) * max_sequence_length "
+        f"= {max_image_rows})"
     )
 
     epoch_start = time.perf_counter()
@@ -281,10 +290,10 @@ def train_epoch(
             accum_branch = ("long", "image", "short")[int(branch_code_t.item())]
 
             # Random crop start — short branch only.
-            if accum_branch == "short" and max_seq > ctx_len:
+            if accum_branch == "short" and max_seq > short_seq_len:
                 if rank == 0:
                     start_t = torch.randint(
-                        0, max_seq - ctx_len + 1, (1,),
+                        0, max_seq - short_seq_len + 1, (1,),
                         device=device, dtype=torch.long,
                     )
                 else:
@@ -296,10 +305,18 @@ def train_epoch(
 
         # --- Apply branch slicing ---
         if accum_branch == "short":
-            images = images[:short_bs, crop_start:crop_start + ctx_len]
-            actions = actions[:short_bs, crop_start:crop_start + ctx_len]
+            images = images[:short_bs, crop_start:crop_start + short_seq_len]
+            actions = actions[:short_bs, crop_start:crop_start + short_seq_len]
             if rewards is not None:
-                rewards = rewards[:short_bs, crop_start:crop_start + ctx_len]
+                rewards = rewards[:short_bs, crop_start:crop_start + short_seq_len]
+        elif accum_branch == "long":
+            # Loader fetches loader_bs = max(short_bs, long_bs); explicitly trim
+            # to long_bs here so the long branch sees its configured batch size
+            # regardless of which other knob is larger.
+            images = images[:long_bs]
+            actions = actions[:long_bs]
+            if rewards is not None:
+                rewards = rewards[:long_bs]
         elif accum_branch == "image":
             # Flatten time into batch — (B_long, T_long, …) → (B_long*T_long,
             # 1, …) — so every frame is an independent length-1 sequence.
@@ -311,11 +328,18 @@ def train_epoch(
             B_in, T_in = images.shape[:2]
             images = images.reshape(B_in * T_in, 1, *images.shape[2:])
             actions = actions.reshape(B_in * T_in, 1, *actions.shape[2:])
-            images = images[:image_bs]
-            actions = actions[:image_bs]
             if rewards is not None:
-                rewards = rewards.reshape(B_in * T_in, 1)[:image_bs]
-        # long: leave (B_long, T_long) untouched
+                rewards = rewards.reshape(B_in * T_in, 1)
+            # Shuffle the flattened (window × time) axis before slicing so we
+            # sample uniformly across the loaded window. Without this, taking
+            # `[:image_bs]` always picks the earliest frames and over-samples
+            # episode-start state. Each rank shuffles independently — rank-local
+            # data tensors don't need to align.
+            perm = torch.randperm(B_in * T_in, device=images.device)[:image_bs]
+            images = images[perm]
+            actions = actions[perm]
+            if rewards is not None:
+                rewards = rewards[perm]
 
         torch.cuda.synchronize(device)
         step_start = time.perf_counter()

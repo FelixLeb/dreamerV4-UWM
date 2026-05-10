@@ -17,8 +17,8 @@ denoiser:
   num_action_tokens: 1    # Number of tokens for the image or other modalities
   num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
-  context_length: 64          # The context length for the dynamics model
-  max_sequence_length: 64      # The maximum temporal horizon of the tokenizer during training
+  context_length: 64           # temporal-attention window
+  max_sequence_length: 64      # long-branch T == loader window size
   model_dim: 768              # The dimension of the transformer latents
   latent_dim: 32              # The dimention of the encoder output latents (z)
   n_layers: 6           # Causal tokenizer encoder depth
@@ -41,6 +41,7 @@ train:
   num_epochs: 100
   batch_per_gpu: 4
   long_seq_batch_per_gpu: 4
+  short_sequence_length: 64    # short-branch crop T (independent from denoiser.context_length)
   long_seq_prob: 0.0
   # Image branch: reshape (B_long, T_long) → (B_long*T_long, 1) and trim to
   # image_batch_per_gpu for unconditional single-frame training. Defaults

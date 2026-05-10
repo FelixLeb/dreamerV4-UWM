@@ -18,8 +18,8 @@ denoiser:
   num_action_tokens: 1
   num_latent_tokens: 256
   num_register_tokens: 4
-  context_length: 64
-  max_sequence_length: 64
+  context_length: 64           # temporal-attention window
+  max_sequence_length: 64      # long-branch T == loader window size
   model_dim: 768
   latent_dim: 32
   n_layers: 6
@@ -41,6 +41,7 @@ train:
   num_epochs: 20       # finetuning is short; tune as needed
   batch_per_gpu: 4
   long_seq_batch_per_gpu: 4
+  short_sequence_length: 64    # short-branch crop T (independent from denoiser.context_length)
   long_seq_prob: 0.0
   accum_grad_steps: 1
   lr: 3e-4             # LoRA tolerates higher LR than full finetuning

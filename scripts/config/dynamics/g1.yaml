@@ -16,8 +16,8 @@ denoiser:
   num_action_tokens: 1
   num_latent_tokens: 256       # must match tokenizer.num_latent_tokens
   num_register_tokens: 4
-  context_length: 64
-  max_sequence_length: 96      # short/long branch trains beyond context_length
+  context_length: 64           # temporal-attention window
+  max_sequence_length: 96      # long-branch T == loader window size
   model_dim: 768
   latent_dim: 32               # must match tokenizer.latent_dim
   n_layers: 6
@@ -47,6 +47,7 @@ train:
   # long_seq_prob the long shape is used, otherwise random ctx_len crop.
   batch_per_gpu: 4
   long_seq_batch_per_gpu: 4
+  short_sequence_length: 64    # short-branch crop T (independent from denoiser.context_length)
   long_seq_prob: 0.15
   # Image branch (Dreamer-V4 "30% as images"): reshape (B, T) -> (B*T, 1) for
   # unconditional single-frame training. Cheap; bump image_batch_per_gpu later.
