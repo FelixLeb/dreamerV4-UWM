@@ -437,17 +437,32 @@ class DreamerV4Denoiser(nn.Module):
             dim=-2,
         )
 
+        if self.cfg.train_reward_model:
+            agent_part = self.agent_token.expand(B, T, -1, -1)
+            x = torch.cat([x, agent_part], dim=-2)
+            spatial_mask = self.agent_spatial_mask.to(dtype=x.dtype)
+        else:
+            spatial_mask = None
+
         for layer in self.layers:
             x = layer.forward_step(
                 x,
                 start_step_idx=start_step_idx,
-                spatial_mask=None,
+                spatial_mask=spatial_mask,
                 update_cache=update_cache,
             )
 
-        obs_output = self.obs_projector(x[:, :, :self.cfg.num_latent_tokens, :])
-        act_output = self.action_projector(x[:, :, -self.cfg.num_action_tokens:, :])
-        return obs_output, act_output
+        if self.cfg.train_reward_model:
+            world_x = x[:, :, :-1, :]
+            agent_x = x[:, :, -1, :]
+            obs_output = self.obs_projector(world_x[:, :, :self.cfg.num_latent_tokens, :])
+            act_output = self.action_projector(world_x[:, :, -self.cfg.num_action_tokens:, :])
+            pred_rewards = self.reward_head(agent_x)
+            return obs_output, act_output, pred_rewards
+        else:
+            obs_output = self.obs_projector(x[:, :, :self.cfg.num_latent_tokens, :])
+            act_output = self.action_projector(x[:, :, -self.cfg.num_action_tokens:, :])
+            return obs_output, act_output, None
     
     def init_cache(self, batch_size: int, device: torch.device, context_length: int, dtype: torch.dtype):
         """Initializes KV caches for all temporal layers."""

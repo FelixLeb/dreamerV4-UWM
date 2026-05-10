@@ -1,11 +1,10 @@
 # @package _global_
 defaults:
- - /tokenizer: /g1_wm
+ - /tokenizer: /g1
 
-dual_stream: false
 dynamics_ckpt: null
 reload_checkpoint: null
-output_dir: checkpoints/dynamics/g1_wm/${now:%Y-%m-%d_%H-%M-%S}
+output_dir: checkpoints/dynamics/g1/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 2000
 log_every: 25

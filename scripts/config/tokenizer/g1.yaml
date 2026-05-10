@@ -1,42 +1,61 @@
 # @package _global_
 defaults:
  - /dataset: g1
+ - _self_
 
 reload_checkpoint: null
-tokenizer_ckpt: null
+# Default to the reference G1 tokenizer (two-stream + proprio).
+# Override with tokenizer_ckpt=null on the command line to train from scratch.
+# Format ('native' vs the reference 'enc'/'dec' layout) is auto-detected from
+# the file's top-level keys; no extra config field needed.
+tokenizer_ckpt: /home/mim-server/robot/GR00T-WholeBodyControl/tokenizer.pt
 output_dir: checkpoints/tokenizer/g1/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100
 log_every: 25
-save_every: 1000
+save_every: 5000
 seed: 42
 
+# Multi-stream architecture matching the reference G1 checkpoint
+# (constants from wm_pico_eval_kvcache.py). The shared fields below cover both
+# arches; the multi_stream sub-block holds keys only this arch consumes.
 tokenizer:
-  dual_stream: false
-  num_modality_tokens: 256    # Number of tokens for the image or other modalities
-  num_latent_tokens: 256      # The number of latent tokens per frame
-  context_length: 32           # The maximum temporal horizon of the tokenizer
-  max_sequence_length: 32      # The maximum temporal horizon of the tokenizer during training
-  model_dim: 1024              # The dimension of the transformer latents
-  latent_dim: 32              # The dimention of the encoder output latents (z)
-  enc_num_layers: 4           # Causal tokenizer encoder depth
-  dec_num_layers: 4           # Causal tokenizer decoder depth
-  n_heads: 16
-  n_kv_heads: 16
+  architecture: multi_stream
+  # shared
+  num_modality_tokens: 256       # 256/16 = 16 → 16×16 = 256 patch tokens
+  num_latent_tokens: 256         # = N_LATENTS
+  context_length: 32
+  max_sequence_length: 5000      # = MAX_INTERACTIVE_LEN; gives RoPE room for long rollouts
+  model_dim: 1024
+  latent_dim: 32                 # = BOTTLENECK_D
+  enc_num_layers: 16
+  dec_num_layers: 16
+  n_heads: 16                    # = HEADS_Q_ENC
+  n_kv_heads: 16                 # = HEADS_KV_LATENT_ENC; latent stream uses GQA when < n_heads
   dropout_prob: 0.0
   qk_norm: false
-  patch_size: 16 # Note: image_size//patch_size should be equal to sqrt(num_modality_tokens)
+  patch_size: 16
+  multi_stream:
+    mlp_ratio: 4.0
+    temporal_every: 4            # 3 spatial + 1 temporal per block
+    mae_max_mask_prob: 0.0       # MAE off by default at eval; bump up if retraining
+    activate_masking: false
+    use_proprio: true
+    proprio_dim: 50              # G1 proprio width (matches H5 chunks' `proprio` field)
+    num_proprio: 1
+    in_channels: 3
 
 train:
   use_compile: true
   num_epochs: 60
-  batch_per_gpu: 2
-  grad_accum_steps: 2
+  batch_per_gpu: 1
+  grad_accum_steps: 1
   lr: 1e-4
   weight_decay: 0.01
   num_workers: 12
   lpips_weight: 0.2
-  mixed_precision: true
+  proprio_weight: 1.0   # G1 only — adds MSE on the decoder's proprio readout
+  mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
 

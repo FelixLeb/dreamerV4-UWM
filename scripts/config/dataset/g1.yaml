@@ -1,18 +1,8 @@
-data_dir: null                # to be set on the command line
-shard_glob: "*.h5"
-img_key: images               # key in the hdf5 shards holding image frames
-action_key: null
-state_key: null
-reward_key: null
-is_done_key: null
-bgr_to_rgb: false
-overlapping: true
-pushT_backward_compatibility: false
-
-# Resize raw images to this (H, W) via F.interpolate before returning them.
-# Must satisfy image_size // tokenizer.patch_size == sqrt(num_modality_tokens).
+kind: g1_chunked
+dt: 0.1
 resolution: [256, 256]
-resize_mode: bilinear
-
+load_to_ram: false
+data_dir: /scratch/rk4342/datasets/G1/wm
 split_seed: 123
 train_episodes_fraction: 0.9
+absolute_actions: false

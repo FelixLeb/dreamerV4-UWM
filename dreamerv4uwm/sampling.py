@@ -867,15 +867,27 @@ class AutoRegressiveForwardDynamics:
         """Sample one frame.
 
         wm mode    : `actions_t` (shape (B, n_act) or (B, 1, n_act)) is required.
-                     Returns the predicted image (B, C, H, W).
+                     Returns the predicted image (B, C, H, W), or
+                     `(image, rewards)` when the denoiser has a reward head, where
+                     `rewards` is (B, L) decoded scalar rewards from the final
+                     denoising step's agent token (L = MTP horizon).
         policy mode: `actions_t` must be None.
-                     Returns (image, action) where action has shape (B, n_act).
+                     Returns `(image, action)`, or `(image, action, rewards)` when
+                     the denoiser has a reward head.
         """
         if self.mode == 'wm':
             assert actions_t is not None, "wm mode requires `actions_t`"
             return self._step_wm(actions_t)
         assert actions_t is None, "policy mode does not accept `actions_t`"
         return self._step_policy()
+
+    def _decode_reward_logits(self, pred_rewards):
+        """(B, T, L, K) logits → (B, T, L) scalar rewards in real space."""
+        head0 = self.denoiser.model.reward_head.heads[0]
+        buckets = head0.buckets.to(device=pred_rewards.device, dtype=torch.float32)
+        probs = torch.softmax(pred_rewards.float(), dim=-1)
+        symlog_pred = (probs * buckets).sum(dim=-1)
+        return torch.sign(symlog_pred) * (torch.exp(torch.abs(symlog_pred)) - 1.0)
 
     def _step_wm(self, actions_t):
         actions_t = actions_t.to(device=self.device, dtype=self.dtype)
@@ -891,12 +903,13 @@ class AutoRegressiveForwardDynamics:
         step_idx = torch.full((B, 1), self.flow_step_idx, dtype=torch.long, device=self.device)
         act_sigma_idx = torch.full((B, 1), self.clean_idx, dtype=torch.long, device=self.device)
 
+        last_pred_rewards = None
         for k in range(self.denoising_step_count):
             tau_idx = k * stride
             tau = tau_idx / float(N)
             obs_sigma_idx = torch.full((B, 1), tau_idx, dtype=torch.long, device=self.device)
 
-            obs_pred, _ = self.denoiser.forward_step(
+            obs_pred, _, pred_rewards = self.denoiser.forward_step(
                 noisy_act=actions_t,
                 noisy_obs=z_obs,
                 obs_sigma_idx=obs_sigma_idx,
@@ -909,6 +922,8 @@ class AutoRegressiveForwardDynamics:
             denom = max(1.0 - tau, 1e-5)
             v_obs = (obs_pred - z_obs) / denom
             z_obs = z_obs + v_obs * step_size
+            if k == self.denoising_step_count - 1:
+                last_pred_rewards = pred_rewards
 
         # commit cache: noise predicted obs to tau_cond; action stays clean
         cor_z = (1.0 - self.context_cond_tau) * torch.randn_like(z_obs) + self.context_cond_tau * z_obs
@@ -932,6 +947,10 @@ class AutoRegressiveForwardDynamics:
         self.current_z = z_obs.clone()
         self.current_act = actions_t.clone()
         self.current_frame_index += 1
+
+        if last_pred_rewards is not None:
+            rewards = self._decode_reward_logits(last_pred_rewards)[:, 0]  # (B, L)
+            return imgs_recon[:, 0, ...], rewards
         return imgs_recon[:, 0, ...]
 
     def _step_policy(self):
@@ -944,13 +963,14 @@ class AutoRegressiveForwardDynamics:
         z_act = torch.randn(B, 1, self.n_act, device=self.device, dtype=self.dtype)
         step_idx = torch.full((B, 1), self.flow_step_idx, dtype=torch.long, device=self.device)
 
+        last_pred_rewards = None
         for k in range(self.denoising_step_count):
             tau_idx = k * stride
             tau = tau_idx / float(N)
             obs_sigma_idx = torch.full((B, 1), tau_idx, dtype=torch.long, device=self.device)
             act_sigma_idx = torch.full((B, 1), tau_idx, dtype=torch.long, device=self.device)
 
-            obs_pred, act_pred = self.denoiser.forward_step(
+            obs_pred, act_pred, pred_rewards = self.denoiser.forward_step(
                 noisy_act=z_act,
                 noisy_obs=z_obs,
                 obs_sigma_idx=obs_sigma_idx,
@@ -967,6 +987,8 @@ class AutoRegressiveForwardDynamics:
             v_act = (act_pred - z_act) / denom
             z_obs = z_obs + v_obs * step_size
             z_act = z_act + v_act * step_size
+            if k == self.denoising_step_count - 1:
+                last_pred_rewards = pred_rewards
 
         # commit cache: noise both predicted obs and action to tau_cond
         cor_z = (1.0 - self.context_cond_tau) * torch.randn_like(z_obs) + self.context_cond_tau * z_obs
@@ -992,4 +1014,8 @@ class AutoRegressiveForwardDynamics:
         self.current_z = z_obs.clone()
         self.current_act = z_act.clone()
         self.current_frame_index += 1
+
+        if last_pred_rewards is not None:
+            rewards = self._decode_reward_logits(last_pred_rewards)[:, 0]  # (B, L)
+            return imgs_recon[:, 0, ...], z_act[:, 0, ...], rewards
         return imgs_recon[:, 0, ...], z_act[:, 0, ...]

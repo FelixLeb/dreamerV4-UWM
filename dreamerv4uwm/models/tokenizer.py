@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Optional
 from .blocks import EfficientTransformerBlock
 from .blocks import create_temporal_mask, create_encoder_spatial_mask, create_decoder_spatial_mask
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from omegaconf import DictConfig, OmegaConf
 import math
 
@@ -16,14 +16,13 @@ class CausalTokenizerConfig:
     context_length: int
     model_dim: int
     latent_dim: int
-    enc_num_layers: int 
-    dec_num_layers: int 
+    enc_num_layers: int
+    dec_num_layers: int
     n_heads: int
     n_kv_heads: Optional[int] = None
     dropout_prob: float = 0.0
     qk_norm: bool = True
     patch_size: int = 14
-    dual_stream: bool = False
    
 class CausalTokenizerEncoder(nn.Module):
     """
@@ -377,22 +376,30 @@ class TokenizerWrapper(nn.Module):
     def __init__(self, cfg:DictConfig, max_num_forward_steps=None):
         super().__init__()
         self.cfg = cfg
-        tokenizer_cfg = CausalTokenizerConfig(**OmegaConf.to_object(cfg.tokenizer)) 
+        # Filter unknown keys so adding e.g. `architecture` or a `multi_stream`
+        # sub-block to the tokenizer config doesn't break single-stream init.
+        raw = OmegaConf.to_object(cfg.tokenizer)
+        known = {f.name for f in fields(CausalTokenizerConfig)}
+        tokenizer_cfg = CausalTokenizerConfig(**{k: v for k, v in raw.items() if k in known})
         self.encoder = CausalTokenizerEncoder(tokenizer_cfg, max_num_forward_steps=max_num_forward_steps)
         self.decoder = CausalTokenizerDecoder(tokenizer_cfg, max_num_forward_steps=max_num_forward_steps)
         self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
         self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
         self.masker = TokenMasker(cfg.tokenizer.model_dim)
 
-    def forward(self, images):
+    def forward(self, images, proprio=None):
+        """Reconstruct images. Returns ``(recon_images, None)`` so the call
+        signature matches MultiStreamTokenizerWrapper; this arch has no proprio
+        path so the second slot is always None. ``proprio`` is accepted for
+        signature parity and ignored."""
+        del proprio
         images = (images*2.)-1. # Translate the images in +-1 range
         tokens = self.patchifier(images)
         masked_tokens = self.masker(tokens)
         z, _ = self.encoder(masked_tokens)
         z_decoded = self.decoder(z)
         recon_images = self.image_head(z_decoded)
-        # return  torch.clamp((recon_images + 1)/2., 0., 1.)
-        return (recon_images + 1)/2. 
+        return ((recon_images + 1)/2., None)
     
     def decode_step(self, x: torch.Tensor, start_step_idx: int, update_cache: bool = True):
         z_decoded = self.decoder.forward_step(x, start_step_idx, update_cache)

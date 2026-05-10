@@ -269,6 +269,7 @@ class G1ChunkDataset(Dataset):
         ) as f:
             images = f["images"][t0:end]            # (T, H, W, 3) uint8 BGR
             commands = f["commands"][t0:end]        # (T, 22) float32
+            proprio_np = f["proprio"][t0:end] if "proprio" in f else None  # (T, 50) float32
 
         # BGR -> RGB; .copy() to drop the negative-stride view torch can't take.
         images = images[..., ::-1].copy()
@@ -276,7 +277,10 @@ class G1ChunkDataset(Dataset):
         images = images.permute(0, 3, 1, 2)
         actions = torch.from_numpy(commands.copy())
 
-        return {"image": images, "action": actions}
+        out = {"image": images, "action": actions}
+        if proprio_np is not None:
+            out["proprio"] = torch.from_numpy(proprio_np.copy())
+        return out
 
     def get_episode_length_statistics(self):
         lengths = np.array(self.episode_lengths)

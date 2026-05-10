@@ -27,7 +27,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dreamerv4uwm.datasets import create_distributed_dataloader
 from dreamerv4uwm.models.blocks import EfficientTransformerLayer
-from dreamerv4uwm.models.tokenizer import TokenizerWrapper
+from dreamerv4uwm.models import make_tokenizer
 from dreamerv4uwm.models.utils import load_tokenizer
 from dreamerv4uwm.utils.distributed import cleanup_distributed, setup_distributed
 
@@ -278,10 +278,11 @@ def build_tokenizer(cfg, device):
     if cfg.tokenizer_ckpt:
         print(f"Initializing tokenizer from: {cfg.tokenizer_ckpt}")
         tokenizer = load_tokenizer(
-            cfg, device=device, max_num_forward_steps=cfg.tokenizer.max_sequence_length
+            cfg, device=device,
+            max_num_forward_steps=cfg.tokenizer.max_sequence_length,
         )
     else:
-        tokenizer = TokenizerWrapper(cfg, max_num_forward_steps=cfg.tokenizer.max_sequence_length)
+        tokenizer = make_tokenizer(cfg, max_num_forward_steps=cfg.tokenizer.max_sequence_length)
 
     tokenizer = tokenizer.to(device)
 
@@ -387,6 +388,9 @@ def train_epoch(
     accum_lpips = 0.0
     accum_raw_loss = 0.0
     accum_norm = 0.0
+    accum_proprio = 0.0
+
+    proprio_weight = float(cfg.train.get("proprio_weight", 0.0))
 
     steps_per_epoch = len(train_loader)
     data_start = time.perf_counter()
@@ -399,6 +403,11 @@ def train_epoch(
 
         # --- Prepare batch ---
         images = batch["image"].to(device, non_blocking=True).to(torch.bfloat16)
+        proprio = batch.get("proprio", None)
+        if proprio is not None and proprio_weight > 0.0:
+            proprio = proprio.to(device, non_blocking=True).to(torch.bfloat16)
+        else:
+            proprio = None  # off when weight=0 or absent from batch
 
         torch.cuda.synchronize(device)
         step_start = time.perf_counter()
@@ -408,18 +417,29 @@ def train_epoch(
 
         # --- Forward pass ---
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            x_hat = tokenizer(images)
+            x_hat, recon_proprio = tokenizer(images, proprio)
 
         mse_loss, lpips_loss = compute_recon_losses(x_hat, images, lpips_model)
         raw_loss = mse_loss + cfg.train.lpips_weight * lpips_loss
 
+        if recon_proprio is not None and proprio is not None:
+            proprio_loss = nn.functional.mse_loss(recon_proprio.float(), proprio.float())
+            raw_loss = raw_loss + proprio_weight * proprio_loss
+        else:
+            proprio_loss = None
+
         accum_mse += mse_loss.detach().item()
         accum_lpips += lpips_loss.detach().item()
         accum_raw_loss += raw_loss.detach().item()
+        if proprio_loss is not None:
+            accum_proprio += proprio_loss.detach().item()
 
         mse_norm = rms_norm("mse", mse_loss)
         lpips_norm = rms_norm("lpips", lpips_loss)
         loss_micro = (mse_norm + cfg.train.lpips_weight * lpips_norm) / cfg.train.grad_accum_steps
+        if proprio_loss is not None:
+            proprio_norm = rms_norm("proprio", proprio_loss)
+            loss_micro = loss_micro + (proprio_weight * proprio_norm) / cfg.train.grad_accum_steps
         accum_norm += loss_micro.detach().item()
 
         # --- Backward pass ---
@@ -438,10 +458,10 @@ def train_epoch(
 
             # Sync scalars across ranks
             stats = torch.tensor(
-                [accum_norm, accum_mse, accum_lpips, accum_raw_loss], device=device
+                [accum_norm, accum_mse, accum_lpips, accum_raw_loss, accum_proprio], device=device
             )
             dist.all_reduce(stats, op=dist.ReduceOp.AVG)
-            sync_norm, sync_mse, sync_lpips, sync_raw = stats.tolist()
+            sync_norm, sync_mse, sync_lpips, sync_raw, sync_proprio = stats.tolist()
 
             epoch_loss_sum += sync_norm
             num_updates += 1
@@ -449,6 +469,7 @@ def train_epoch(
             mse_mean = sync_mse / cfg.train.grad_accum_steps
             lpips_mean = sync_lpips / cfg.train.grad_accum_steps
             raw_mean = sync_raw / cfg.train.grad_accum_steps
+            proprio_mean = sync_proprio / cfg.train.grad_accum_steps
 
             if rank == 0 and num_updates % cfg.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
@@ -457,6 +478,8 @@ def train_epoch(
                 tb_writer.add_scalar("train/raw_loss_mean", raw_mean, global_update)
                 tb_writer.add_scalar("train/normalized_loss_mean", sync_norm, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
+                if proprio_weight > 0.0:
+                    tb_writer.add_scalar("train/proprio_mean", proprio_mean, global_update)
 
             if global_update % cfg.save_every == 0:
                 if rank == 0:
@@ -498,6 +521,7 @@ def train_epoch(
             accum_lpips = 0.0
             accum_raw_loss = 0.0
             accum_norm = 0.0
+            accum_proprio = 0.0
 
         torch.cuda.synchronize(device)
         step_times.append(time.perf_counter() - step_start)
@@ -533,14 +557,28 @@ def validate(epoch, test_loader, test_sampler, tokenizer, lpips_model, cfg, rank
     val_loss_sum = 0.0
     val_mse_sum = 0.0
     val_lpips_sum = 0.0
+    val_proprio_sum = 0.0
     val_count = 0
+
+    proprio_weight = float(cfg.train.get("proprio_weight", 0.0))
 
     with torch.no_grad():
         for batch in test_loader:
             images = batch["image"].to(device, non_blocking=True).to(torch.bfloat16)
-            x_hat = tokenizer(images)
+            proprio = batch.get("proprio", None)
+            if proprio is not None and proprio_weight > 0.0:
+                proprio = proprio.to(device, non_blocking=True).to(torch.bfloat16)
+            else:
+                proprio = None
+
+            x_hat, recon_proprio = tokenizer(images, proprio)
             mse_loss, lpips_loss = compute_recon_losses(x_hat, images, lpips_model)
             val_loss = mse_loss + cfg.train.lpips_weight * lpips_loss
+
+            if recon_proprio is not None and proprio is not None:
+                proprio_loss = nn.functional.mse_loss(recon_proprio.float(), proprio.float())
+                val_loss = val_loss + proprio_weight * proprio_loss
+                val_proprio_sum += proprio_loss.item()
 
             val_loss_sum += val_loss.item()
             val_mse_sum += mse_loss.item()
@@ -548,18 +586,21 @@ def validate(epoch, test_loader, test_sampler, tokenizer, lpips_model, cfg, rank
             val_count += 1
 
     stats = torch.tensor(
-        [val_loss_sum, val_mse_sum, val_lpips_sum, float(val_count)], device=device
+        [val_loss_sum, val_mse_sum, val_lpips_sum, val_proprio_sum, float(val_count)], device=device
     )
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-    total_count = max(int(stats[3].item()), 1)
+    total_count = max(int(stats[4].item()), 1)
     avg_val_loss = stats[0].item() / total_count
     avg_val_mse = stats[1].item() / total_count
     avg_val_lpips = stats[2].item() / total_count
+    avg_val_proprio = stats[3].item() / total_count
 
     if rank == 0:
         tb_writer.add_scalar("val/raw_loss", avg_val_loss, epoch + 1)
         tb_writer.add_scalar("val/mse", avg_val_mse, epoch + 1)
         tb_writer.add_scalar("val/lpips", avg_val_lpips, epoch + 1)
+        if proprio_weight > 0.0:
+            tb_writer.add_scalar("val/proprio", avg_val_proprio, epoch + 1)
 
     return avg_val_loss, avg_val_mse, avg_val_lpips
 
