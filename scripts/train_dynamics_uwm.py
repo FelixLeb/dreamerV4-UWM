@@ -29,15 +29,25 @@ from dreamerv4uwm.utils.distributed import (
 # Scheduler
 # ---------------------------------------------------------------------------
 
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-8):
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr=1e-8):
+    """Linear warmup + cosine decay keyed on LambdaLR's internal step counter.
+
+    `warmup_steps` and `total_steps` are optimizer-step counts. The counter
+    advances by one each `scheduler.step()` (called after `optim.step()`).
+    """
+    peak_lr = optimizer.defaults["lr"]
+    warmup_steps = int(warmup_steps)
+    total_steps = int(total_steps)
+
     def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(
-            max(1, num_training_steps - num_warmup_steps)
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
         )
+        progress = min(progress, 1.0)
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return max(min_lr / optimizer.defaults["lr"], cosine_decay)
+        return max(min_lr / peak_lr, cosine_decay)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -181,6 +191,7 @@ def train_epoch(
 ):
     denoiser.train()
     train_sampler.set_epoch(epoch)
+    world_size = dist.get_world_size()
 
     # --- Batch-length branch selection (Dreamer-V4 paper) ---
     # Loader delivers (B_long, T_long) where T_long = max_sequence_length.
@@ -382,9 +393,8 @@ def train_epoch(
         if is_last_micro:
             torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
             optim.step()
-            scheduler.step()
             global_update += 1
-
+            scheduler.step()
             total_tensor = torch.tensor([accum_total], device=device)
             dist.all_reduce(total_tensor, op=dist.ReduceOp.AVG)
             sync_loss = total_tensor.item()
@@ -400,6 +410,7 @@ def train_epoch(
                 if train_reward:
                     tb_writer.add_scalar("train/reward_loss", accum_reward, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
+                tb_writer.add_scalar("train/global_update", global_update, global_update)
                 # Branch-namespaced curves. Sparse by design — only one of
                 # {short, long, image} updates per step. Losses across
                 # branches are not magnitude-comparable (different effective
@@ -507,9 +518,8 @@ def main(cfg: DictConfig):
     optim = torch.optim.AdamW(
         denoiser.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
     )
-    steps_per_epoch = len(train_loader)
-    total_steps = cfg.train.num_epochs * steps_per_epoch // cfg.train.accum_grad_steps
-    warmup_steps = int(0.05 * total_steps)
+    warmup_steps = int(cfg.train.warmup_samples)
+    total_steps = int(cfg.train.total_samples)
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
 
     # --- Checkpoint resume ---
@@ -521,7 +531,7 @@ def main(cfg: DictConfig):
     if cfg.reload_checkpoint is not None:
         if rank == 0:
             print(f"Resuming from checkpoint: {cfg.reload_checkpoint}")
-        start_epoch, global_update, wandb_run_id, log_dir = load_ddp_checkpoint(
+        start_epoch, global_update, _cumulative_samples, wandb_run_id, log_dir = load_ddp_checkpoint(
             ckpt_path=cfg.reload_checkpoint,
             model=denoiser,
             optim=optim,

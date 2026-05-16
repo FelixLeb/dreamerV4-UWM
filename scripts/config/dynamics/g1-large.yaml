@@ -6,9 +6,9 @@ dynamics_ckpt: null
 reload_checkpoint: null
 output_dir: checkpoints/dynamics/g1/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
-print_every: 2000
+print_every: 100
 log_every: 25
-save_every: 50000
+save_every: 10000
 seed: 42
 
 denoiser:
@@ -16,7 +16,7 @@ denoiser:
   num_action_tokens: 1
   num_latent_tokens: 256       # must match tokenizer.num_latent_tokens
   num_register_tokens: 4
-  context_length: 80           # temporal-attention window
+  context_length: 64           # temporal-attention window
   max_sequence_length: 128     # long-branch T == loader window size
   model_dim: 1536              # matches Joseph reference (wm_pico_eval_kvcache.py)
   latent_dim: 32               # must match tokenizer.latent_dim
@@ -40,12 +40,12 @@ denoiser:
 train:
   device: 'cuda:0'
   use_compile: true
-  num_epochs: 100
+  num_epochs: 110
 
   # Short/long mixed-batch training (Dreamer-V4 length-generalization trick).
   # Loader batches at long_seq_batch_per_gpu × max_sequence_length; with prob
   # long_seq_prob the long shape is used, otherwise random ctx_len crop.
-  batch_per_gpu: 4
+  batch_per_gpu: 8 # Batch size for short sequences.
   long_seq_batch_per_gpu: 1
   short_sequence_length: 32    # short-branch crop T (independent from denoiser.context_length)
   long_seq_prob: 0.15
@@ -54,21 +54,23 @@ train:
   image_prob: 0.1
   image_batch_per_gpu: 64
 
-  accum_grad_steps: 4
+  accum_grad_steps: 2
   lr: 1e-4
   num_workers: 12
   lpips_weight: 0.2
-  num_training_steps: 1e7
+
+  warmup_samples: 4200 # ~1.5 hours with the current settings
+  total_samples: 420000 # ~150 hours with the current settings; adjust as needed for longer/shorter training
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
   # `uniform` (not `ramp`) — ramp down-weights the noisy end which is the wrong
   # bias for forcing/mode-3 training.
-  loss_weighting: uniform
+  loss_weighting: ramp
   reward_weight: 1.0
   # Best recipe so far: forcing dominates, wm has 2× weight; everything else 0.
   mode_weights:
-    policy: 0.2
+    policy: 0.5
     video: 0
     wm: 2.5
     id: 0

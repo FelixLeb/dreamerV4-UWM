@@ -58,7 +58,13 @@ train:
   lr: 1e-4
   num_workers: 12
   lpips_weight: 0.2
-  num_training_steps: 1e7
+  # LR schedule is keyed on cumulative frames seen (the x-axis), so it is
+  # invariant to world_size / batch_per_gpu / accum_grad_steps / sequence
+  # length / branch mix / num_epochs. Defaults below approximate the
+  # 4-GPU recipe's prior 5%/100-epoch schedule (≈160k optimizer steps × 908
+  # avg frames/step ≈ 145M warmup, 3.2M total × 908 ≈ 2.9B total).
+  warmup_samples: 1.5e8
+  total_samples: 3.0e9
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0

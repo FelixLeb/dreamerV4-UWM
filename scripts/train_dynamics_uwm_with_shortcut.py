@@ -406,7 +406,7 @@ def main(cfg: DictConfig):
     if cfg.reload_checkpoint is not None:
         if rank == 0:
             print(f"Resuming from checkpoint: {cfg.reload_checkpoint}")
-        start_epoch, global_update, wandb_run_id, log_dir = load_ddp_checkpoint(
+        start_epoch, global_update, _cumulative_samples, wandb_run_id, log_dir = load_ddp_checkpoint(
             ckpt_path=cfg.reload_checkpoint,
             model=denoiser,
             optim=optim,

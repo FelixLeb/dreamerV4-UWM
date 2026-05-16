@@ -64,12 +64,14 @@ def save_ddp_checkpoint(
     rank: int,
     wandb_run_id: str = None,
     log_dir: str = None,
+    cumulative_samples: int = 0,
 ):
     if rank == 0:
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         ckpt = {
             "epoch": epoch,
             "global_update": global_update,
+            "cumulative_samples": cumulative_samples,
             "model": unwrap_model(model).state_dict(),  # <- .module to unwrap DDP
             "optim": optim.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -88,12 +90,15 @@ def load_ddp_checkpoint(
 ):
     """
     Load FULL checkpoint saved by save_checkpoint().
-    Returns (start_epoch, global_update, wandb_run_id, log_dir).
+    Returns (start_epoch, global_update, cumulative_samples, wandb_run_id, log_dir).
+    `cumulative_samples` defaults to 0 for checkpoints written before that
+    field was added — resumed runs will restart their x-axis from 0 in that
+    case; new runs are unaffected.
     """
     if not os.path.isfile(ckpt_path):
         if rank == 0:
             print(f"No checkpoint found at {ckpt_path}, starting from scratch.")
-        return 0, 0, None, None  # epoch, global_update, wandb_run_id, log_dir
+        return 0, 0, 0, None, None  # epoch, global_update, cumulative_samples, wandb_run_id, log_dir
 
     # Rank 0 loads from disk
     if rank == 0:
@@ -109,18 +114,19 @@ def load_ddp_checkpoint(
 
     start_epoch = ckpt.get("epoch", 0)
     global_update = ckpt.get("global_update", 0)
+    cumulative_samples = ckpt.get("cumulative_samples", 0)
     wandb_run_id = ckpt.get("wandb_run_id", None)  # NEW
-    log_dir = ckpt.get("log_dir", None)       
+    log_dir = ckpt.get("log_dir", None)
     # breakpoint()     # NEW
     model.module._orig_mod.load_state_dict(ckpt["model"])
     # optim.load_state_dict(ckpt["optim"])
     # scheduler.load_state_dict(ckpt["scheduler"])
 
     if rank == 0:
-        print(f"Resuming from epoch {start_epoch+1}, global_update {global_update}")
+        print(f"Resuming from epoch {start_epoch+1}, global_update {global_update}, cumulative_samples {cumulative_samples}")
         if wandb_run_id:
             print(f"Resuming W&B run ID: {wandb_run_id}")
         if log_dir:
             print(f"Resuming log directory: {log_dir}")
 
-    return start_epoch, global_update, wandb_run_id, log_dir
+    return start_epoch, global_update, cumulative_samples, wandb_run_id, log_dir
