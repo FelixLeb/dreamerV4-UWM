@@ -1,0 +1,25 @@
+# Union over the 10 OGBench manipulation datasets. Each subset performs its
+# own per-dataset train/test split with the shared `split_seed`; sampling is
+# equal-weight-per-dataset via DistributedWeightedSampler (see
+# dreamerv4uwm/datasets.py:MultiShardedHDF5Dataset).
+#
+# All 10 subsets share action_shape=[5]; episode counts range 422..3146 across
+# datasets, which is why equal-weight (not concat) is the right default.
+kind: multi_sharded_hdf5
+dt: 0.1
+resolution: [256, 256]
+load_to_ram: false
+split_seed: 123
+train_episodes_fraction: 0.9
+absolute_actions: false
+data_dirs:
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-cube-single-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-cube-double-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-cube-triple-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-cube-quadruple-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-cube-octuple-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-puzzle-3x3-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-puzzle-4x4-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-puzzle-4x5-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-puzzle-4x6-v0
+  - /scratch/rk4342/datasets/benchmarks/ogbench/manipulation/visual-scene-v0

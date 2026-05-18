@@ -164,7 +164,8 @@ def save_merged_final(model, ckpt_path: str, rank: int):
 
 def build_dataloader(cfg, rank, world_size):
     loader, sampler, _ = create_distributed_dataloader(
-        data_dir=cfg.dataset.data_dir,
+        data_dir=cfg.dataset.get("data_dir", None),
+        data_dirs=cfg.dataset.get("data_dirs", None),
         window_size=cfg.denoiser.max_sequence_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
@@ -178,6 +179,7 @@ def build_dataloader(cfg, rank, world_size):
         shuffle=True,
         drop_last=True,
         absolute_actions=cfg.train.absolute_actions,
+        kind=cfg.dataset.get("kind", "sharded_hdf5"),
     )
     return loader, sampler
 

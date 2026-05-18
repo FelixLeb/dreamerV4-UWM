@@ -3,7 +3,7 @@ import torch
 import random
 import json
 from functools import partial
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from pathlib import Path
@@ -431,6 +431,185 @@ class MixedDemoPlayDataset(Dataset):
             )
         sample['reward'] = reward
         return sample
+
+
+class MultiShardedHDF5Dataset(Dataset):
+    """Concat of N `ShardedHDF5Dataset` subsets, one per `data_dirs[i]`.
+
+    Each subset performs its own per-dataset train/test split with the shared
+    `split_seed`, then we expose a flat `(subset_idx, local_idx)` window index
+    over the kept windows. `sample_weights[i]` gives the per-window probability
+    used by `DistributedWeightedSampler` for equal-weight-per-dataset training
+    (each dataset contributes a total mass of `1/N` regardless of its size).
+
+    Asserts that all subsets share the same `action_shape` (read from each
+    subset's `metadata.json`) so a single denoiser `n_actions` is valid across
+    the union.
+    """
+
+    def __init__(
+        self,
+        data_dirs,
+        window_size: int,
+        stride: int = 1,
+        split: str = "train",
+        train_fraction: float = 0.9,
+        split_seed: int = 42,
+        shuffle_windows: bool = False,
+        absolute_actions: bool = False,
+    ):
+        if not data_dirs:
+            raise ValueError("MultiShardedHDF5Dataset requires a non-empty data_dirs list")
+
+        self.data_dirs = [Path(p) for p in data_dirs]
+        self.window_size = int(window_size)
+
+        # Read each subset's metadata first to assert action-shape uniformity.
+        action_shapes = []
+        for d in self.data_dirs:
+            with open(d / "metadata.json", "r") as f:
+                m = json.load(f)
+            action_shapes.append(tuple(m.get("action_shape", ())))
+        if len(set(action_shapes)) > 1:
+            raise ValueError(
+                f"MultiShardedHDF5Dataset: heterogeneous action_shape across data_dirs: "
+                f"{dict(zip([str(d) for d in self.data_dirs], action_shapes))}"
+            )
+
+        # Build subsets. Each does its own split with the shared seed.
+        # shuffle_windows is forced off inside subsets — the outer sampler
+        # controls ordering for distributed training.
+        self.subsets = [
+            ShardedHDF5Dataset(
+                data_dir=str(d),
+                window_size=window_size,
+                stride=stride,
+                split=split,
+                train_fraction=train_fraction,
+                split_seed=split_seed,
+                shuffle_windows=False,
+                absolute_actions=absolute_actions,
+            )
+            for d in self.data_dirs
+        ]
+
+        # Flat (subset_idx, local_idx) index + per-window weights such that
+        # total mass per subset == 1/N.
+        N = len(self.subsets)
+        self.flat_index = []
+        weights = []
+        for s_idx, sub in enumerate(self.subsets):
+            n_i = len(sub)
+            if n_i == 0:
+                continue
+            w_i = 1.0 / (N * n_i)
+            self.flat_index.extend((s_idx, j) for j in range(n_i))
+            weights.extend([w_i] * n_i)
+        self.sample_weights = np.asarray(weights, dtype=np.float64)
+
+        # Plain concat fallback flag (always emit 'reward' iff every subset has it).
+        self.has_rewards = all(sub.has_rewards for sub in self.subsets)
+
+        if shuffle_windows:
+            order = np.random.default_rng(split_seed).permutation(len(self.flat_index))
+            self.flat_index = [self.flat_index[i] for i in order]
+            self.sample_weights = self.sample_weights[order]
+
+        # Summary
+        per_subset = [(str(d), len(s)) for d, s in zip(self.data_dirs, self.subsets)]
+        print(
+            f"MultiShardedHDF5Dataset[{split}]: {len(self.flat_index)} windows across "
+            f"{N} subsets — " + ", ".join(f"{Path(d).name}:{n}" for d, n in per_subset)
+        )
+
+    def __len__(self):
+        return len(self.flat_index)
+
+    def __getitem__(self, idx):
+        s_idx, local_idx = self.flat_index[idx]
+        return self.subsets[s_idx][local_idx]
+
+    def get_episode_length_statistics(self):
+        merged = []
+        for sub in self.subsets:
+            merged.extend(sub.episode_lengths)
+        lengths = np.array(merged)
+        return {
+            "total_episodes": int(len(lengths)),
+            "total_timesteps": int(np.sum(lengths)),
+            "min_length": int(np.min(lengths)),
+            "max_length": int(np.max(lengths)),
+            "mean_length": float(np.mean(lengths)),
+            "median_length": float(np.median(lengths)),
+            "std_length": float(np.std(lengths)),
+        }
+
+
+class DistributedWeightedSampler(Sampler):
+    """Distributed sampler that draws indices proportional to `weights`.
+
+    A single deterministic `torch.multinomial` draw (seeded by `seed + epoch`)
+    produces `num_samples` indices, identical across ranks; each rank then
+    takes its disjoint slice of length `num_samples // num_replicas`. Call
+    `set_epoch(e)` between epochs to reshuffle.
+
+    Standard PyTorch `WeightedRandomSampler` does not interoperate with
+    `DistributedSampler` (it samples without rank-awareness), hence this small
+    custom variant. Used by `kind: multi_sharded_hdf5` for equal-weight-per-
+    dataset sampling under DDP.
+    """
+
+    def __init__(
+        self,
+        weights,
+        num_replicas: int,
+        rank: int,
+        num_samples: int = None,
+        seed: int = 0,
+        replacement: bool = True,
+        drop_last: bool = True,
+    ):
+        if num_replicas <= 0 or rank < 0 or rank >= num_replicas:
+            raise ValueError(
+                f"DistributedWeightedSampler: bad rank/world_size: rank={rank}, "
+                f"num_replicas={num_replicas}"
+            )
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.replacement = bool(replacement)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        total = int(num_samples) if num_samples is not None else int(self.weights.numel())
+        if self.drop_last:
+            self.num_samples_total = (total // self.num_replicas) * self.num_replicas
+        else:
+            # Round up so all ranks have equal length; we'll wrap padding at __iter__.
+            self.num_samples_total = (
+                (total + self.num_replicas - 1) // self.num_replicas
+            ) * self.num_replicas
+        self.num_samples_per_rank = self.num_samples_total // self.num_replicas
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        # Single global draw, identical across ranks (same seed, same generator
+        # state). Each rank slices its disjoint chunk.
+        indices = torch.multinomial(
+            self.weights, self.num_samples_total, replacement=self.replacement, generator=g
+        ).tolist()
+        start = self.rank * self.num_samples_per_rank
+        end = start + self.num_samples_per_rank
+        return iter(indices[start:end])
+
+    def __len__(self):
+        return self.num_samples_per_rank
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
 
 
 # class PushTDataset(Dataset):
@@ -1070,11 +1249,11 @@ class MixedDemoPlayDataset(Dataset):
 #         }
 
 def create_distributed_dataloader(
-    data_dir: str,
-    window_size: int,
-    batch_size: int,
-    rank: int,
-    world_size: int,
+    data_dir: str = None,
+    window_size: int = None,
+    batch_size: int = None,
+    rank: int = 0,
+    world_size: int = 1,
     num_workers: int = 4,
     stride: int = 1,
     seed: int = 42,
@@ -1085,16 +1264,23 @@ def create_distributed_dataloader(
     drop_last: bool = True,
     absolute_actions: bool = False,
     kind: str = "sharded_hdf5",
+    data_dirs=None,
 ):
     """
     Create DataLoader with DistributedSampler.
 
     `kind` selects the dataset layout:
       - 'sharded_hdf5' (default): legacy per-episode sharded layout
-        (`metadata.json` + `shard_XXXX.h5` with `images (N,T,H,W,C)`).
+        (`metadata.json` + `shard_XXXX.h5` with `images (N,T,H,W,C)`). Reads
+        from `data_dir`.
       - 'g1_chunked': flat per-frame G1 chunks (`chunk_XXXX.h5`); episode
         boundaries inferred from `dones` and `source_rrd`. `absolute_actions`
-        is ignored in this branch.
+        is ignored in this branch. Reads from `data_dir`.
+      - 'multi_sharded_hdf5': union of N `sharded_hdf5` datasets, one per
+        `data_dirs[i]`. Each subset does its own per-dataset train/test split
+        with the shared `split_seed`. Sampling is equal-weight-per-dataset via
+        `DistributedWeightedSampler` (the `shuffle` flag is ignored — order is
+        always randomized; `seed` controls the multinomial draw).
     """
     if kind == "sharded_hdf5":
         dataset = ShardedHDF5Dataset(
@@ -1115,20 +1301,45 @@ def create_distributed_dataloader(
             train_fraction=train_fraction,
             split_seed=split_seed,
         )
+    elif kind == "multi_sharded_hdf5":
+        if not data_dirs:
+            raise ValueError(
+                "kind='multi_sharded_hdf5' requires `data_dirs` (list of paths)"
+            )
+        dataset = MultiShardedHDF5Dataset(
+            data_dirs=data_dirs,
+            window_size=window_size,
+            stride=stride,
+            split=split,
+            train_fraction=train_fraction,
+            split_seed=split_seed,
+            absolute_actions=absolute_actions,
+        )
     else:
         raise ValueError(
-            f"Unknown dataset kind: {kind!r} (expected 'sharded_hdf5' or 'g1_chunked')"
+            f"Unknown dataset kind: {kind!r} "
+            f"(expected 'sharded_hdf5', 'g1_chunked', or 'multi_sharded_hdf5')"
         )
 
-    # Create DistributedSampler
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=shuffle,
-        seed=seed,
-        drop_last=drop_last,
-    )
+    if kind == "multi_sharded_hdf5":
+        sampler = DistributedWeightedSampler(
+            weights=dataset.sample_weights,
+            num_replicas=world_size,
+            rank=rank,
+            num_samples=len(dataset),
+            seed=seed,
+            replacement=True,
+            drop_last=drop_last,
+        )
+    else:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
+        )
 
     # Create DataLoader
     dataloader = DataLoader(

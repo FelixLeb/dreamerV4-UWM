@@ -218,8 +218,11 @@ def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD"
 
 def build_dataloaders(cfg, rank, world_size):
     dataset_kind = cfg.dataset.get("kind", "sharded_hdf5")
+    data_dir = cfg.dataset.get("data_dir", None)
+    data_dirs = cfg.dataset.get("data_dirs", None)
     train_loader, train_sampler, _ = create_distributed_dataloader(
-        data_dir=cfg.dataset.data_dir,
+        data_dir=data_dir,
+        data_dirs=data_dirs,
         window_size=cfg.tokenizer.max_sequence_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
@@ -236,7 +239,8 @@ def build_dataloaders(cfg, rank, world_size):
     )
 
     test_loader, test_sampler, _ = create_distributed_dataloader(
-        data_dir=cfg.dataset.data_dir,
+        data_dir=data_dir,
+        data_dirs=data_dirs,
         window_size=cfg.tokenizer.max_sequence_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,

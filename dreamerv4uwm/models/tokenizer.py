@@ -101,9 +101,13 @@ class CausalTokenizerEncoder(nn.Module):
         # Project to latent_dim and squash. Force fp32 for the final
         # projection + tanh: under bf16 autocast, the backward `1 - tanh^2(x)`
         # underflows to 0 for |x| > ~3 (vs ~9 in fp32), which silently kills
-        # gradient flow through the bottleneck.
+        # gradient flow through the bottleneck. We cast both the activation and
+        # the weight/bias to fp32 because FSDP's MixedPrecision policy keeps
+        # params in bf16 even inside an autocast-disabled block.
         with torch.autocast(device_type="cuda", enabled=False):
-            x = self.output_nonlinearity(self.output_proj(x.float()))
+            w = self.output_proj.weight.float()
+            b = self.output_proj.bias.float() if self.output_proj.bias is not None else None
+            x = self.output_nonlinearity(F.linear(x.float(), w, b))
 
         # Split back into [patch_tokens, latent_tokens]
         S_mod = self.cfg.num_modality_tokens

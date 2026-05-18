@@ -71,7 +71,8 @@ def build_dataloader(cfg, rank, world_size):
     short_bs = int(cfg.train.batch_per_gpu)
     loader_bs = max(short_bs, long_bs)
     loader, sampler, _ = create_distributed_dataloader(
-        data_dir=cfg.dataset.data_dir,
+        data_dir=cfg.dataset.get("data_dir", None),
+        data_dirs=cfg.dataset.get("data_dirs", None),
         window_size=cfg.denoiser.max_sequence_length,
         batch_size=loader_bs,
         rank=rank,

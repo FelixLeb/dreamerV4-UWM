@@ -48,7 +48,8 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
 def build_dataloader(cfg, rank, world_size):
     loader, sampler, _ = create_distributed_dataloader(
-        data_dir=cfg.dataset.data_dir,
+        data_dir=cfg.dataset.get("data_dir", None),
+        data_dirs=cfg.dataset.get("data_dirs", None),
         window_size=cfg.denoiser.max_sequence_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
