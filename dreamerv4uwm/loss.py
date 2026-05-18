@@ -312,7 +312,57 @@ class UWMForwardProcess(nn.Module):
             "mode": mode,
             "forcing_mask_actions": self.forcing_mask_actions if mode == 'forcing' else False,
         }
-    
+
+    def apply_diff(
+        self,
+        z_clean: torch.Tensor,         # (B, T, N_lat, D_lat)
+        a_clean: torch.Tensor,         # (B, T, N_act_tokens, n_actions)
+        obs_diff: dict,                # from sample_step_noise
+        act_diff: dict,                # from sample_step_noise
+        context_length: int,
+        mode: str,
+        z0: Optional[torch.Tensor] = None,   # (B, T, N_lat, D_lat) — shared noise
+        a0: Optional[torch.Tensor] = None,   # (B, T, N_act_tokens, n_actions) — shared noise
+    ):
+        """Apply a pre-sampled (τ, ε) schedule to a (z_clean, a_clean) pair.
+
+        Intended for FDPO-style training where the same (τ, ε) must be reused
+        across a (positive, negative) pair to make the Diffusion-DPO bound
+        constants cancel. Call `sample_step_noise(B, T, force_mode=...)` once,
+        then call this twice — once with the positive's clean tensors and
+        once with the negative's — passing the same `z0`, `a0`, `obs_diff`,
+        `act_diff`, `context_length`, `mode`.
+
+        Returns the same info-dict format as `forward()`.
+        """
+        if z0 is None:
+            z0 = torch.randn_like(z_clean)
+        if a0 is None:
+            a0 = self.action_noise_std * torch.randn_like(a_clean)
+
+        obs_tau = obs_diff["tau"].unsqueeze(-1).unsqueeze(-1)
+        z_tau = (1.0 - obs_tau) * z0 + obs_tau * z_clean
+
+        act_tau = act_diff["tau"].unsqueeze(-1).unsqueeze(-1)
+        a_tau = (1.0 - act_tau) * a0 + act_tau * a_clean
+
+        return {
+            "x":         z_clean,
+            "x0":        z0,
+            "x_tau":     z_tau,
+            "obs_tau":   obs_diff["tau"],
+            "obs_tau_idx": obs_diff["tau_idx"],
+            "a":         a_clean,
+            "a0":        a0,
+            "a_tau":     a_tau,
+            "act_tau":   act_diff["tau"],
+            "act_tau_idx": act_diff["tau_idx"],
+            "context_length": context_length,
+            "mode": mode,
+            "forcing_mask_actions": self.forcing_mask_actions if mode == 'forcing' else False,
+        }
+
+
 def compute_uwm_loss(
     info: dict,
     denoiser: DreamerV4Denoiser,
@@ -411,6 +461,139 @@ def compute_uwm_loss(
         "obs_flow_loss": obs_flow_loss,
         "act_flow_loss": act_flow_loss,
         "reward_loss": reward_loss,
+    }
+
+
+def compute_per_sample_uwm_loss(
+    info: dict,
+    denoiser: DreamerV4Denoiser,
+    device='cpu',
+    loss_weighting: str = 'ramp',
+):
+    """Per-sample variant of `compute_uwm_loss` for FDPO-style preference losses.
+
+    Mirrors the math of `compute_uwm_loss` but reduces over the time axis
+    only, returning (B,) tensors instead of scalars. The reward MTP branch
+    is intentionally omitted — FDPO operates on the joint state-action
+    flow-matching objective, not on rewards.
+
+    Returns a dict with keys:
+        - obs_flow_loss : (B,)  per-sample, time-averaged, mode-masked
+        - act_flow_loss : (B,)  same
+        - total_flow_loss : (B,)  = obs_flow_loss + act_flow_loss
+
+    Mode handling is identical to `compute_uwm_loss` (per-mode masking of
+    obs/action terms and the policy/action_only context-skip slicing).
+    """
+    x = info["x"]
+    B, T, N_lat, D_lat = x.shape
+    x_tau = info["x_tau"]
+    obs_tau_idx = info["obs_tau_idx"]
+
+    a = info["a"]
+    a_tau = info["a_tau"]
+    act_tau_idx = info["act_tau_idx"]
+
+    step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
+
+    z_hat, a_hat, _ = denoiser(
+        noisy_act=a_tau.squeeze(-2),
+        noisy_obs=x_tau,
+        obs_sigma_idx=obs_tau_idx,
+        obs_step_idx=step_idx,
+        act_sigma_idx=act_tau_idx,
+        act_step_idx=step_idx,
+    )
+
+    # Per-frame squared error, averaged over the per-frame inner dims.
+    obs_flow_sq = (z_hat - x).pow(2).mean(dim=(-1, -2))  # (B, T)
+    act_flow_sq = (a_hat - a).pow(2).mean(dim=(-1, -2))  # (B, T)
+    w_obs = loss_weight(info['obs_tau'], scheme=loss_weighting)  # (B, T)
+    w_act = loss_weight(info['act_tau'], scheme=loss_weighting)  # (B, T)
+
+    obs_weighted = obs_flow_sq * w_obs  # (B, T)
+    act_weighted = act_flow_sq * w_act  # (B, T)
+
+    mode = info['mode']
+    context_length = info['context_length']
+    zeros_B = torch.zeros(B, device=device, dtype=obs_weighted.dtype)
+
+    if mode == 'policy':
+        obs_loss = obs_weighted[:, context_length:].mean(dim=1)
+        act_loss = act_weighted[:, context_length:].mean(dim=1)
+    elif mode == 'video':
+        obs_loss = obs_weighted.mean(dim=1)
+        act_loss = zeros_B
+    elif mode == 'wm':
+        obs_loss = obs_weighted.mean(dim=1)
+        act_loss = zeros_B
+    elif mode == 'id':
+        obs_loss = zeros_B
+        act_loss = act_weighted.mean(dim=1)
+    elif mode == 'forcing':
+        obs_loss = obs_weighted.mean(dim=1)
+        if info.get('forcing_mask_actions', False):
+            act_loss = zeros_B
+        else:
+            act_loss = act_weighted.mean(dim=1)
+    elif mode == 'action_only':
+        obs_loss = zeros_B
+        act_loss = act_weighted[:, context_length:].mean(dim=1)
+    else:
+        raise NotImplementedError(f"unknown mode {mode!r}")
+
+    return {
+        "obs_flow_loss":   obs_loss,         # (B,)
+        "act_flow_loss":   act_loss,         # (B,)
+        "total_flow_loss": obs_loss + act_loss,  # (B,)
+    }
+
+
+def compute_flow_dpo_loss(
+    theta_loss_pos: torch.Tensor,    # (B,)  per-sample ℓ_θ on positive
+    theta_loss_neg: torch.Tensor,    # (B,)  per-sample ℓ_θ on negative
+    ref_loss_pos:   torch.Tensor,    # (B,)  per-sample ℓ_ref on positive
+    ref_loss_neg:   torch.Tensor,    # (B,)  per-sample ℓ_ref on negative
+    beta: float = 0.1,
+):
+    """Flow-DPO sigmoid-CE preference loss for joint state-action flow matching.
+
+    Adapts the Diffusion-DPO bound (Wallace et al., 2024) to the dual-channel
+    flow-matching setting in this project. With per-sample flow-matching losses
+    ℓ for the aligned model θ and the frozen reference, the per-sample
+    "advantage" is
+
+        Δ_θ(ξ) = ℓ_ref(ξ) - ℓ_θ(ξ)
+
+    so that a lower aligned loss on ξ (i.e. higher implicit likelihood) yields
+    a more positive advantage. The pair loss is
+
+        L = -log σ( β · (Δ_θ(ξ⁺) - Δ_θ(ξ⁻)) )
+
+    A shared (τ, ε) sample across (ξ⁺, ξ⁻) cancels the additive constants in
+    the Diffusion-DPO bound; the caller is responsible for that.
+
+    Returns
+    -------
+    dict with:
+        - loss      : scalar — mean over the batch, suitable for backprop
+        - per_sample: (B,) — pre-mean values, for logging
+        - margin    : (B,) — β·(Δ_θ(ξ⁺) - Δ_θ(ξ⁻)); positive = preferred wins
+        - reward_pos: (B,) — implicit reward Δ_θ(ξ⁺), for logging
+        - reward_neg: (B,) — implicit reward Δ_θ(ξ⁻), for logging
+        - accuracy  : scalar — fraction of pairs with positive margin
+    """
+    reward_pos = ref_loss_pos - theta_loss_pos  # (B,)
+    reward_neg = ref_loss_neg - theta_loss_neg  # (B,)
+    margin     = beta * (reward_pos - reward_neg)  # (B,)
+    per_sample = -F.logsigmoid(margin)             # (B,)
+    return {
+        "loss":       per_sample.mean(),
+        "per_sample": per_sample.detach(),
+        "margin":     margin.detach(),
+        "reward_pos": reward_pos.detach(),
+        "reward_neg": reward_neg.detach(),
+        "accuracy":   (margin > 0).float().mean(),
     }
 
 

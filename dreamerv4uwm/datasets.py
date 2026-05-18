@@ -158,6 +158,104 @@ class ShardedHDF5Dataset(Dataset):
         return stats
 
 
+class PreferencePairDataset(Dataset):
+    """Dataset over (positive, negative) trajectory pairs produced by
+    `scripts/preprocessing/gen_fdpo_negatives.py` (schema 'fdpo_pairs_v1').
+
+    Each shard stores fixed-length pairs side-by-side, so there is no windowing
+    or src-shard joining — one HDF5 row is one training example. The first
+    `ctx_frames` of pos and neg are identical clean context by construction
+    (recorded in `metadata.json`); the trailing `horizon_frames` is the true
+    demo continuation (positive) vs. the reference rollout (negative).
+
+    Returns
+    -------
+    Per __getitem__ call, a dict with:
+        - pos_image  : (T, 3, H, W) float in [0, 1]
+        - pos_action : (T, A)        float32
+        - neg_image  : (T, 3, H, W) float in [0, 1]
+        - neg_action : (T, A)        float32
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        split: str = "train",
+        train_fraction: float = 0.9,
+        split_seed: int = 42,
+        shuffle_pairs: bool = True,
+    ):
+        self.data_dir = Path(data_dir)
+        self.split = split
+
+        meta_path = self.data_dir / "metadata.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"missing metadata.json in {self.data_dir}")
+        with open(meta_path) as f:
+            self.metadata = json.load(f)
+        schema = self.metadata.get("schema")
+        if schema != "fdpo_pairs_v1":
+            raise ValueError(
+                f"PreferencePairDataset expects schema='fdpo_pairs_v1' "
+                f"in {meta_path}, got {schema!r}"
+            )
+
+        self.ctx_frames = int(self.metadata.get("ctx_frames", 0))
+        self.horizon_frames = int(self.metadata.get("horizon_frames", 0))
+
+        self.shard_files = sorted(self.data_dir.glob("shard_*.h5"))
+        if not self.shard_files:
+            raise FileNotFoundError(f"no shard_*.h5 in {self.data_dir}")
+
+        # Flat index: (shard_idx, pair_idx_within_shard).
+        flat = []
+        for s_idx, p in enumerate(self.shard_files):
+            with h5py.File(p, "r") as f:
+                n_pairs = int(f.attrs.get("num_pairs", f["pos_images"].shape[0]))
+            for j in range(n_pairs):
+                flat.append((s_idx, j))
+
+        rng = np.random.default_rng(split_seed)
+        perm = rng.permutation(len(flat))
+        num_train = int(train_fraction * len(flat))
+        if split == "train":
+            keep = set(perm[:num_train].tolist())
+        elif split == "test":
+            keep = set(perm[num_train:].tolist())
+        else:
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        self.pairs = [flat[i] for i in range(len(flat)) if i in keep]
+        if shuffle_pairs:
+            random.shuffle(self.pairs)
+        print(f"{split.capitalize()} split: {len(self.pairs)} pairs "
+              f"from {len(flat)} total in {self.data_dir}")
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        shard_idx, pair_idx = self.pairs[idx]
+        shard_file = self.shard_files[shard_idx]
+        with h5py.File(shard_file, "r") as f:
+            pos_imgs = f["pos_images"][pair_idx]
+            pos_acts = f["pos_actions"][pair_idx]
+            neg_imgs = f["neg_images"][pair_idx]
+            neg_acts = f["neg_actions"][pair_idx]
+
+        # uint8 (T, H, W, C) → float (T, C, H, W) in [0, 1], matching
+        # ShardedHDF5Dataset's image contract.
+        def _to_chw_float(arr):
+            t = torch.from_numpy(arr).float() / 255.0
+            return t.permute(0, 3, 1, 2).contiguous()
+
+        return {
+            "pos_image":  _to_chw_float(pos_imgs),
+            "pos_action": torch.from_numpy(pos_acts),
+            "neg_image":  _to_chw_float(neg_imgs),
+            "neg_action": torch.from_numpy(neg_acts),
+        }
+
+
 class G1ChunkDataset(Dataset):
     """
     Dataset over the G1 world-model chunked HDF5 layout
@@ -1142,6 +1240,53 @@ def create_distributed_dataloader(
         prefetch_factor=2 if num_workers > 0 else None,
     )
 
+    return dataloader, sampler, dataset
+
+
+def create_distributed_pair_dataloader(
+    data_dir: str,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    num_workers: int = 4,
+    seed: int = 42,
+    split: str = "train",
+    train_fraction: float = 0.9,
+    split_seed: int = 42,
+    shuffle: bool = True,
+    drop_last: bool = True,
+):
+    """DistributedSampler-wrapped DataLoader over PreferencePairDataset.
+
+    Pairs are already fixed-length windows (see fdpo_pairs_v1 schema), so this
+    helper does not take a `window_size` or `stride` — those are properties of
+    the generation job, recorded in `metadata.json`.
+    """
+    dataset = PreferencePairDataset(
+        data_dir=data_dir,
+        split=split,
+        train_fraction=train_fraction,
+        split_seed=split_seed,
+        shuffle_pairs=False,  # DistributedSampler does shuffling
+    )
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=shuffle,
+        seed=seed,
+        drop_last=drop_last,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=drop_last,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
     return dataloader, sampler, dataset
 
 
