@@ -221,3 +221,5 @@ HPC
 .vscode
 scripts/tmp
 notebooks/results
+# Scratch artifacts (viz outputs, logs, smoke datasets, run dirs)
+/tmp/

@@ -1,0 +1,88 @@
+# @package _global_
+defaults:
+ - /tokenizer: /pushT
+
+dual_stream: false
+# REQUIRED: pretrained play-trained denoiser checkpoint. Both ref and aligned
+# models are built from this; only the aligned copy gets LoRA + grad.
+dynamics_ckpt: /home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/dynamics/pushT/final/joint-model/v1/432360.pt
+reload_checkpoint: null
+output_dir: checkpoints/align/${now:%Y-%m-%d_%H-%M-%S}
+print_every: 50
+log_every: 25
+save_every: 500
+seed: 42
+
+denoiser:
+  dual_stream: false
+  num_action_tokens: 1
+  num_latent_tokens: 256
+  num_register_tokens: 4
+  context_length: 64
+  max_sequence_length: 64
+  model_dim: 768
+  latent_dim: 32
+  n_layers: 6
+  n_heads: 12
+  n_kv_heads: 12
+  dropout_prob: 0.0
+  qk_norm: false
+  num_noise_levels: 128
+  n_actions: 2
+  is_causal: true
+  layer_types: [spatial, temporal, spatial, temporal]
+  train_reward_model: false
+
+# FDPO pair dataset (output of scripts/preprocessing/gen_fdpo_negatives.py).
+fdpo:
+  pairs_dir: /home/mim-server/datasets/pushT/fdpo-pairs-v0
+  train_fraction: 0.9
+  split_seed: 42
+  beta: 0.1                 # DPO temperature
+  anchor_weight: 0.1        # λ on aligned ℓ_θ(ξ⁺) — wam-dpo.tex Eq. 9
+  force_mode: 'policy'      # τ-sampling mode for the DPO contrast.
+  # Which loss term(s) drive the DPO contrast.
+  #   'both' = total_flow_loss (legacy v0/v0a behavior)
+  #   'obs'  = obs_flow_loss only — closes the trivial action-noise
+  #            discrimination loophole when negs are sampler-rolled jittery
+  #            and pos are human-recorded smooth.
+  #   'act'  = act_flow_loss only — diagnostic / ablation
+  dpo_streams: 'both'
+  # Play-data WM anchor (off when play_data_dir is null). Set play_data_dir to
+  # the raw play dataset (NOT the FDPO pairs) to avoid bias from ref-induced
+  # negatives. Adds   λ_wm · ℓ_θ(play_batch, force_mode=wm_anchor_force_mode)
+  # to the total loss each step.
+  play_data_dir: null
+  play_batch_per_gpu: 2
+  play_train_fraction: 0.9
+  play_split_seed: 42
+  wm_anchor_weight: 0.0
+  wm_anchor_force_mode: 'wm'
+
+train:
+  device: 'cuda:0'
+  use_compile: false        # PEFT + torch.compile is fragile
+  num_epochs: 20
+  batch_per_gpu: 4
+  accum_grad_steps: 1
+  lr: 3e-4
+  weight_decay: 0.0
+  num_workers: 8
+  num_training_steps: 1e7
+  enable_fast_matmul: true
+  clip_grad_norm: 1.0
+
+# LoRA / PEFT configuration. Mirrors scripts/config/dynamics/lewm-cubes-lora.yaml.
+lora:
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  bias: "none"
+  target_modules: "all-linear"
+  modules_to_save: null
+  save_merged_final: true
+
+wandb:
+  enable: true
+  project: "UWM-fdpo"
+  run_name: null
