@@ -38,54 +38,53 @@ denoiser:
 train:
   device: 'cuda:0'
   use_compile: true
-  num_epochs: 100
-  
-  batch_per_gpu: 4
-  long_seq_batch_per_gpu: 4
-  short_sequence_length: 64    # short-branch crop T (independent from denoiser.context_length)
+  num_epochs: 110
+
+  # Short/long mixed-batch training (Dreamer-V4 length-generalization trick).
+  # Loader batches at long_seq_batch_per_gpu × max_sequence_length; with prob
+  # long_seq_prob the long shape is used, otherwise random ctx_len crop.
+  batch_per_gpu: 8 # Batch size for short sequences.
+  long_seq_batch_per_gpu: 1
+  short_sequence_length: 32    # short-branch crop T (independent from denoiser.context_length)
   long_seq_prob: 0.15
-  # Image branch: reshape (B_long, T_long) → (B_long*T_long, 1) and trim to
-  # image_batch_per_gpu for unconditional single-frame training. Defaults
-  # off (image_prob=0) to preserve today's behavior.
-  image_prob: 0.25
+  # Image branch (Dreamer-V4 "30% as images"): reshape (B, T) -> (B*T, 1) for
+  # unconditional single-frame training. Cheap; bump image_batch_per_gpu later.
+  image_prob: 0.1
   image_batch_per_gpu: 64
 
-  accum_grad_steps: 1
+  accum_grad_steps: 2
   lr: 1e-4
   num_workers: 12
   lpips_weight: 0.2
-  num_training_steps: 1e7
+
+  warmup_samples: 4200 # ~1.5 hours with the current settings
+  total_samples: 520000 # ~150 hours with the current settings; adjust as needed for longer/shorter training
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
-  # Per-τ loss weighting scheme applied to both flow and (if shortcut) bootstrap
-  # losses. 'ramp' = 0.9τ+0.1 (default, favors clean end); 'uniform' = 1 (equal
-  # weight across the full schedule — use when training the heavily-noisy regime).
+  # `uniform` (not `ramp`) — ramp down-weights the noisy end which is the wrong
+  # bias for forcing/mode-3 training.
   loss_weighting: ramp
-  # Multiplier on reward MTP loss when denoiser.train_reward_model=true. Ignored otherwise.
   reward_weight: 1.0
+  # Best recipe so far: forcing dominates, wm has 2× weight; everything else 0.
   mode_weights:
-    policy: 0.0
-    video: 0.0
-    wm: 1.0
-    id: 0.0
-    forcing: 0.0
-    action_only: 0.0
-  forcing_mask_actions: false  # When true, action τ is pinned to 0 (pure noise) and action loss is zeroed in forcing mode — video-only progressive forcing.
-  video_pretraining: false # Set the action to zero in doing video pretraining
-  absolute_actions: false # Whether to use absolute actions (actions_abs) instead of relative actions (actions_rel)
+    policy: 0.5
+    video: 0
+    wm: 2.5
+    id: 0
+    forcing: 1
+    action_only: 0
+  forcing_mask_actions: false  # actions co-noised with state in forcing mode
+  video_pretraining: false
+  absolute_actions: false      # ignored by g1_chunked loader; kept for shape compat
   forcing_context_noise:
-    # In `forcing` mode, with probability `bias` the context-chunk τ (for both
-    # obs and act, independently) is redrawn from Beta(alpha, beta). alpha<beta
-    # tilts mass toward τ≈0 (pure-noise context), giving the model explicit
-    # training for generation from heavily-masked contexts. bias=0 disables.
     bias: 0.0
     alpha: 0.5
     beta: 2.0
   shortcut:
-    flow_bias: 0.75   # P(step_index_raw = max_pow2) → forces flow branch. Remaining mass uniform over bootstrap rungs.
-    ema_decay: 0.0  # EMA decay for the teacher used in the bootstrap target.
-
+    flow_bias: 0.75
+    ema_decay: 0.0
+    
 wandb:
   enable: true
   project: "UWM-dynamics"

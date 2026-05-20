@@ -109,6 +109,7 @@ def build_dataloaders(cfg, rank, world_size):
     window = int(cfg.denoiser.max_sequence_length)
     play_bs = int(cfg.train.batch_per_gpu)
     demo_bs = int(cfg.train.get('demo_batch_per_gpu', cfg.train.batch_per_gpu))
+    kind = str(cfg.dataset.get('kind', 'sharded_hdf5'))
 
     play_loader, play_sampler, _ = create_distributed_dataloader(
         data_dir=cfg.dataset.play_data_dir,
@@ -122,6 +123,7 @@ def build_dataloaders(cfg, rank, world_size):
         split_seed=cfg.dataset.split_seed,
         shuffle=True, drop_last=True,
         absolute_actions=cfg.train.absolute_actions,
+        kind=kind,
     )
     demo_loader, demo_sampler, _ = create_distributed_dataloader(
         data_dir=cfg.dataset.demo_data_dir,
@@ -135,6 +137,7 @@ def build_dataloaders(cfg, rank, world_size):
         split_seed=cfg.dataset.split_seed,
         shuffle=True, drop_last=True,
         absolute_actions=cfg.train.absolute_actions,
+        kind=kind,
     )
     return play_loader, play_sampler, demo_loader, demo_sampler
 
@@ -555,41 +558,30 @@ def main(cfg: DictConfig):
         lr=float(cfg.train.lr),
         weight_decay=float(cfg.train.get('weight_decay', 0.0)),
     )
-    # "Epoch" = one pass over the play loader (the bigger of the two) by
-    # default. Override via `train.steps_per_epoch` to cap micro-steps per
-    # epoch — useful for smoke tests and for keeping epoch length manageable
-    # when the play dataset is much larger than the demo dataset.
-    natural_steps = len(play_loader)
-    cap = cfg.train.get('steps_per_epoch', None)
-    if cap is not None and int(cap) > 0:
-        steps_per_epoch = min(int(cap), natural_steps)
-        if rank == 0:
-            print(f"steps_per_epoch capped to {steps_per_epoch} "
-                  f"(natural play-pass length: {natural_steps})")
-    else:
-        steps_per_epoch = natural_steps
-    total_grad_steps = (cfg.train.num_epochs * steps_per_epoch) // cfg.train.accum_grad_steps
-    # Warmup. Override `train.warmup_steps` to fix the warmup length
-    # independently of the total-step budget (useful when resuming from a
-    # pretrained model where the default 5%-of-total is far too long).
+    # Run length is driven by a single knob: `train.num_training_steps`
+    # (total optimizer steps). The cosine schedule spans the same horizon,
+    # so ablation slurms equalize compute by sharing this one value and
+    # nothing else about epochs/dataset size leaks into the schedule.
+    total_grad_steps = int(cfg.train.num_training_steps)
+    total_micro_steps = total_grad_steps * cfg.train.accum_grad_steps
     warmup_cfg = cfg.train.get('warmup_steps', None)
     if warmup_cfg is not None:
         warmup_steps = int(warmup_cfg)
     else:
         warmup_steps = int(0.05 * total_grad_steps)
     if rank == 0:
-        print(f"Schedule: total grad steps={total_grad_steps}, warmup={warmup_steps}")
+        print(f"Schedule: total grad steps={total_grad_steps}, "
+              f"micro-steps={total_micro_steps}, warmup={warmup_steps}")
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_grad_steps)
 
     # --- Resume (model only; optimizer/scheduler start fresh by design) ---
     wandb_run_id = cfg.wandb.run_name
     log_dir = None
-    start_epoch = 0
     global_update = 0
     if cfg.reload_checkpoint is not None:
         if rank == 0:
             print(f"Resuming training state from: {cfg.reload_checkpoint}")
-        start_epoch, global_update, wandb_run_id, log_dir = load_ddp_checkpoint(
+        _, global_update, _cumulative_samples, wandb_run_id, log_dir = load_ddp_checkpoint(
             ckpt_path=cfg.reload_checkpoint,
             model=denoiser, optim=optim, scheduler=scheduler, rank=rank,
         )
@@ -613,8 +605,9 @@ def main(cfg: DictConfig):
         OmegaConf.save(cfg, os.path.join(log_dir, 'config.yaml'))
     dist.barrier()
 
-    # --- Cycling iterators (the smaller demo loader will restart many times
-    # per play epoch; play_iter restarts at most once per outer epoch). ---
+    # --- Cycling iterators. Both loaders restart as many times as needed to
+    # supply num_training_steps grad steps. `_cycling_iter` increments its
+    # internal pass_idx on each restart to keep shuffles varying. ---
     epoch_ref = [0]
     play_iter = _cycling_iter(play_loader, sampler=play_sampler, epoch_ref=epoch_ref)
     demo_iter = _cycling_iter(demo_loader, sampler=demo_sampler, epoch_ref=epoch_ref,
@@ -624,42 +617,42 @@ def main(cfg: DictConfig):
     rng = torch.Generator(device='cpu').manual_seed(cfg.seed + 31337)
 
     if rank == 0:
-        print(f"Starting training: {cfg.train.num_epochs} epochs × "
-              f"{steps_per_epoch} steps/epoch (play-loader passes).")
+        print(f"Starting training: {total_grad_steps} grad steps "
+              f"({total_micro_steps} micro-steps, accum={cfg.train.accum_grad_steps}).")
 
+    # Single training pass driven by num_training_steps. `_cycling_iter`
+    # varies the DistributedSampler seed on each loader restart via its
+    # internal pass_idx, so shuffles still differ across passes.
     epoch_losses, epoch_times = [], []
-    for epoch in range(start_epoch, cfg.train.num_epochs):
-        epoch_ref[0] = epoch
-        play_sampler.set_epoch(epoch)
-        global_update, avg_loss, epoch_time = train_epoch(
-            epoch=epoch,
-            play_iter=play_iter, demo_iter=demo_iter,
-            steps_in_epoch=steps_per_epoch,
-            tokenizer=tokenizer, denoiser=denoiser, diffuser=diffuser,
-            optim=optim, scheduler=scheduler, tb_writer=tb_writer,
-            cfg=cfg, rank=rank, device=device,
-            global_update=global_update, log_dir=log_dir, wandb_run_id=wandb_run_id,
-            trainable_params=trainable_params, lora_enabled=lora_enabled, rng=rng,
-        )
-        epoch_losses.append(avg_loss)
-        epoch_times.append(epoch_time)
+    global_update, avg_loss, epoch_time = train_epoch(
+        epoch=0,
+        play_iter=play_iter, demo_iter=demo_iter,
+        steps_in_epoch=total_micro_steps,
+        tokenizer=tokenizer, denoiser=denoiser, diffuser=diffuser,
+        optim=optim, scheduler=scheduler, tb_writer=tb_writer,
+        cfg=cfg, rank=rank, device=device,
+        global_update=global_update, log_dir=log_dir, wandb_run_id=wandb_run_id,
+        trainable_params=trainable_params, lora_enabled=lora_enabled, rng=rng,
+    )
+    epoch_losses.append(avg_loss)
+    epoch_times.append(epoch_time)
 
-        if rank == 0:
-            if lora_enabled:
-                save_lora_adapter(
-                    ckpt_path=os.path.join(log_dir, f'adapter_{global_update}.pt'),
-                    epoch=epoch, global_update=global_update,
-                    model=denoiser, optim=optim, scheduler=scheduler,
-                    rank=rank, wandb_run_id=wandb_run_id, log_dir=log_dir,
-                )
-            else:
-                save_ddp_checkpoint(
-                    ckpt_path=os.path.join(log_dir, f'{global_update}.pt'),
-                    epoch=epoch, global_update=global_update,
-                    model=denoiser, optim=optim, scheduler=scheduler,
-                    rank=rank, wandb_run_id=wandb_run_id, log_dir=log_dir,
-                )
-        dist.barrier()
+    if rank == 0:
+        if lora_enabled:
+            save_lora_adapter(
+                ckpt_path=os.path.join(log_dir, f'adapter_{global_update}.pt'),
+                epoch=0, global_update=global_update,
+                model=denoiser, optim=optim, scheduler=scheduler,
+                rank=rank, wandb_run_id=wandb_run_id, log_dir=log_dir,
+            )
+        else:
+            save_ddp_checkpoint(
+                ckpt_path=os.path.join(log_dir, f'{global_update}.pt'),
+                epoch=0, global_update=global_update,
+                model=denoiser, optim=optim, scheduler=scheduler,
+                rank=rank, wandb_run_id=wandb_run_id, log_dir=log_dir,
+            )
+    dist.barrier()
 
     # --- Final merged save when using LoRA ---
     if lora_enabled and bool(cfg.lora.get('save_merged_final', True)):
