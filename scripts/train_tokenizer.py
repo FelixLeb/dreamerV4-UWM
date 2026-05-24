@@ -95,6 +95,42 @@ def unwrap_model(m):
     return m
 
 
+# Prefixes inserted by wrappers (torch.compile, FSDP, DDP) that must be stripped
+# so checkpoints map 1:1 to a bare wrapper module.
+_WRAPPER_PREFIX_SEGMENTS = ("_orig_mod.", "_fsdp_wrapped_module.", "module.")
+
+
+def _strip_wrapper_prefixes(sd: dict) -> dict:
+    out = {}
+    for k, v in sd.items():
+        new_k = k
+        for seg in _WRAPPER_PREFIX_SEGMENTS:
+            new_k = new_k.replace(seg, "")
+        out[new_k] = v
+    return out
+
+
+def _restore_wrapper_prefixes(sd: dict, model: nn.Module) -> dict:
+    """Add back whatever leading wrapper prefixes the live `model` exposes,
+    so a portable (stripped-key) checkpoint can be loaded back into a wrapped
+    module. Only handles a single common leading prefix chain — sufficient for
+    our DDP/compile/FSDP combinations.
+    """
+    target_keys = list(model.state_dict().keys())
+    if not target_keys:
+        return sd
+    sample_target = target_keys[0]
+    sample_clean = sample_target
+    for seg in _WRAPPER_PREFIX_SEGMENTS:
+        sample_clean = sample_clean.replace(seg, "")
+    if sample_target == sample_clean:
+        return sd  # No prefix in target model
+    if not sample_target.endswith(sample_clean):
+        return sd  # Cannot detect; let load fail loudly
+    prefix = sample_target[: len(sample_target) - len(sample_clean)]
+    return {prefix + k: v for k, v in sd.items()}
+
+
 def save_fsdp_checkpoint(
     ckpt_path: str,
     epoch: int,
@@ -107,13 +143,22 @@ def save_fsdp_checkpoint(
     wandb_run_id: str = None,
     log_dir: str = None,
 ):
-    """Save a FULL (unsharded) checkpoint. All ranks must participate in the gather."""
+    """Save a FULL (unsharded) checkpoint. All ranks must participate in the gather.
+
+    `state_dict()` must be called on the FSDP-wrapped module itself so its
+    FULL_STATE_DICT hooks fire and all-gather every sharded param. Calling it on
+    the unwrapped inner module under `use_orig_params=True` silently returns
+    rank-local shards for params owned directly by the root FSDP wrapper, which
+    on rank 0 are often shape `[0]` for small params — producing a checkpoint
+    that cannot be reloaded.
+    """
     full_cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
 
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
-        model_state = unwrap_model(model).state_dict()
+        raw_state = model.state_dict()
 
     if rank == 0:
+        model_state = _strip_wrapper_prefixes(raw_state)
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         ckpt = {
             "epoch": epoch,
@@ -161,7 +206,7 @@ def load_fsdp_checkpoint(
 
     full_cfg = FullStateDictConfig(rank0_only=False, offload_to_cpu=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(_restore_wrapper_prefixes(ckpt["model"], model))
 
     optim.load_state_dict(ckpt["optim"])
     scheduler.load_state_dict(ckpt["scheduler"])

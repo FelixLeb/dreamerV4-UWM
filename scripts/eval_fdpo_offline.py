@@ -143,6 +143,7 @@ def _build(args):
     diffuser = UWMForwardProcess(
         max_diff_steps=cfg.denoiser.num_noise_levels,
         mode_weights={'policy': 1.0, 'wm': 1.0},
+        horizon_aware=bool(cfg.denoiser.get("horizon_aware", False)),
         device=device,
     )
     return cfg, tokenizer, ref, aligned, diffuser, device
@@ -177,14 +178,14 @@ def _eval_one_pass(dataset, batch_size, ref, aligned, tokenizer, diffuser,
             z_clean = tokenizer.encode(images).detach()
 
         for _ in range(n_tau_samples):
-            obs_diff, act_diff, ctx_len, mode_out = diffuser.sample_step_noise(
+            obs_diff, act_diff, ctx_len, mode_out, is_horizon = diffuser.sample_step_noise(
                 B, T, force_mode=force_mode,
             )
             z0 = torch.randn_like(z_clean)
             a0 = diffuser.action_noise_std * torch.randn_like(actions)
             info = diffuser.apply_diff(
                 z_clean, actions, obs_diff, act_diff, ctx_len, mode_out,
-                z0=z0, a0=a0,
+                z0=z0, a0=a0, is_horizon=is_horizon,
             )
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 ref_per = compute_per_sample_uwm_loss(info, ref, device=device)

@@ -217,6 +217,7 @@ def build_models(cfg, device, local_rank, rank):
     diffuser = UWMForwardProcess(
         max_diff_steps=cfg.denoiser.num_noise_levels,
         mode_weights={cfg.fdpo.force_mode: 1.0},  # we always force a single mode
+        horizon_aware=bool(cfg.denoiser.get("horizon_aware", False)),
         device=device,
     )
     return tokenizer, ref_denoiser, aligned_denoiser, diffuser
@@ -301,13 +302,13 @@ def fdpo_step(
     B, T = pos_z.shape[:2]
 
     # Shared (τ, ε) across pos/neg per pair.
-    obs_diff, act_diff, ctx_len, mode = diffuser.sample_step_noise(
+    obs_diff, act_diff, ctx_len, mode, is_horizon = diffuser.sample_step_noise(
         B, T, force_mode=cfg.fdpo.force_mode,
     )
     z0 = torch.randn_like(pos_z)
     a0 = diffuser.action_noise_std * torch.randn_like(pos_a)
-    pos_info = diffuser.apply_diff(pos_z, pos_a, obs_diff, act_diff, ctx_len, mode, z0=z0, a0=a0)
-    neg_info = diffuser.apply_diff(neg_z, neg_a, obs_diff, act_diff, ctx_len, mode, z0=z0, a0=a0)
+    pos_info = diffuser.apply_diff(pos_z, pos_a, obs_diff, act_diff, ctx_len, mode, z0=z0, a0=a0, is_horizon=is_horizon)
+    neg_info = diffuser.apply_diff(neg_z, neg_a, obs_diff, act_diff, ctx_len, mode, z0=z0, a0=a0, is_horizon=is_horizon)
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         per_aligned_pos = compute_per_sample_uwm_loss(pos_info, aligned_denoiser, device=device)
@@ -344,14 +345,14 @@ def fdpo_step(
         play_a = play_action[:, :, :n_act].unsqueeze(-2)
         Bp, Tp = play_z.shape[:2]
         wm_mode = str(cfg.fdpo.get("wm_anchor_force_mode", "wm"))
-        p_obs_diff, p_act_diff, p_ctx_len, p_mode = diffuser.sample_step_noise(
+        p_obs_diff, p_act_diff, p_ctx_len, p_mode, p_is_horizon = diffuser.sample_step_noise(
             Bp, Tp, force_mode=wm_mode,
         )
         p_z0 = torch.randn_like(play_z)
         p_a0 = diffuser.action_noise_std * torch.randn_like(play_a)
         play_info = diffuser.apply_diff(
             play_z, play_a, p_obs_diff, p_act_diff, p_ctx_len, p_mode,
-            z0=p_z0, a0=p_a0,
+            z0=p_z0, a0=p_a0, is_horizon=p_is_horizon,
         )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             per_play = compute_per_sample_uwm_loss(play_info, aligned_denoiser, device=device)

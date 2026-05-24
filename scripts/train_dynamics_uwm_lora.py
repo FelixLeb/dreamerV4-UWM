@@ -217,6 +217,7 @@ def build_models(cfg, device, local_rank, rank):
     diffuser = UWMForwardProcess(
         max_diff_steps=cfg.denoiser.num_noise_levels,
         mode_weights=OmegaConf.to_container(cfg.train.mode_weights, resolve=True),
+        horizon_aware=bool(cfg.denoiser.get("horizon_aware", False)),
         device=device,
     )
     return tokenizer, denoiser, diffuser

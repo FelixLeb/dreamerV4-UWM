@@ -13,7 +13,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from dreamerv4uwm.datasets import create_distributed_dataloader
-from dreamerv4uwm.loss_new import UnifiedForwardProcess, compute_unified_uwm_loss
+from dreamerv4uwm.loss_new import (
+    ActionPretrainingForwardProcess,
+    ImageForwardProcess,
+    UnifiedForwardProcess,
+    VideoPretrainingForwardProcess,
+    compute_action_pretraining_loss,
+    compute_image_loss,
+    compute_unified_uwm_loss,
+    compute_video_pretraining_loss,
+)
 from dreamerv4uwm.models.dynamics import DenoiserWrapper
 from dreamerv4uwm.models.utils import load_denoiser, load_tokenizer
 from dreamerv4uwm.utils.distributed import (
@@ -119,8 +128,31 @@ def build_models(cfg, device, local_rank):
         profile_step_prob=float(unified_cfg.get("profile_step_prob", 0.5)),
         profile_progressive_prob=float(unified_cfg.get("profile_progressive_prob", 0.3)),
         profile_constant_prob=float(unified_cfg.get("profile_constant_prob", 0.2)),
+        profile_diffusion_forcing_prob=float(
+            unified_cfg.get("profile_diffusion_forcing_prob", 0.0)
+        ),
         r_beta_alpha=float(unified_cfg.get("r_beta_alpha", 1.0)),
         r_beta_beta=float(unified_cfg.get("r_beta_beta", 1.0)),
+        diffusion_forcing_bidir_prob=float(
+            unified_cfg.get("diffusion_forcing_bidir_prob", 0.5)
+        ),
+        device=device,
+    )
+    image_diffuser = ImageForwardProcess(
+        max_diff_steps=cfg.denoiser.num_noise_levels,
+        action_noise_std=float(unified_cfg.get("action_noise_std", 1.0)),
+        device=device,
+    )
+    video_pretraining_diffuser = VideoPretrainingForwardProcess(
+        max_diff_steps=cfg.denoiser.num_noise_levels,
+        action_noise_std=float(unified_cfg.get("action_noise_std", 1.0)),
+        bidir_prob=float(unified_cfg.get("pretraining_bidir_prob", 0.5)),
+        device=device,
+    )
+    action_pretraining_diffuser = ActionPretrainingForwardProcess(
+        max_diff_steps=cfg.denoiser.num_noise_levels,
+        action_noise_std=float(unified_cfg.get("action_noise_std", 1.0)),
+        bidir_prob=float(unified_cfg.get("pretraining_bidir_prob", 0.5)),
         device=device,
     )
 
@@ -137,7 +169,11 @@ def build_models(cfg, device, local_rank):
 
     denoiser = DDP(denoiser, device_ids=[local_rank], find_unused_parameters=False)
 
-    return tokenizer, denoiser, diffuser
+    return (
+        tokenizer, denoiser,
+        diffuser, image_diffuser,
+        video_pretraining_diffuser, action_pretraining_diffuser,
+    )
 
 
 def setup_logging(cfg, rank, log_dir, wandb_run_id):
@@ -188,6 +224,9 @@ def train_epoch(
     tokenizer,
     denoiser,
     diffuser,
+    image_diffuser,
+    video_pretraining_diffuser,
+    action_pretraining_diffuser,
     optim,
     scheduler,
     tb_writer,
@@ -207,9 +246,9 @@ def train_epoch(
     # Per accumulation window, sample a 3-way categorical branch:
     #   long  → consume (B_long, T_long) as-is.
     #   image → reshape (B_long, T_long, …) → (B_long*T_long, 1, …), then
-    #           trim to image_batch_per_gpu. force_video=True below pins
-    #           actions to pure noise and applies state-only loss for
-    #           unconditioned single-frame generation.
+    #           trim to image_batch_per_gpu. Routed through
+    #           ImageForwardProcess + compute_image_loss for the marginal
+    #           state objective (action stream ignored).
     #   short → random-crop along T to short_sequence_length.
     # Branch is fixed across all micro-batches in one optimizer step.
     short_bs = int(cfg.train.batch_per_gpu)
@@ -238,9 +277,31 @@ def train_epoch(
 
     # Unified-loss knobs (re-read each epoch so live overrides take effect on resume).
     unified_cfg = cfg.train.get("unified", {}) or {}
-    causal_alpha = float(unified_cfg.get("causal_alpha", 0.5))
-    weight_floor = str(unified_cfg.get("weight_floor", "uniform"))
-    floor_slope = float(unified_cfg.get("floor_slope", 0.9))
+    causal_eps = float(unified_cfg.get("causal_eps", 1e-3))
+    # Per-frame, per-modality ramp multiplier applied to the causal weights.
+    # β = 1 is uniform (no ramp); β = 0 is pure cleanness ramp (down-weights
+    # the noisy end of each modality).
+    ramp_beta = float(unified_cfg.get("ramp_beta", 1.0))
+
+    # Mode mixture for long/short branches: {unified, video_pretraining, action_pretraining}.
+    # Default 1/3 each. Image branch is unaffected by this — it always uses
+    # ImageForwardProcess + compute_image_loss.
+    mode_probs_cfg = unified_cfg.get("mode_probs", {}) or {}
+    _mp_unified = float(mode_probs_cfg.get("unified", 1.0 / 3.0))
+    _mp_video = float(mode_probs_cfg.get("video_pretraining", 1.0 / 3.0))
+    _mp_action = float(mode_probs_cfg.get("action_pretraining", 1.0 / 3.0))
+    _mp_total = _mp_unified + _mp_video + _mp_action
+    assert _mp_total > 0, "at least one of train.unified.mode_probs.* must be > 0"
+    mp_unified = _mp_unified / _mp_total
+    mp_video = _mp_video / _mp_total
+    # mp_action = _mp_action / _mp_total  # implicit remainder
+
+    # Dataset-modality forcing: if the dataset lacks one modality, pin the
+    # mode for long/short branches to the marginal that doesn't need it.
+    dataset_cfg = cfg.get("dataset", {}) or {}
+    has_states = bool(dataset_cfg.get("has_states", True))
+    has_actions = bool(dataset_cfg.get("has_actions", True))
+    assert has_states or has_actions, "dataset must have at least one of states/actions"
 
     epoch_start = time.perf_counter()
     epoch_loss_sum = 0.0
@@ -253,6 +314,11 @@ def train_epoch(
     accum_reward = 0.0
     accum_total = 0.0
     accum_branch = "short"  # set on the first micro of each window
+    # Mode within long/short branches: unified | video_pretraining | action_pretraining.
+    # Set on the first micro of each window via the same rank-0-broadcast pattern
+    # as accum_branch. Meaningless for the image branch (image always uses
+    # ImageForwardProcess + compute_image_loss).
+    accum_mode = "unified"
     train_reward = bool(cfg.denoiser.get("train_reward_model", False))
     reward_weight = float(cfg.train.get("reward_weight", 1.0))
 
@@ -292,6 +358,29 @@ def train_epoch(
                 branch_code_t = torch.zeros(1, device=device, dtype=torch.long)
             dist.broadcast(branch_code_t, src=0)
             accum_branch = ("long", "image", "short")[int(branch_code_t.item())]
+
+            # Mode pick for long/short branches. Forced when the dataset is
+            # missing one modality; otherwise sampled from mode_probs.
+            if rank == 0:
+                if not has_actions:
+                    mode_code = 1  # video_pretraining
+                elif not has_states:
+                    mode_code = 2  # action_pretraining
+                else:
+                    r_mode = torch.rand(1).item()
+                    if r_mode < mp_unified:
+                        mode_code = 0
+                    elif r_mode < mp_unified + mp_video:
+                        mode_code = 1
+                    else:
+                        mode_code = 2
+                mode_code_t = torch.tensor([mode_code], device=device, dtype=torch.long)
+            else:
+                mode_code_t = torch.zeros(1, device=device, dtype=torch.long)
+            dist.broadcast(mode_code_t, src=0)
+            accum_mode = (
+                "unified", "video_pretraining", "action_pretraining",
+            )[int(mode_code_t.item())]
 
             if accum_branch == "short" and max_seq > short_seq_len:
                 if rank == 0:
@@ -341,17 +430,32 @@ def train_epoch(
                 z_clean = tokenizer.encode(images).detach().clone()
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            diffused_info = diffuser(
-                z_clean, actions,
-                force_video=(accum_branch == "image"),
-            )
-            losses = compute_unified_uwm_loss(
-                diffused_info, denoiser, device=device,
-                causal_alpha=causal_alpha,
-                weight_floor=weight_floor,
-                floor_slope=floor_slope,
-                rewards=rewards if train_reward else None,
-            )
+            if accum_branch == "image":
+                diffused_info = image_diffuser(z_clean, actions)
+                losses = compute_image_loss(
+                    diffused_info, denoiser, device=device,
+                    rewards=rewards if train_reward else None,
+                )
+            elif accum_mode == "video_pretraining":
+                diffused_info = video_pretraining_diffuser(z_clean, actions)
+                losses = compute_video_pretraining_loss(
+                    diffused_info, denoiser, device=device,
+                    rewards=rewards if train_reward else None,
+                )
+            elif accum_mode == "action_pretraining":
+                diffused_info = action_pretraining_diffuser(z_clean, actions)
+                losses = compute_action_pretraining_loss(
+                    diffused_info, denoiser, device=device,
+                    rewards=rewards if train_reward else None,
+                )
+            else:  # accum_mode == "unified"
+                diffused_info = diffuser(z_clean, actions)
+                losses = compute_unified_uwm_loss(
+                    diffused_info, denoiser, device=device,
+                    causal_eps=causal_eps,
+                    ramp_beta=ramp_beta,
+                    rewards=rewards if train_reward else None,
+                )
             obs_flow_loss = losses["obs_flow_loss"]
             act_flow_loss = losses["act_flow_loss"]
             reward_loss = losses["reward_loss"]
@@ -389,7 +493,12 @@ def train_epoch(
                     tb_writer.add_scalar("train/reward_loss", accum_reward, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
                 tb_writer.add_scalar("train/global_update", global_update, global_update)
-                ns = f"train/{accum_branch}"
+                # Per-branch namespace; for long/short we further split by
+                # mode so each (branch × mode) combination gets its own curve.
+                if accum_branch == "image":
+                    ns = "train/image"
+                else:
+                    ns = f"train/{accum_branch}_{accum_mode}"
                 tb_writer.add_scalar(f"{ns}/total_loss", sync_loss, global_update)
                 tb_writer.add_scalar(f"{ns}/obs_flow_loss", accum_obs_flow, global_update)
                 tb_writer.add_scalar(f"{ns}/act_flow_loss", accum_act_flow, global_update)
@@ -397,11 +506,18 @@ def train_epoch(
                     tb_writer.add_scalar(f"{ns}/reward_loss", accum_reward, global_update)
                 _branch_code = {"long": 0, "image": 1, "short": 2}[accum_branch]
                 tb_writer.add_scalar("train/branch_code", _branch_code, global_update)
+                # Mode trace: 0=unified, 1=video, 2=action, -1=image branch (no mode).
+                _mode_code = (
+                    -1 if accum_branch == "image" else
+                    {"unified": 0, "video_pretraining": 1, "action_pretraining": 2}[accum_mode]
+                )
+                tb_writer.add_scalar("train/mode_code", _mode_code, global_update)
 
                 if global_update % cfg.print_every == 0:
+                    tag = "image" if accum_branch == "image" else f"{accum_branch}/{accum_mode}"
                     print(
                         f"  [step {global_update}]"
-                        f"  [{accum_branch}]"
+                        f"  [{tag}]"
                         f"  loss: {sync_loss:.4f}"
                         f"  obs: {accum_obs_flow:.4f}"
                         f"  act: {accum_act_flow:.4f}"
@@ -477,7 +593,11 @@ def main(cfg: DictConfig):
     # --- Models ---
     if rank == 0:
         print("Building models...")
-    tokenizer, denoiser, diffuser = build_models(cfg, device, local_rank)
+    (
+        tokenizer, denoiser,
+        diffuser, image_diffuser,
+        video_pretraining_diffuser, action_pretraining_diffuser,
+    ) = build_models(cfg, device, local_rank)
     if rank == 0:
         n_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)
         print(f"Denoiser learnable parameters: {n_params:,}")
@@ -539,6 +659,9 @@ def main(cfg: DictConfig):
             tokenizer=tokenizer,
             denoiser=denoiser,
             diffuser=diffuser,
+            image_diffuser=image_diffuser,
+            video_pretraining_diffuser=video_pretraining_diffuser,
+            action_pretraining_diffuser=action_pretraining_diffuser,
             optim=optim,
             scheduler=scheduler,
             tb_writer=tb_writer,
@@ -552,20 +675,6 @@ def main(cfg: DictConfig):
         epoch_losses.append(avg_loss)
         epoch_times.append(epoch_time)
         epoch_fps_vals.append(epoch_fps)
-
-        if rank == 0:
-            save_ddp_checkpoint(
-                ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
-                epoch=epoch,
-                global_update=global_update,
-                model=denoiser,
-                optim=optim,
-                scheduler=scheduler,
-                rank=rank,
-                wandb_run_id=wandb_run_id,
-                log_dir=log_dir,
-            )
-        dist.barrier()
 
     # --- Final summary ---
     if rank == 0:

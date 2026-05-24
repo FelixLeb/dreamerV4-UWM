@@ -40,7 +40,7 @@ denoiser:
 train:
   device: 'cuda:0'
   use_compile: true
-  num_epochs: 100
+  num_epochs: 1000
 
   # Short/long mixed-batch training (Dreamer-V4 length-generalization trick).
   # Loader batches at long_seq_batch_per_gpu × max_sequence_length; with prob

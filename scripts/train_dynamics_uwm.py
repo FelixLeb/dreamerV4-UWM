@@ -113,6 +113,7 @@ def build_models(cfg, device, local_rank):
         forcing_context_noise_alpha=float(fc_noise.get("alpha", 0.5)),
         forcing_context_noise_beta=float(fc_noise.get("beta", 2.0)),
         forcing_mask_actions=bool(cfg.train.get("forcing_mask_actions", False)),
+        horizon_aware=bool(cfg.denoiser.get("horizon_aware", False)),
         device=device,
     )
 

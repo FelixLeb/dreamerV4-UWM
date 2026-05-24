@@ -3,7 +3,7 @@ defaults:
  - /dataset: ogbench-manipulation
 
 reload_checkpoint: null
-tokenizer_ckpt: null
+tokenizer_ckpt: /scratch/rk4342/projects/dreamerV4-UWM/checkpoints/tokenizer/ogbench-manipulation/23000.pt
 output_dir: checkpoints/tokenizer/ogbench-manipulation/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100

@@ -97,3 +97,21 @@ In the VSCode window attached to this node:
 - Server dies on shell exit unless backgrounded with `nohup` / `tmux`.
 - Always bind to `127.0.0.1`, never `0.0.0.0` — other users on the shared node would otherwise have access.
 - `pip install` against the read-only overlay will silently fail in confusing ways; use `--user` or remount rw.
+
+
+torchrun --standalone --nproc_per_node=1 scripts/train_dynamics_uwm_new.py \
+  --config-path config --config-name dynamics/pushT \
+  dataset.data_dir=/scratch/rk4342/datasets/pushT/play \
+  tokenizer_ckpt=/scratch/rk4342/projects/dreamer-v4/checkpoints/tokenizer_ckpts/pushT.pt \
+  +denoiser.horizon_aware=true \
+  +train.unified.causal_alpha=0.5 \
+  +train.unified.weight_floor=uniform \
+  +train.unified.theta_id_prob=0.15 \
+  +train.unified.theta_policy_prob=0.15 \
+  +train.unified.theta_wm_prob=0.15 \
+  +train.unified.theta_continuum_prob=0.55 \
+  +train.unified.profile_step_prob=0.5 \
+  +train.unified.profile_progressive_prob=0.3 \
+  +train.unified.profile_constant_prob=0.2 \
+  +train.unified.ramp_beta=0.3 \
+  wandb.run_name=pushT-unified-horizon-aware-smoke-v3 

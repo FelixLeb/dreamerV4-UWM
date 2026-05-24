@@ -149,12 +149,18 @@ class UWMForwardProcess(nn.Module):
                  forcing_context_noise_alpha: float = 0.5,
                  forcing_context_noise_beta: float = 2.0,
                  forcing_mask_actions: bool = False,
+                 horizon_aware: bool = False,
                  device='cpu'):
         super().__init__()
         self.max_diff_steps = max_diff_steps
         self.device = device
         self.action_noise_std = action_noise_std
         self.forcing_mask_actions = forcing_mask_actions
+        # When True, sample_step_noise emits a per-frame is_horizon tensor so
+        # the denoiser's uncached temporal path can use bidirectional attention
+        # within the horizon block. When False (default), is_horizon is None
+        # everywhere and the call chain is bit-equivalent to pre-flag main.
+        self.horizon_aware = bool(horizon_aware)
         self.modes = ['policy', 'video', 'wm', 'id', 'forcing', 'action_only']
         if mode_weights is not None:
             weights = [float(mode_weights.get(m, 0.0)) for m in self.modes]
@@ -271,7 +277,23 @@ class UWMForwardProcess(nn.Module):
         action_tau_idx = (action_tau*self.max_diff_steps).to(torch.long)
         obs_diff = dict(tau=state_tau, tau_idx = state_tau_idx.to(self.device))
         act_diff = dict(tau=action_tau, tau_idx = action_tau_idx.to(self.device))
-        return obs_diff, act_diff, context_length, mode
+        # Frame-identity flag for the horizon-aware temporal mask.
+        # When horizon_aware is off, return None and the rest of the pipeline
+        # stays on the legacy purely-causal path.
+        # When on:
+        #   - wm stays fully causal (ctx + hor both treated as context).
+        #   - video is kept fully causal for parity with the legacy path.
+        #   - policy/forcing/id/action_only split at `context_length`: hor =
+        #     bidirectional within the horizon block, ctx = causal-only.
+        #     forcing's context_length is forced to 1 in its branch above, so
+        #     its is_horizon labels frame 0 as ctx and 1..T-1 as hor.
+        if self.horizon_aware:
+            is_horizon = torch.zeros(T, dtype=torch.long, device=self.device)
+            if mode in ('policy', 'forcing', 'id', 'action_only'):
+                is_horizon[context_length:] = 1
+        else:
+            is_horizon = None
+        return obs_diff, act_diff, context_length, mode, is_horizon
 
     def forward(
         self,
@@ -281,10 +303,10 @@ class UWMForwardProcess(nn.Module):
     ):
         B, T, N_lat, D_lat = z_clean.shape
         device = z_clean.device
-        obs_diff, act_diff, context_length, mode = self.sample_step_noise(
+        obs_diff, act_diff, context_length, mode, is_horizon = self.sample_step_noise(
             B, T, force_mode=force_mode,
         )
-        
+
         # observation forward diffusion
         z0 = torch.randn_like(z_clean)
         obs_tau = obs_diff["tau"].unsqueeze(-1).unsqueeze(-1)  # (B,T,1,1)
@@ -310,6 +332,7 @@ class UWMForwardProcess(nn.Module):
             "act_tau_idx": act_diff["tau_idx"],
             "context_length": context_length,
             "mode": mode,
+            "is_horizon": is_horizon,
             "forcing_mask_actions": self.forcing_mask_actions if mode == 'forcing' else False,
         }
 
@@ -323,6 +346,7 @@ class UWMForwardProcess(nn.Module):
         mode: str,
         z0: Optional[torch.Tensor] = None,   # (B, T, N_lat, D_lat) — shared noise
         a0: Optional[torch.Tensor] = None,   # (B, T, N_act_tokens, n_actions) — shared noise
+        is_horizon: Optional[torch.Tensor] = None,  # passthrough from sample_step_noise
     ):
         """Apply a pre-sampled (τ, ε) schedule to a (z_clean, a_clean) pair.
 
@@ -359,6 +383,7 @@ class UWMForwardProcess(nn.Module):
             "act_tau_idx": act_diff["tau_idx"],
             "context_length": context_length,
             "mode": mode,
+            "is_horizon": is_horizon,
             "forcing_mask_actions": self.forcing_mask_actions if mode == 'forcing' else False,
         }
 
@@ -402,6 +427,7 @@ def compute_uwm_loss(
         obs_step_idx=step_idx,
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
+        is_horizon=info.get("is_horizon"),
     )  # a_hat: (B,T,1,A); pred_rewards: (B,T,L,K) or None
 
     # X-prediction targets: directly regress clean signal
@@ -503,6 +529,7 @@ def compute_per_sample_uwm_loss(
         obs_step_idx=step_idx,
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
+        is_horizon=info.get("is_horizon"),
     )
 
     # Per-frame squared error, averaged over the per-frame inner dims.
