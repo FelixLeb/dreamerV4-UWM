@@ -7,18 +7,25 @@ dynamics_ckpt: null
 reload_checkpoint: null
 output_dir: checkpoints/dynamics/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
-print_every: 100
+print_every: 2000
 log_every: 25
-save_every: 2000
+save_every: 50000
 seed: 42
+
+# Dataset modality flags — when one side is False, the train script pins the
+# long/short mode dispatch to the corresponding marginal (video_pretraining if
+# no actions; action_pretraining if no states). Default is paired data.
+dataset:
+  has_states: true
+  has_actions: true
 
 denoiser:
   dual_stream: false
   num_action_tokens: 1    # Number of tokens for the image or other modalities
   num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
-  context_length: 32           # temporal-attention window
-  max_sequence_length: 32      # long-branch T == loader window size
+  context_length: 64           # temporal-attention window
+  max_sequence_length: 96      # long-branch T == loader window size
   model_dim: 1024              # The dimension of the transformer latents
   latent_dim: 32              # The dimention of the encoder output latents (z)
   n_layers: 8           # Causal tokenizer encoder depth
@@ -28,60 +35,135 @@ denoiser:
   qk_norm: false
   num_noise_levels: 128
   n_actions: 2
-  is_causal: false
+  is_causal: true
   layer_types: [spatial, temporal, spatial, temporal]
   # Reward / MTP head. Off by default → no agent token, no extra params,
   # bit-equivalent to runs without these fields.
   train_reward_model: false
   mtp_length: 8
+  # Horizon-aware temporal attention: when true, registers a 2-row
+  # `frame_id_embedder` summed into IC/AC, and the uncached temporal mask
+  # becomes causal-into-ctx + bidirectional-within-horizon according to the
+  # per-frame `is_horizon` flag emitted by the forward processes.
+  horizon_aware: true
 
 train:
   device: 'cuda:0'
   use_compile: true
-  num_epochs: 100
-  batch_per_gpu: 4
-  long_seq_batch_per_gpu: 4
+  num_epochs: 1100
+
+  # Short/long mixed-batch training (Dreamer-V4 length-generalization trick).
+  # Loader batches at long_seq_batch_per_gpu × max_sequence_length; with prob
+  # long_seq_prob the long shape is used, otherwise random ctx_len crop.
+  batch_per_gpu: 8 # Batch size for short sequences.
+  long_seq_batch_per_gpu: 1
   short_sequence_length: 32    # short-branch crop T (independent from denoiser.context_length)
-  long_seq_prob: 0.0
-  # Image branch: reshape (B_long, T_long) → (B_long*T_long, 1) and trim to
-  # image_batch_per_gpu for unconditional single-frame training. Defaults
-  # off (image_prob=0) to preserve today's behavior.
-  image_prob: 0.0
+  long_seq_prob: 0.15
+  # Image branch (Dreamer-V4 "30% as images"): reshape (B, T) -> (B*T, 1) for
+  # unconditional single-frame training. Cheap; bump image_batch_per_gpu later.
+  image_prob: 0.1
   image_batch_per_gpu: 64
-  accum_grad_steps: 1
+
+  accum_grad_steps: 2
   lr: 1e-4
   num_workers: 12
   lpips_weight: 0.2
-  num_training_steps: 1e7
+
+  warmup_samples: 1000 # ~1.5 hours with the current settings
+  total_samples: 520000 # ~150 hours with the current settings; adjust as needed for longer/shorter training
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
-  # Per-τ loss weighting scheme applied to both flow and (if shortcut) bootstrap
-  # losses. 'ramp' = 0.9τ+0.1 (default, favors clean end); 'uniform' = 1 (equal
-  # weight across the full schedule — use when training the heavily-noisy regime).
+  # `uniform` (not `ramp`) — ramp down-weights the noisy end which is the wrong
+  # bias for forcing/mode-3 training.
   loss_weighting: ramp
-  # Multiplier on reward MTP loss when denoiser.train_reward_model=true. Ignored otherwise.
   reward_weight: 1.0
+  # Best recipe so far: forcing dominates, wm has 2× weight; everything else 0.
   mode_weights:
-    policy: 1.0
-    video: 1.0
-    wm: 1.0
-    id: 1.0
-    forcing: 1.0
-    action_only: 1.0
-  forcing_mask_actions: false  # When true, action τ is pinned to 0 (pure noise) and action loss is zeroed in forcing mode — video-only progressive forcing.
-  video_pretraining: false # Set the action to zero in doing video pretraining
+    policy: 0.5
+    video: 0
+    wm: 2.5
+    id: 0
+    forcing: 1
+    action_only: 0
+  forcing_mask_actions: false  # actions co-noised with state in forcing mode
+  video_pretraining: false
+  absolute_actions: false      # ignored by g1_chunked loader; kept for shape compat
   forcing_context_noise:
-    # In `forcing` mode, with probability `bias` the context-chunk τ (for both
-    # obs and act, independently) is redrawn from Beta(alpha, beta). alpha<beta
-    # tilts mass toward τ≈0 (pure-noise context), giving the model explicit
-    # training for generation from heavily-masked contexts. bias=0 disables.
     bias: 0.0
     alpha: 0.5
     beta: 2.0
   shortcut:
-    flow_bias: 0.25   # P(step_index_raw = max_pow2) → forces flow branch. Remaining mass uniform over bootstrap rungs.
-    ema_decay: 0.999  # EMA decay for the teacher used in the bootstrap target.
+    flow_bias: 0.75
+    ema_decay: 0.0
+
+  # ===========================================================================
+  # Unified-loss knobs (consumed by train_dynamics_uwm_new.py / loss_new.py).
+  # The legacy `mode_weights`, `loss_weighting`, `forcing_*` keys above are
+  # ignored by the new pipeline and kept only for compatibility with the
+  # original train_dynamics_uwm.py runs.
+  # ===========================================================================
+  unified:
+    # Per-frame Gaussian noise std for the action stream's noise prior.
+    action_noise_std: 1.0
+
+    # θ-mixture for the (θ, r) ray sampler in UnifiedForwardProcess. Picks
+    # the causality direction: 0=ID, π/4=policy, π/2=WM, plus a continuum.
+    # Need not sum to 1 — normalized internally.
+    theta_id_prob: 0.15
+    theta_policy_prob: 0.15
+    theta_wm_prob: 0.15
+    theta_continuum_prob: 0.55
+
+    # r-profile mixture for how `r` varies across frames in a sequence.
+    # step               → clean ctx + noisy horizon (legacy policy/wm/id pattern)
+    # progressive        → smooth ramp (forcing-like)
+    # constant           → all frames at the same r (mode-3-like joint generation)
+    # diffusion_forcing  → per-frame i.i.d. r along the ray, no ctx/hor split;
+    #                      is_horizon is a per-batch coin flip (see
+    #                      `diffusion_forcing_bidir_prob` below).
+    # reverse_step       → time-reverse of step: noisy past + clean future,
+    #                      full bidir attention. Trains goal-conditioned /
+    #                      hindsight reasoning (past attends to clean future).
+    profile_step_prob: 0.15
+    profile_progressive_prob: 0.15
+    profile_constant_prob: 0.15
+    profile_diffusion_forcing_prob: 0.4
+    profile_reverse_step_prob: 0.3
+
+    # r ∼ Beta(α, β) on [0, 1] within the chosen r-profile.
+    # (1, 1) = Uniform. α < β biases toward small r (near-clean horizon);
+    # α > β biases toward large r (very-noisy regime, mode-3 emphasis).
+    r_beta_alpha: 1.0
+    r_beta_beta: 1.0
+
+    # Singularity-regularizer ε for the causal weights at the policy corner
+    # (both modalities fully noisy → 0/0 without ε). ε pushes that point to
+    # a 50/50 split between obs/act loss.
+    causal_eps: 1.0e-3
+
+    # Per-frame, per-modality ramp multiplied onto the causal weights:
+    #   w_ramp = β + (1 - β) · (1 - n_modality)
+    # β = 1 → uniform (no ramp). β = 0 → pure cleanness ramp (down-weights
+    # the noisy end of each modality).
+    ramp_beta: 0.33
+
+    # Top-level mode mixture for the long/short branches. Image branch always
+    # uses ImageForwardProcess + compute_image_loss regardless of these.
+    #   unified            → joint state-action via (θ, r) sampler
+    #   video_pretraining  → state-only, per-frame Diffusion Forcing on state
+    #   action_pretraining → action-only, symmetric counterpart
+    mode_probs:
+      unified: 0.333
+      video_pretraining: 0.333
+      action_pretraining: 0.333
+
+    # P(fully bidirectional attention) in the pretraining marginals; the
+    # complementary mass goes to fully causal. Per-batch coin flip.
+    pretraining_bidir_prob: 0.5
+
+    # Same coin-flip mechanism for the diffusion_forcing r-profile.
+    diffusion_forcing_bidir_prob: 0.5
 
 wandb:
   enable: true

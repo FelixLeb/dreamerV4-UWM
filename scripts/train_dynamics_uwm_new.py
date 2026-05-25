@@ -16,6 +16,7 @@ from dreamerv4uwm.datasets import create_distributed_dataloader
 from dreamerv4uwm.loss_new import (
     ActionPretrainingForwardProcess,
     ImageForwardProcess,
+    RMSLossScaler,
     UnifiedForwardProcess,
     VideoPretrainingForwardProcess,
     compute_action_pretraining_loss,
@@ -131,6 +132,9 @@ def build_models(cfg, device, local_rank):
         profile_diffusion_forcing_prob=float(
             unified_cfg.get("profile_diffusion_forcing_prob", 0.0)
         ),
+        profile_reverse_step_prob=float(
+            unified_cfg.get("profile_reverse_step_prob", 0.0)
+        ),
         r_beta_alpha=float(unified_cfg.get("r_beta_alpha", 1.0)),
         r_beta_beta=float(unified_cfg.get("r_beta_beta", 1.0)),
         diffusion_forcing_bidir_prob=float(
@@ -236,6 +240,7 @@ def train_epoch(
     global_update,
     log_dir,
     wandb_run_id,
+    loss_scaler,
 ):
     denoiser.train()
     train_sampler.set_epoch(epoch)
@@ -435,18 +440,21 @@ def train_epoch(
                 losses = compute_image_loss(
                     diffused_info, denoiser, device=device,
                     rewards=rewards if train_reward else None,
+                    scaler=loss_scaler,
                 )
             elif accum_mode == "video_pretraining":
                 diffused_info = video_pretraining_diffuser(z_clean, actions)
                 losses = compute_video_pretraining_loss(
                     diffused_info, denoiser, device=device,
                     rewards=rewards if train_reward else None,
+                    scaler=loss_scaler,
                 )
             elif accum_mode == "action_pretraining":
                 diffused_info = action_pretraining_diffuser(z_clean, actions)
                 losses = compute_action_pretraining_loss(
                     diffused_info, denoiser, device=device,
                     rewards=rewards if train_reward else None,
+                    scaler=loss_scaler,
                 )
             else:  # accum_mode == "unified"
                 diffused_info = diffuser(z_clean, actions)
@@ -455,6 +463,7 @@ def train_epoch(
                     causal_eps=causal_eps,
                     ramp_beta=ramp_beta,
                     rewards=rewards if train_reward else None,
+                    scaler=loss_scaler,
                 )
             obs_flow_loss = losses["obs_flow_loss"]
             act_flow_loss = losses["act_flow_loss"]
@@ -610,6 +619,19 @@ def main(cfg: DictConfig):
     total_steps = int(cfg.train.total_samples)
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
 
+    # --- Loss scaler (RMS-normalizes obs vs act loss magnitudes) ---
+    # Lives in main() so its EMA persists across epochs. Disabled if
+    # cfg.train.unified.rms_scale_loss=False. State isn't saved with the
+    # checkpoint — first ~100 steps post-resume run at slightly mis-scaled
+    # magnitudes while the EMA reconverges.
+    _unified_cfg = (cfg.train.get("unified", {}) or {})
+    _rms_decay = float(_unified_cfg.get("rms_scale_decay", 0.99))
+    _rms_enabled = bool(_unified_cfg.get("rms_scale_loss", True))
+    loss_scaler = RMSLossScaler(decay=_rms_decay) if _rms_enabled else None
+    if rank == 0:
+        print(f"RMS loss scaler: {'enabled' if _rms_enabled else 'disabled'}"
+              + (f" (decay={_rms_decay})" if _rms_enabled else ""))
+
     # --- Checkpoint resume ---
     wandb_run_id = cfg.wandb.run_name
     log_dir = None
@@ -671,6 +693,7 @@ def main(cfg: DictConfig):
             global_update=global_update,
             log_dir=log_dir,
             wandb_run_id=wandb_run_id,
+            loss_scaler=loss_scaler,
         )
         epoch_losses.append(avg_loss)
         epoch_times.append(epoch_time)

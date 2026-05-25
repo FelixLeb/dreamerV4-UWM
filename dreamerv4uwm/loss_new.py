@@ -44,6 +44,7 @@ import math
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -89,6 +90,53 @@ def compute_reward_mtp_loss(pred_rewards: torch.Tensor, rewards: torch.Tensor) -
         + high_w * logp.gather(-1, high.unsqueeze(-1)).squeeze(-1)
     )
     return (nll * valid).sum() / valid.sum().clamp_min(1.0)
+
+
+# ============================================================================
+# RMS loss scaler (running per-name RMS, used to equalize obs/act magnitudes)
+# ============================================================================
+
+class RMSLossScaler:
+    """Tracks per-name EMA of `loss²` and returns `loss / sqrt(EMA(loss²))`.
+
+    Used to rebalance the obs/act flow-matching losses when the action stream
+    isn't normalized to the same per-element variance as the latent stream —
+    the causality-aware weighting in `compute_unified_uwm_loss` assumes the
+    two terms are on comparable scale, which they aren't when raw actions
+    have arbitrary units.
+
+    The EMA divisor is no-grad and updates only *between* optimizer steps,
+    so within any single step it's a constant scalar — the causality
+    weighting's per-step relative semantics are fully preserved. Across
+    many steps, the two scaled terms equalize to unit RMS in expectation.
+
+    DDP-aware: `all_reduce` averages the per-rank `mean_sq` so the EMA is
+    consistent across ranks.
+
+    State is plain Python (not registered with the model). Resuming from
+    a checkpoint resets the EMA; the first ~100 steps post-resume run at
+    slightly mis-scaled magnitudes while it reconverges. Usually negligible.
+    """
+
+    def __init__(self, decay: float = 0.99, eps: float = 1e-8):
+        self.decay = float(decay)
+        self.eps = float(eps)
+        self.ema_sq = {}  # name -> scalar tensor
+
+    def __call__(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            mean_sq = value.detach().pow(2).mean()
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(mean_sq, op=dist.ReduceOp.AVG)
+            if name not in self.ema_sq:
+                self.ema_sq[name] = mean_sq
+            else:
+                self.ema_sq[name] = (
+                    self.decay * self.ema_sq[name]
+                    + (1.0 - self.decay) * mean_sq
+                )
+            rms = (self.ema_sq[name] + self.eps).sqrt()
+        return value / rms
 
 
 # ============================================================================
@@ -164,6 +212,7 @@ class UnifiedForwardProcess(nn.Module):
     PROFILE_PROGRESSIVE = 1
     PROFILE_CONSTANT = 2
     PROFILE_DIFFUSION_FORCING = 3
+    PROFILE_REVERSE_STEP = 4
 
     THETA_ID = 0
     THETA_POLICY = 1
@@ -184,6 +233,7 @@ class UnifiedForwardProcess(nn.Module):
         profile_progressive_prob: float = 0.3,
         profile_constant_prob: float = 0.2,
         profile_diffusion_forcing_prob: float = 0.0,
+        profile_reverse_step_prob: float = 0.0,
         # r distribution Beta(α, β) on [0, 1]; default uniform
         r_beta_alpha: float = 1.0,
         r_beta_beta: float = 1.0,
@@ -212,6 +262,7 @@ class UnifiedForwardProcess(nn.Module):
                 profile_progressive_prob,
                 profile_constant_prob,
                 profile_diffusion_forcing_prob,
+                profile_reverse_step_prob,
             ],
             dtype=torch.float32,
         )
@@ -304,6 +355,9 @@ class UnifiedForwardProcess(nn.Module):
           diffusion_forcing  → per-batch coin flip (zeros or ones) at
                                `diffusion_forcing_bidir_prob`. No ctx/hor;
                                each frame draws its own r along the ray.
+          reverse_step       → all-ones (full bidir is required so the noisy
+                               past frames can attend to the clean future
+                               frames for goal-conditioned grounding).
         """
         profile_idx = int(torch.multinomial(self.profile_probs, 1).item())
         profile_type = torch.full((B,), profile_idx, dtype=torch.long, device=self.device)
@@ -340,6 +394,18 @@ class UnifiedForwardProcess(nn.Module):
             else:
                 is_horizon = torch.zeros(T, dtype=torch.long, device=self.device)
 
+        elif profile_idx == self.PROFILE_REVERSE_STEP:
+            # Time-reverse of step: noisy past + clean future. Forces full
+            # bidirectional attention (is_horizon = ones(T)) so noisy past
+            # frames can attend to the clean future frames they're being
+            # conditioned on. Trains goal-conditioned / hindsight reasoning:
+            # "what past trajectory is consistent with this future?"
+            future_start = int(torch.randint(1, T - 1, (1,)).item()) if T > 2 else 0
+            r_past = self._sample_r(B)
+            r = torch.zeros(B, T, device=self.device)
+            r[:, :future_start] = r_past.unsqueeze(-1)
+            is_horizon = torch.ones(T, dtype=torch.long, device=self.device)
+
         else:
             raise ValueError(f"unknown profile_idx {profile_idx}")
 
@@ -354,10 +420,18 @@ class UnifiedForwardProcess(nn.Module):
         tau_q = tau_idx.float() / self.max_diff_steps
         return tau_q, tau_idx
 
-    def sample_step_noise(self, batch_size: int, seq_len: int):
+    def sample_step_noise(
+        self,
+        batch_size: int,
+        seq_len: int,
+        force_theta: Optional[float] = None,
+    ):
         B, T = int(batch_size), int(seq_len)
 
-        theta = self._sample_theta(B)                                              # (B,)
+        if force_theta is not None:
+            theta = torch.full((B,), float(force_theta), device=self.device)
+        else:
+            theta = self._sample_theta(B)                                          # (B,)
         x_max, y_max = self._theta_to_boundary(theta)                              # each (B,)
         profile_type, r, is_horizon = self._sample_r_profile(B, T)                 # (B,), (B, T), (T,)
 
@@ -379,9 +453,12 @@ class UnifiedForwardProcess(nn.Module):
         self,
         z_clean: torch.Tensor,  # (B, T, N_lat, D_lat)
         a_clean: torch.Tensor,  # (B, T, 1, n_actions)
+        force_theta: Optional[float] = None,
     ):
         B, T, N_lat, D_lat = z_clean.shape
-        obs_diff, act_diff, theta, r, profile_type, is_horizon = self.sample_step_noise(B, T)
+        obs_diff, act_diff, theta, r, profile_type, is_horizon = self.sample_step_noise(
+            B, T, force_theta=force_theta,
+        )
 
         z0 = torch.randn_like(z_clean)
         obs_tau_b = obs_diff["tau"].unsqueeze(-1).unsqueeze(-1)                    # (B,T,1,1)
@@ -420,6 +497,7 @@ def compute_unified_uwm_loss(
     causal_eps: float = 1e-3,
     ramp_beta: float = 1.0,
     rewards: Optional[torch.Tensor] = None,
+    scaler: Optional[RMSLossScaler] = None,
 ):
     """Flow-matching loss with causality-aware per-modality weighting.
 
@@ -464,6 +542,13 @@ def compute_unified_uwm_loss(
     )
     obs_flow_loss = (obs_flow_sq * w_obs).mean()
     act_flow_loss = (act_flow_sq * w_act).mean()
+
+    # Rebalance obs vs act magnitudes if a scaler is supplied. Each term
+    # divides by its own running RMS — equalizes long-run scale while
+    # preserving the causality weighting's per-step relative dynamics.
+    if scaler is not None:
+        obs_flow_loss = scaler("obs", obs_flow_loss)
+        act_flow_loss = scaler("act", act_flow_loss)
 
     reward_loss = None
     if pred_rewards is not None:
@@ -569,6 +654,7 @@ def compute_image_loss(
     denoiser: DreamerV4Denoiser,
     device='cpu',
     rewards: Optional[torch.Tensor] = None,
+    scaler: Optional[RMSLossScaler] = None,
 ):
     """Marginal state-flow loss for the image (single-frame) pathway.
 
@@ -607,6 +693,11 @@ def compute_image_loss(
     # contribution but preserves the backward edge (mirrors the legacy
     # `*.mean()*0.` pattern in compute_uwm_loss for non-action modes).
     act_flow_loss = (a_hat - a).pow(2).mean() * 0.0
+
+    # Scale only the meaningful (obs) term so the shared "obs" EMA isn't
+    # polluted by the zeroed-out act term.
+    if scaler is not None:
+        obs_flow_loss = scaler("obs", obs_flow_loss)
 
     reward_loss = None
     if pred_rewards is not None:
@@ -792,6 +883,7 @@ def compute_video_pretraining_loss(
     denoiser: DreamerV4Denoiser,
     device='cpu',
     rewards: Optional[torch.Tensor] = None,
+    scaler: Optional[RMSLossScaler] = None,
 ):
     """Multi-frame video-pretraining loss: state-only x-prediction.
 
@@ -822,6 +914,11 @@ def compute_video_pretraining_loss(
     obs_flow_loss = (z_hat - x).pow(2).mean()
     act_flow_loss = (a_hat - a).pow(2).mean() * 0.0
 
+    # Scale only the meaningful (obs) term — same shared "obs" key as the
+    # unified loss so the EMA pools obs-loss magnitudes across modes.
+    if scaler is not None:
+        obs_flow_loss = scaler("obs", obs_flow_loss)
+
     reward_loss = None
     if pred_rewards is not None:
         if rewards is None:
@@ -843,6 +940,7 @@ def compute_action_pretraining_loss(
     denoiser: DreamerV4Denoiser,
     device='cpu',
     rewards: Optional[torch.Tensor] = None,
+    scaler: Optional[RMSLossScaler] = None,
 ):
     """Multi-frame action-pretraining loss: action-only x-prediction.
 
@@ -871,6 +969,11 @@ def compute_action_pretraining_loss(
 
     act_flow_loss = (a_hat - a).pow(2).mean()
     obs_flow_loss = (z_hat - x).pow(2).mean() * 0.0
+
+    # Scale only the meaningful (act) term — same shared "act" key as the
+    # unified loss so the EMA pools act-loss magnitudes across modes.
+    if scaler is not None:
+        act_flow_loss = scaler("act", act_flow_loss)
 
     reward_loss = None
     if pred_rewards is not None:

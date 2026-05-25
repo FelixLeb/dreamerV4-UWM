@@ -124,10 +124,14 @@ train:
     # diffusion_forcing  → per-frame i.i.d. r along the ray, no ctx/hor split;
     #                      is_horizon is a per-batch coin flip (see
     #                      `diffusion_forcing_bidir_prob` below).
+    # reverse_step       → time-reverse of step: noisy past + clean future,
+    #                      full bidir attention. Trains goal-conditioned /
+    #                      hindsight reasoning (past attends to clean future).
     profile_step_prob: 0.3
     profile_progressive_prob: 0.15
     profile_constant_prob: 0.15
     profile_diffusion_forcing_prob: 0.4
+    profile_reverse_step_prob: 0.15
 
     # r ∼ Beta(α, β) on [0, 1] within the chosen r-profile.
     # (1, 1) = Uniform. α < β biases toward small r (near-clean horizon);
@@ -162,6 +166,13 @@ train:
 
     # Same coin-flip mechanism for the diffusion_forcing r-profile.
     diffusion_forcing_bidir_prob: 0.5
+
+    # RMS loss-scaling: each meaningful loss term is divided by its own
+    # running RMS (EMA of loss², shared across modes via "obs" / "act"
+    # keys). Equalizes obs/act loss magnitudes when actions aren't
+    # normalized at the dataset level. Set false to disable.
+    rms_scale_loss: true
+    rms_scale_decay: 0.99
 
 wandb:
   enable: true
