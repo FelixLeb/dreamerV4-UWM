@@ -516,6 +516,93 @@ class DreamerV4Denoiser(nn.Module):
         for layer in self.layers:
             layer.init_cache(batch_size, device, context_length, dtype)
 
+    def forward_chunk_step(
+        self,
+        noisy_act: torch.Tensor,           # (B, m, n_actions)
+        noisy_obs: torch.Tensor,           # (B, m, N_latent, D_latent)
+        obs_sigma_idx: torch.Tensor,       # (B, m) long
+        obs_step_idx: torch.Tensor,        # (B, m) long
+        act_sigma_idx: torch.Tensor,       # (B, m) long
+        act_step_idx: torch.Tensor,        # (B, m) long
+        start_step_idx: int,
+        commit_first_k: int = 0,
+        is_horizon: Optional[torch.Tensor] = None,
+    ):
+        """KV-cached **chunk** counterpart to `forward_step()` for hybrid
+        sampling. Token layout, projections, and outputs mirror `forward()`
+        and `forward_step()` exactly; the difference is in the temporal
+        attention path:
+
+          - Reads cached past K/V (causal context).
+          - Computes K/V for the m new chunk frames; runs attention with
+            `attn_mask=None, is_causal=False` (causality enforced *by
+            construction* since the cache only contains past keys, and we
+            *want* full bidirectional attention within the chunk).
+          - If `commit_first_k > 0`, appends the first `commit_first_k`
+            new K/V to the cache **after** attention. The rest is discarded.
+
+        `is_horizon` is summed into IC/AC for distributional consistency
+        with the training step profile; the actual horizon-aware mask is
+        implicit in the cache+concat structure, not in an `is_horizon`-derived
+        SDPA mask. For hybrid inference pass `is_horizon = ones(m)` to
+        align with the model's "horizon" embedding row at training time
+        when `cfg.horizon_aware = True`.
+        """
+        B, m, N_lat, D_latent = noisy_obs.shape
+
+        obs_diff_step_token = self.obs_diffusion_embedder(obs_sigma_idx).unsqueeze(-2)
+        obs_shortcut_token  = self.obs_shortcut_embedder(obs_step_idx).unsqueeze(-2)
+        act_diff_step_token = self.act_diffusion_embedder(act_sigma_idx).unsqueeze(-2)
+        act_shortcut_token  = self.act_shortcut_embedder(act_step_idx).unsqueeze(-2)
+
+        obs_diff_control_token = torch.cat([obs_shortcut_token, obs_diff_step_token], dim=-1)
+        obs_diff_control_token = self.obs_diff_control_proj(obs_diff_control_token)
+        act_diff_control_token = torch.cat([act_shortcut_token, act_diff_step_token], dim=-1)
+        act_diff_control_token = self.act_diff_control_proj(act_diff_control_token)
+
+        if self.frame_id_embedder is not None and is_horizon is not None:
+            frame_id_emb = self.frame_id_embedder(is_horizon)        # (m, D)
+            frame_id_token = frame_id_emb.view(1, m, 1, self.cfg.model_dim)
+            obs_diff_control_token = obs_diff_control_token + frame_id_token
+            act_diff_control_token = act_diff_control_token + frame_id_token
+
+        reg_tokens = self.register_tokens.expand(B, m, -1, -1)
+        obs_tokens = self.latent_projector(noisy_obs)
+        act_tokens = self.action_input_proj(noisy_act).unsqueeze(-2)
+
+        x = torch.cat(
+            [obs_tokens, reg_tokens, obs_diff_control_token, act_diff_control_token, act_tokens],
+            dim=-2,
+        )
+
+        if self.cfg.train_reward_model:
+            agent_part = self.agent_token.expand(B, m, -1, -1)
+            x = torch.cat([x, agent_part], dim=-2)
+            spatial_mask = self.agent_spatial_mask.to(dtype=x.dtype)
+        else:
+            spatial_mask = None
+
+        for layer in self.layers:
+            x = layer.forward_chunk_step(
+                x,
+                start_step_idx=start_step_idx,
+                spatial_mask=spatial_mask,
+                commit_first_k=commit_first_k,
+            )
+
+        if self.cfg.train_reward_model:
+            world_x = x[:, :, :-1, :]
+            agent_x = x[:, :, -1, :]
+            obs_output = self.obs_projector(world_x[:, :, :self.cfg.num_latent_tokens, :])
+            act_output = self.action_projector(world_x[:, :, -self.cfg.num_action_tokens:, :])
+            pred_rewards = self.reward_head(agent_x)
+            return obs_output, act_output, pred_rewards
+        else:
+            obs_output = self.obs_projector(x[:, :, :self.cfg.num_latent_tokens, :])
+            act_output = self.action_projector(x[:, :, -self.cfg.num_action_tokens:, :])
+            return obs_output, act_output, None
+
+
 class DenoiserWrapper(nn.Module):
     def __init__(self, cfg: DictConfig, max_num_forward_steps=None):
         super().__init__()
@@ -564,6 +651,30 @@ class DenoiserWrapper(nn.Module):
             act_step_idx=act_step_idx,
             start_step_idx=start_step_idx,
             update_cache=update_cache,
+            is_horizon=is_horizon,
+        )
+
+    def forward_chunk_step(
+        self,
+        noisy_act: torch.Tensor,
+        noisy_obs: torch.Tensor,
+        obs_sigma_idx: torch.Tensor,
+        obs_step_idx: torch.Tensor,
+        act_sigma_idx: torch.Tensor,
+        act_step_idx: torch.Tensor,
+        start_step_idx: int,
+        commit_first_k: int = 0,
+        is_horizon: Optional[torch.Tensor] = None,
+    ):
+        return self.model.forward_chunk_step(
+            noisy_act=noisy_act,
+            noisy_obs=noisy_obs,
+            obs_sigma_idx=obs_sigma_idx,
+            obs_step_idx=obs_step_idx,
+            act_sigma_idx=act_sigma_idx,
+            act_step_idx=act_step_idx,
+            start_step_idx=start_step_idx,
+            commit_first_k=commit_first_k,
             is_horizon=is_horizon,
         )
 

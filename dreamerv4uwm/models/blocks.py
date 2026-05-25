@@ -205,6 +205,38 @@ class KVCache:
         """
         return self.k_cache[:, :, :self.curr_len, :], self.v_cache[:, :, :self.curr_len, :]
 
+    def append_partial(self,
+                       k_new: torch.Tensor,
+                       v_new: torch.Tensor,
+                       n: int) -> None:
+        """Append only the first `n` time-steps of `k_new` / `v_new` to the
+        cache (rolling if it would overflow). The remaining `S_new - n`
+        rows are discarded — used by the hybrid chunk sampler to commit the
+        leading subset of a denoised chunk while throwing away its
+        "speculative" tail.
+
+        k_new, v_new: [B, H, S_new, D]
+        n: number of leading time-steps to commit. n == 0 is a no-op; n
+           must satisfy 0 <= n <= S_new.
+        """
+        if n <= 0:
+            return
+        assert n <= k_new.shape[2], (
+            f"append_partial: requested n={n} > available S_new={k_new.shape[2]}"
+        )
+        k_part = k_new[:, :, :n, :]
+        v_part = v_new[:, :, :n, :]
+
+        if self.curr_len + n > self.context_length:
+            shift = (self.curr_len + n) - self.context_length
+            self.k_cache = torch.roll(self.k_cache, shifts=-shift, dims=2)
+            self.v_cache = torch.roll(self.v_cache, shifts=-shift, dims=2)
+            self.curr_len -= shift
+
+        self.k_cache[:, :, self.curr_len:self.curr_len + n, :] = k_part
+        self.v_cache[:, :, self.curr_len:self.curr_len + n, :] = v_part
+        self.curr_len += n
+
 class Attention(nn.Module):
     """
     Multi-head (self/cross) attention block with optional QK-Norm and RoPE and GQA.
@@ -365,6 +397,84 @@ class Attention(nn.Module):
         Y = self.W_o(Y)
         return Y
 
+    def forward_chunk_step(self,
+                           q: torch.Tensor,
+                           k: torch.Tensor,
+                           v: torch.Tensor,
+                           kv_cache: KVCache,
+                           commit_first_k: int = 0,
+                           kv_position_ids: Optional[torch.Tensor] = None,
+                           q_position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Hybrid cached chunk-attention for m > 1 new frames.
+
+        The m new queries attend (a) **causally** to all keys already in
+        the cache (causality is enforced *by construction* — the cache only
+        contains past keys) and (b) **bidirectionally** within the chunk
+        (the m new keys). Implementation: build K_full = cat(cache_K,
+        new_K) and run SDPA with `attn_mask=None, is_causal=False` — the
+        same workaround used for single-step KV-cached decode, generalized
+        to T_q = m. This avoids passing a custom mask, which keeps the
+        flash-attention backend honored without silent fallback.
+
+        If `commit_first_k > 0`, the first `commit_first_k` of the new K/V
+        are appended to the cache **after** attention is computed. The
+        remaining `m - commit_first_k` are discarded.
+
+        Assumes self-attention with q = k = v.
+        """
+        B, T_q, _ = q.shape
+        B, T_k, _ = k.shape
+        assert kv_cache is not None, "forward_chunk_step requires a KVCache."
+
+        Q = self.W_q(q).view(B, T_q, self.n_heads, self.dk).transpose(1, 2).contiguous()
+        K = self.W_k(k).view(B, T_k, self.n_kv_heads, self.dk).transpose(1, 2).contiguous()
+        V = self.W_v(v).view(B, T_k, self.n_kv_heads, self.dk).transpose(1, 2).contiguous()
+        if self.qk_norm:
+            Q = F.normalize(Q, dim=-1)
+            K = F.normalize(K, dim=-1)
+            Q = self.g * Q
+
+        # RoPE applied to the *new* K and Q at their chunk-absolute positions.
+        # Cached K/V were already RoPE'd at commit time.
+        if self.rope_embedder is not None:
+            K = self.rope_embedder(K, position_ids=kv_position_ids)
+            Q = self.rope_embedder(Q, position_ids=q_position_ids)
+
+        # Pull cached past K/V (no modification) and concatenate.
+        cache_k, cache_v = kv_cache.no_update()
+        K_full = torch.cat([cache_k, K], dim=2)
+        V_full = torch.cat([cache_v, V], dim=2)
+
+        # mask=None, is_causal=False — see method docstring.
+        if self.flash_attention and Q.dtype in (torch.float16, torch.bfloat16) and Q.is_cuda:
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                Y = F.scaled_dot_product_attention(
+                    Q, K_full, V_full,
+                    attn_mask=None,
+                    dropout_p=self.dropout_prob if self.training else 0.0,
+                    is_causal=False,
+                    scale=None,
+                    enable_gqa=False if self.n_kv_heads == self.n_heads else True,
+                )
+        else:
+            Y = F.scaled_dot_product_attention(
+                Q, K_full, V_full,
+                attn_mask=None,
+                dropout_p=self.dropout_prob if self.training else 0.0,
+                is_causal=False,
+                scale=None,
+                enable_gqa=False if self.n_kv_heads == self.n_heads else True,
+            )
+        Y = Y.transpose(1, 2).contiguous().view(B, T_q, self.d)
+        Y = self.W_o(Y)
+
+        # Partial commit (post-attention).
+        if commit_first_k > 0:
+            kv_cache.append_partial(K, V, commit_first_k)
+
+        return Y
+
+
 class AxialAttention(nn.Module):
     """
     Axial wrapper around the Attention block.
@@ -458,6 +568,52 @@ class AxialAttention(nn.Module):
         Y_t = Y_flat.view(*q_t.shape)  # (B, d1, ..., d_{dim-1}, d_{dim+1}, ..., dN, Tq, D)
         Y = Y_t.transpose(dim, -2).contiguous()  # (B, d1, ..., dN, D)
         return Y
+
+    def forward_chunk_step(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dim: int,
+        kv_cache: KVCache,
+        commit_first_k: int = 0,
+        kv_position_ids: Optional[torch.Tensor] = None,
+        q_position_ids: Optional[torch.Tensor] = None,
+    ):
+        """Axial wrapper around `Attention.forward_chunk_step`.
+
+        Same reshape pattern as `forward`: moves the axial dim to -2 and
+        flattens the remaining non-(T, D) dims into a single batch dim,
+        which aligns with how the per-layer KVCache was sized
+        (`batch_size = B * modality_dim_max_seq_len`).
+        """
+        dims_q = list(q.shape)
+        assert dim > 0 and dim < q.dim() - 1, "dim must be between 1 and q.dim()-2"
+        D = dims_q[-1]
+        Tq = dims_q[dim]
+        Tk = list(k.shape)[dim]
+
+        q_t = q.transpose(dim, -2).contiguous()
+        k_t = k.transpose(dim, -2).contiguous()
+        v_t = v.transpose(dim, -2).contiguous()
+
+        B_star = int(q_t.numel() // (Tq * D))
+        q_flat = q_t.view(B_star, Tq, D)
+        k_flat = k_t.view(B_star, Tk, D)
+        v_flat = v_t.view(B_star, Tk, D)
+
+        Y_flat = self.attn.forward_chunk_step(
+            q_flat, k_flat, v_flat,
+            kv_cache=kv_cache,
+            commit_first_k=commit_first_k,
+            kv_position_ids=kv_position_ids,
+            q_position_ids=q_position_ids,
+        )
+
+        Y_t = Y_flat.view(*q_t.shape)
+        Y = Y_t.transpose(dim, -2).contiguous()
+        return Y
+
 
 class EfficientTransformerLayer(nn.Module):
     """
@@ -586,6 +742,43 @@ class EfficientTransformerLayer(nn.Module):
 
         return x
 
+    def forward_chunk_step(self,
+                           x: torch.Tensor,
+                           spatial_mask: Optional[torch.Tensor],
+                           kv_cache: Optional[KVCache],
+                           commit_first_k: int,
+                           position_ids: torch.Tensor) -> torch.Tensor:
+        """Hybrid cached chunk forward over a single layer.
+
+        Temporal layer  → routes through `AxialAttention.forward_chunk_step`
+                          (uses the cache; performs partial commit).
+        Spatial  layer  → runs the regular uncached spatial attention on
+                          the (B, m, S, D) chunk; no cache involvement.
+        """
+        h = self.norm1(x)
+        if self.layer_type == LayerType.TEMPORAL:
+            assert kv_cache is not None, (
+                "forward_chunk_step on a temporal layer requires a KVCache."
+            )
+            h = self.attn.forward_chunk_step(
+                h, h, h, dim=1,
+                kv_cache=kv_cache,
+                commit_first_k=commit_first_k,
+                kv_position_ids=position_ids,
+                q_position_ids=position_ids,
+            )
+        else:
+            # Spatial layer is over modality tokens (dim=2); the chunk is
+            # just a longer batch of (B, m, S, D) tensors. No cache use.
+            h = self.attn(h, h, h, dim=2, mask=spatial_mask)
+        x = x + self.dropout(h)
+
+        h = self.norm2(x)
+        h = self.ffn(h)
+        x = x + self.dropout(h)
+        return x
+
+
 class EfficientTransformerBlock(nn.Module):
     """
     One stack of 3 spatial + 1 temporal EfficientTransformerLayer as shown in Fig.x of the paper.
@@ -661,7 +854,7 @@ class EfficientTransformerBlock(nn.Module):
             x = layer(x, spatial_mask=spatial_mask, is_horizon=is_horizon)
         return x
     
-    def forward_step(self, 
+    def forward_step(self,
                      x: torch.Tensor,
                      spatial_mask: Optional[torch.Tensor],
                      start_step_idx: int,
@@ -669,23 +862,67 @@ class EfficientTransformerBlock(nn.Module):
         assert self.is_causal, "KV caching only valid for causal models."
         assert self.caches is not None, "Caches not initialized. Call init_cache() before forward_step."
         B, T, _, _ = x.shape
-        
+
         pos_ids = torch.arange(start_step_idx, start_step_idx + T, device=x.device, dtype=torch.long)
         # pos_ids = pos_ids.unsqueeze(0)
         # 3. Apply Layers
 
         for i, layer in enumerate(self.layers):
             if layer.layer_type == LayerType.TEMPORAL:
-                x = layer(x, 
+                x = layer(x,
                           spatial_mask=spatial_mask,
-                          kv_cache=self.caches[i], 
-                          position_ids=pos_ids, 
+                          kv_cache=self.caches[i],
+                          position_ids=pos_ids,
                           update_cache=update_cache)
             else:
                 x = layer(x, spatial_mask=spatial_mask)
 
         return x
-    
+
+    def forward_chunk_step(self,
+                           x: torch.Tensor,
+                           spatial_mask: Optional[torch.Tensor],
+                           start_step_idx: int,
+                           commit_first_k: int = 0):
+        """Block-level hybrid chunk forward.
+
+        Runs the m-frame chunk through every layer. Temporal layers use
+        their cache (partial-commit only if `commit_first_k > 0`); spatial
+        layers run cache-free over (B, m, S, D).
+
+        `start_step_idx` is the absolute temporal position of frame 0 of
+        the chunk (i.e., equal to the current `caches[i].curr_len` from
+        the caller's perspective).
+        """
+        assert self.is_causal, "KV caching only valid for causal models."
+        assert self.caches is not None, (
+            "Caches not initialized. Call init_cache() before forward_chunk_step."
+        )
+        B, m, _, _ = x.shape
+        pos_ids = torch.arange(
+            start_step_idx, start_step_idx + m,
+            device=x.device, dtype=torch.long,
+        )
+
+        for i, layer in enumerate(self.layers):
+            if layer.layer_type == LayerType.TEMPORAL:
+                x = layer.forward_chunk_step(
+                    x,
+                    spatial_mask=spatial_mask,
+                    kv_cache=self.caches[i],
+                    commit_first_k=commit_first_k,
+                    position_ids=pos_ids,
+                )
+            else:
+                x = layer.forward_chunk_step(
+                    x,
+                    spatial_mask=spatial_mask,
+                    kv_cache=None,
+                    commit_first_k=0,
+                    position_ids=pos_ids,
+                )
+        return x
+
     def init_cache(self, batch_size: int, device: torch.device, context_length: int, dtype: torch.dtype):
         assert self.is_causal, "KV caching only valid for causal models."
         """Initializes KV caches for all temporal layers."""
