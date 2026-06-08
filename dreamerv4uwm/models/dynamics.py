@@ -238,6 +238,14 @@ class DreamerV4DenoiserCfg:
     # pre-flag main: no embedder is registered (no ckpt-shape change) and the
     # temporal mask falls back to the old causal-window path.
     horizon_aware: bool = False
+    # AdaLN-Zero discrete-class conditioning. When True, registers a
+    # `class_embedder` (num_cond_classes rows) and per-layer zero-init AdaLN
+    # projections that modulate every transformer layer's two RMSNorms from the
+    # class embedding. Zero-init ⇒ at day 0 (and whenever `cond_class` is None)
+    # the network is bit-equivalent to the pre-flag / non-conditioned model.
+    # When False (default), no extra params are registered (no ckpt-shape change).
+    cond_adaln: bool = False
+    num_cond_classes: int = 3   # e.g. null / play / demo
 
 class DreamerV4Denoiser(nn.Module):
     """
@@ -267,6 +275,17 @@ class DreamerV4Denoiser(nn.Module):
             nn.init.zeros_(self.frame_id_embedder.embeddings)
         else:
             self.frame_id_embedder = None
+
+        # --- AdaLN-Zero class-conditioning embedding ---
+        # The embedding itself uses the standard DiscreteEmbedder init (std=0.02);
+        # day-0 bit-equivalence comes from the per-layer AdaLN projections being
+        # zero-init (see EfficientTransformerLayer), so the embedding value is
+        # irrelevant at init. Registered only when `cond_adaln` is True.
+        self.cond_adaln = bool(cfg.cond_adaln)
+        if self.cond_adaln:
+            self.class_embedder = DiscreteEmbedder(cfg.num_cond_classes, cfg.model_dim)
+        else:
+            self.class_embedder = None
 
         # --- Register tokens: (1, 1, S_r, D) ---
         self.register_tokens = nn.Parameter(
@@ -300,9 +319,10 @@ class DreamerV4Denoiser(nn.Module):
                 qk_norm=cfg.qk_norm,
                 modality_dim_max_seq_len=self.num_modality_tokens,
                 temporal_dim_max_seq_len= (max_num_forward_steps if max_num_forward_steps is not None else cfg.max_sequence_length),   
-                context_length=cfg.context_length,    
-                is_causal=cfg.is_causal,   
-                layer_types=self.layer_types     
+                context_length=cfg.context_length,
+                is_causal=cfg.is_causal,
+                layer_types=self.layer_types,
+                cond_adaln=self.cond_adaln,
             )
             for _ in range(cfg.n_layers)
         ])
@@ -339,6 +359,30 @@ class DreamerV4Denoiser(nn.Module):
             self.reward_head = None
             self.agent_spatial_mask = None
 
+    def _cond_emb(self, cond_class: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Map a discrete class index tensor (B,) → AdaLN conditioning embedding
+        (B, D), or None when conditioning is inactive.
+
+        Guardrail: cond_class given but conditioning not registered → error (a
+        silent no-op would otherwise hide a misconfiguration). This check is
+        static (a module attribute, not tensor data) so it is torch.compile-safe.
+
+        We deliberately do NOT range-check the index values here: that would need
+        a `.max()/.min()` device→host sync every step and is data-dependent, which
+        breaks `torch.compile(fullgraph=True)`. Out-of-range indices still fail
+        loudly via the embedding gather (IndexError on CPU / CUDA device assert),
+        and callers construct cond_class in [0, num_cond_classes) by construction.
+        """
+        if cond_class is None:
+            return None
+        if self.class_embedder is None:
+            raise RuntimeError(
+                "cond_class was provided but the model was built without "
+                "cond_adaln=True (no class_embedder registered). Enable "
+                "denoiser.cond_adaln to use class conditioning."
+            )
+        return self.class_embedder(cond_class)  # (B, D)
+
     def forward(
         self,
         noisy_act: torch.Tensor,  # (B, T, n_c)
@@ -348,10 +392,13 @@ class DreamerV4Denoiser(nn.Module):
         act_sigma_idx: torch.Tensor,  # (B, T) long, τ index for actions (if separate from obs)
         act_step_idx: torch.Tensor,   # (B, T) long, step index for actions (if separate from obs
         is_horizon: Optional[torch.Tensor] = None,  # (T,) long {0,1}; None ↔ all context (purely causal)
+        temporal_attn_mask: Optional[torch.Tensor] = None,  # (T,T) or (B,..,T,T) bool, True=allowed; block-causal protocol
+        cond_class: Optional[torch.Tensor] = None,  # (B,) long discrete class for AdaLN conditioning
 
 
     ) -> torch.Tensor:
         B, T, N_lat, D_latent = noisy_obs.shape
+        cond_emb = self._cond_emb(cond_class)
 
         # --- Encode diffusion τ and shortcut d into single control token ---
         # diff_step_token: (B, T, 1, D_model)
@@ -418,7 +465,8 @@ class DreamerV4Denoiser(nn.Module):
         # active; otherwise None keeps the temporal mask on the legacy path.
         layer_is_horizon = is_horizon if self.cfg.horizon_aware else None
         for layer in self.layers:
-            x = layer(x, spatial_mask=spatial_mask, is_horizon=layer_is_horizon)
+            x = layer(x, spatial_mask=spatial_mask, is_horizon=layer_is_horizon,
+                      temporal_attn_mask=temporal_attn_mask, cond_emb=cond_emb)
 
         # --- Project back to latent dim, return only latent slice ---
         if self.cfg.train_reward_model:
@@ -444,6 +492,7 @@ class DreamerV4Denoiser(nn.Module):
         start_step_idx: int,
         update_cache: bool = True,
         is_horizon: Optional[torch.Tensor] = None,
+        cond_class: Optional[torch.Tensor] = None,
     ):
         """KV-cached counterpart to `forward()` for autoregressive sampling.
 
@@ -458,6 +507,7 @@ class DreamerV4Denoiser(nn.Module):
         Ignored when `cfg.horizon_aware` is False.
         """
         B, T, N_lat, D_latent = noisy_obs.shape
+        cond_emb = self._cond_emb(cond_class)
 
         obs_diff_step_token = self.obs_diffusion_embedder(obs_sigma_idx).unsqueeze(-2)
         obs_shortcut_token  = self.obs_shortcut_embedder(obs_step_idx).unsqueeze(-2)
@@ -497,6 +547,7 @@ class DreamerV4Denoiser(nn.Module):
                 start_step_idx=start_step_idx,
                 spatial_mask=spatial_mask,
                 update_cache=update_cache,
+                cond_emb=cond_emb,
             )
 
         if self.cfg.train_reward_model:
@@ -527,6 +578,7 @@ class DreamerV4Denoiser(nn.Module):
         start_step_idx: int,
         commit_first_k: int = 0,
         is_horizon: Optional[torch.Tensor] = None,
+        cond_class: Optional[torch.Tensor] = None,
     ):
         """KV-cached **chunk** counterpart to `forward_step()` for hybrid
         sampling. Token layout, projections, and outputs mirror `forward()`
@@ -549,6 +601,7 @@ class DreamerV4Denoiser(nn.Module):
         when `cfg.horizon_aware = True`.
         """
         B, m, N_lat, D_latent = noisy_obs.shape
+        cond_emb = self._cond_emb(cond_class)
 
         obs_diff_step_token = self.obs_diffusion_embedder(obs_sigma_idx).unsqueeze(-2)
         obs_shortcut_token  = self.obs_shortcut_embedder(obs_step_idx).unsqueeze(-2)
@@ -588,6 +641,7 @@ class DreamerV4Denoiser(nn.Module):
                 start_step_idx=start_step_idx,
                 spatial_mask=spatial_mask,
                 commit_first_k=commit_first_k,
+                cond_emb=cond_emb,
             )
 
         if self.cfg.train_reward_model:
@@ -619,6 +673,8 @@ class DenoiserWrapper(nn.Module):
         act_sigma_idx: torch.Tensor,      # (B, T) long
         act_step_idx: torch.Tensor,       # (B, T) long
         is_horizon: Optional[torch.Tensor] = None,
+        temporal_attn_mask: Optional[torch.Tensor] = None,
+        cond_class: Optional[torch.Tensor] = None,
     ):
         return self.model(
             noisy_act=noisy_act,
@@ -628,6 +684,8 @@ class DenoiserWrapper(nn.Module):
             act_sigma_idx=act_sigma_idx,
             act_step_idx=act_step_idx,
             is_horizon=is_horizon,
+            temporal_attn_mask=temporal_attn_mask,
+            cond_class=cond_class,
         )
 
     def forward_step(
@@ -641,6 +699,7 @@ class DenoiserWrapper(nn.Module):
         start_step_idx: int,
         update_cache: bool = True,
         is_horizon: Optional[torch.Tensor] = None,
+        cond_class: Optional[torch.Tensor] = None,
     ):
         return self.model.forward_step(
             noisy_act=noisy_act,
@@ -652,6 +711,7 @@ class DenoiserWrapper(nn.Module):
             start_step_idx=start_step_idx,
             update_cache=update_cache,
             is_horizon=is_horizon,
+            cond_class=cond_class,
         )
 
     def forward_chunk_step(
@@ -665,6 +725,7 @@ class DenoiserWrapper(nn.Module):
         start_step_idx: int,
         commit_first_k: int = 0,
         is_horizon: Optional[torch.Tensor] = None,
+        cond_class: Optional[torch.Tensor] = None,
     ):
         return self.model.forward_chunk_step(
             noisy_act=noisy_act,
@@ -676,6 +737,7 @@ class DenoiserWrapper(nn.Module):
             start_step_idx=start_step_idx,
             commit_first_k=commit_first_k,
             is_horizon=is_horizon,
+            cond_class=cond_class,
         )
 
     def init_cache(

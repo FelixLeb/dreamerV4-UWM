@@ -394,6 +394,7 @@ def compute_uwm_loss(
     device='cpu',
     loss_weighting: str = 'ramp',
     rewards: Optional[torch.Tensor] = None,
+    cond_class: Optional[torch.Tensor] = None,
 ):
     """Returns a dict with keys:
         - obs_flow_loss : scalar
@@ -405,6 +406,10 @@ def compute_uwm_loss(
     matches the time axis of `info['x']` — caller's responsibility to slice
     rewards to the same window as the latents/actions when running on the
     image branch (T=1) or when cropping.
+
+    `cond_class` is an optional (B,) long tensor of discrete class indices for
+    AdaLN class conditioning. Forwarded verbatim to the denoiser; default None
+    means no conditioning (bit-equivalent to the non-conditioned path).
     """
 
     # --- obs ---
@@ -428,6 +433,7 @@ def compute_uwm_loss(
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
         is_horizon=info.get("is_horizon"),
+        cond_class=cond_class,
     )  # a_hat: (B,T,1,A); pred_rewards: (B,T,L,K) or None
 
     # X-prediction targets: directly regress clean signal

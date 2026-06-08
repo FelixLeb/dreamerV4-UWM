@@ -1,14 +1,15 @@
 # @package _global_
 defaults:
- - /tokenizer: /g1
+ - /tokenizer: /finger
 
+dual_stream: false
 dynamics_ckpt: null
 reload_checkpoint: null
-output_dir: checkpoints/dynamics/g1/${now:%Y-%m-%d_%H-%M-%S}
+output_dir: checkpoints/dynamics/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
-print_every: 100
+print_every: 2000
 log_every: 25
-save_every: 10000
+save_every: 50000
 seed: 42
 
 # Dataset modality flags — when one side is False, the train script pins the
@@ -20,42 +21,36 @@ dataset:
 
 denoiser:
   dual_stream: false
-  num_action_tokens: 1
-  num_latent_tokens: 256       # must match tokenizer.num_latent_tokens
+  num_action_tokens: 1    # Number of tokens for the image or other modalities
+  num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
   context_length: 64           # temporal-attention window
-  max_sequence_length: 128     # long-branch T == loader window size
-  model_dim: 1536              # matches Joseph reference (wm_pico_eval_kvcache.py)
-  latent_dim: 32               # must match tokenizer.latent_dim
-  n_layers: 6
-  n_heads: 24                  # head_dim = 1536/24 = 64 
-  n_kv_heads: 24
+  max_sequence_length: 96      # long-branch T == loader window size
+  model_dim: 1024              # The dimension of the transformer latents
+  latent_dim: 32              # The dimention of the encoder output latents (z)
+  n_layers: 8           # Causal tokenizer encoder depth
+  n_heads: 16
+  n_kv_heads: 16
   dropout_prob: 0.0
   qk_norm: false
   num_noise_levels: 128
-  n_actions: 22                # G1 commands: 3 base vel + 17 upper-body + 2 triggers
+  n_actions: 3
   is_causal: true
   layer_types: [spatial, temporal, spatial, temporal]
-  # Reward / MTP head off (separate work item).
+  # Reward / MTP head. Off by default → no agent token, no extra params,
+  # bit-equivalent to runs without these fields.
   train_reward_model: false
   mtp_length: 8
   # Horizon-aware temporal attention: when true, registers a 2-row
   # `frame_id_embedder` summed into IC/AC, and the uncached temporal mask
   # becomes causal-into-ctx + bidirectional-within-horizon according to the
   # per-frame `is_horizon` flag emitted by the forward processes.
-  # OFF for the block-causal sanity: that mode supplies its own (T,T) temporal
-  # mask and passes is_horizon=None, which would leave frame_id_embedder unused
-  # and trip DDP find_unused_parameters=False.
-  horizon_aware: false
-  # NOTE: the reference recipe slurm sets `denoiser.latent_attends_action=true`
-  # but no consumer of that key exists in the codebase today (CLAUDE.md confirms
-  # `spatial_mask=None` is used regardless). Omitted here to avoid carrying a
-  # dead config field; behavior is identical.
+  horizon_aware: true
 
 train:
   device: 'cuda:0'
   use_compile: true
-  num_epochs: 110
+  num_epochs: 1100
 
   # Short/long mixed-batch training (Dreamer-V4 length-generalization trick).
   # Loader batches at long_seq_batch_per_gpu × max_sequence_length; with prob
@@ -63,12 +58,10 @@ train:
   batch_per_gpu: 8 # Batch size for short sequences.
   long_seq_batch_per_gpu: 1
   short_sequence_length: 32    # short-branch crop T (independent from denoiser.context_length)
-  # Branch mix stripped: train ONLY on the short branch. long_seq_prob=0 and
-  # image_prob=0 ⇒ every accumulation window takes the short branch.
-  long_seq_prob: 0.0
+  long_seq_prob: 0.15
   # Image branch (Dreamer-V4 "30% as images"): reshape (B, T) -> (B*T, 1) for
   # unconditional single-frame training. Cheap; bump image_batch_per_gpu later.
-  image_prob: 0.0
+  image_prob: 0.1
   image_batch_per_gpu: 64
 
   accum_grad_steps: 2
@@ -76,7 +69,7 @@ train:
   num_workers: 12
   lpips_weight: 0.2
 
-  warmup_samples: 4200 # ~1.5 hours with the current settings
+  warmup_samples: 1000 # ~1.5 hours with the current settings
   total_samples: 520000 # ~150 hours with the current settings; adjust as needed for longer/shorter training
   mixed_precision: false
   enable_fast_matmul: true
@@ -95,7 +88,7 @@ train:
     action_only: 0
   forcing_mask_actions: false  # actions co-noised with state in forcing mode
   video_pretraining: false
-  absolute_actions: false      # ignored by g1_chunked loader; kept for shape compat
+  absolute_actions: true       # finger loader honors this — selects actions_abs over actions_rel
   forcing_context_noise:
     bias: 0.0
     alpha: 0.5
@@ -132,11 +125,11 @@ train:
     # reverse_step       → time-reverse of step: noisy past + clean future,
     #                      full bidir attention. Trains goal-conditioned /
     #                      hindsight reasoning (past attends to clean future).
-    profile_step_prob: 0.3
+    profile_step_prob: 0.15
     profile_progressive_prob: 0.15
     profile_constant_prob: 0.15
     profile_diffusion_forcing_prob: 0.4
-    profile_reverse_step_prob: 0.15
+    profile_reverse_step_prob: 0.3
 
     # r ∼ Beta(α, β) on [0, 1] within the chosen r-profile.
     # (1, 1) = Uniform. α < β biases toward small r (near-clean horizon);
@@ -160,13 +153,10 @@ train:
     #   unified            → joint state-action via (θ, r) sampler
     #   video_pretraining  → state-only, per-frame Diffusion Forcing on state
     #   action_pretraining → action-only, symmetric counterpart
-    #   block_causal_sanity → PLACEHOLDER (definition pending)
-    # Mode mix stripped: train ONLY on block_causal_sanity.
     mode_probs:
-      unified: 0.0
-      video_pretraining: 0.0
-      action_pretraining: 0.0
-      block_causal_sanity: 1.0
+      unified: 0.333
+      video_pretraining: 0.333
+      action_pretraining: 0.333
 
     # P(fully bidirectional attention) in the pretraining marginals; the
     # complementary mass goes to fully causal. Per-batch coin flip.
@@ -175,36 +165,7 @@ train:
     # Same coin-flip mechanism for the diffusion_forcing r-profile.
     diffusion_forcing_bidir_prob: 0.5
 
-    # RMS loss-scaling: each meaningful loss term is divided by its own
-    # running RMS (EMA of loss², shared across modes via "obs" / "act"
-    # keys). Equalizes obs/act loss magnitudes when actions aren't
-    # normalized at the dataset level. Set false to disable.
-    # NOTE: block-causal mode hardcodes the RMS scaler OFF in the train script
-    # dispatch (obs/act stay on raw scales). This flag only affects the
-    # unified/pretraining modes, which this config does not run.
-    rms_scale_loss: false
-    rms_scale_decay: 0.99
-
-    # Block-causal sanity mode knobs (compute_block_causal_sanity_loss).
-    #   block_sizes        → candidate block sizes K (one shared per batch,
-    #                        must divide T=short_sequence_length into >=2 blocks).
-    #                        Includes 1 → per-frame Diffusion-Forcing batches
-    #                        (purely causal) that preserve single-frame prediction.
-    #   ctx_dropout_prob   → P(0 context blocks → fully unconditional generation)
-    #   ctx_tau_idx_min/max→ near-clean context τ-index band [min, max) on the
-    #                        num_noise_levels grid; null → [max-10, max-1)
-    #   couple_modality_tau→ false: state/action draw independent target τ
-    #                        (faithful to policy mode); true: shared τ
-    # Supervision is block-wise Diffusion Forcing: all non-context blocks are
-    # targets with independent per-block noise; loss covers all of them.
-    block_causal:
-      block_sizes: [1, 2, 4, 8, 16]
-      ctx_dropout_prob: 0.1
-      ctx_tau_idx_min: null
-      ctx_tau_idx_max: null
-      couple_modality_tau: false
-
 wandb:
   enable: true
-  project: "UWM-G1"
+  project: "UWM-dynamics"
   run_name: null

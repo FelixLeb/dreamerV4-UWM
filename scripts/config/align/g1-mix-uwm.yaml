@@ -6,7 +6,7 @@ dual_stream: false
 # REQUIRED: model weights are initialized from this checkpoint; optimizer
 # and scheduler start fresh (no `reload_checkpoint` resume). Override per
 # experiment from the slurm script.
-dynamics_ckpt: /scratch/rk4342/projects/dreamerV4-UWM/checkpoints/dynamics/g1-may14-fixed/98300.pt
+dynamics_ckpt: /scratch/rk4342/projects/dreamerV4-UWM/checkpoints/dynamics/g1-may19-unified-scratch-v2/122500.pt
 reload_checkpoint: null
 output_dir: checkpoints/align/mix-uwm-g1/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
@@ -73,8 +73,9 @@ train:
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
-  # Warmup length in grad steps. When null, falls back to 5% of num_training_steps.
-  warmup_steps: 500
+  # Warmup is short since we start from a pretrained dynamics checkpoint
+  # (no need to re-walk the early-LR regime).
+  warmup_steps: 100
   absolute_actions: false      # ignored by g1_chunked loader; kept for shape compat
 
   # Reward-MTP ignored unless denoiser.train_reward_model=true.
@@ -137,6 +138,12 @@ train:
     # diffusion_forcing_bidir_prob applies to the corresponding r-profile
     # inside the unified diffuser when wm/id paths pick that profile.
     diffusion_forcing_bidir_prob: 0.5
+    # RMS loss scaler — equalizes obs vs act flow-matching loss magnitudes
+    # via a running per-modality EMA of loss². Mirrors the knob added to
+    # train_dynamics_uwm_new.py. State isn't checkpointed; first ~100 steps
+    # post-resume run slightly mis-scaled while the EMA reconverges.
+    rms_scale_loss: true
+    rms_scale_decay: 0.99
 
 # Optional LoRA. Default OFF (full fine-tune); flip lora.enabled=true to try
 # the LoRA variant later.

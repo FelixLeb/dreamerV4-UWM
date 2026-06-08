@@ -15,11 +15,13 @@ from torch.utils.tensorboard import SummaryWriter
 from dreamerv4uwm.datasets import create_distributed_dataloader
 from dreamerv4uwm.loss_new import (
     ActionPretrainingForwardProcess,
+    BlockCausalSanityForwardProcess,
     ImageForwardProcess,
     RMSLossScaler,
     UnifiedForwardProcess,
     VideoPretrainingForwardProcess,
     compute_action_pretraining_loss,
+    compute_block_causal_sanity_loss,
     compute_image_loss,
     compute_unified_uwm_loss,
     compute_video_pretraining_loss,
@@ -159,6 +161,18 @@ def build_models(cfg, device, local_rank):
         bidir_prob=float(unified_cfg.get("pretraining_bidir_prob", 0.5)),
         device=device,
     )
+    # Block-causal sanity mode. Knobs under cfg.train.unified.block_causal.*
+    bc_cfg = unified_cfg.get("block_causal", {}) or {}
+    block_causal_sanity_diffuser = BlockCausalSanityForwardProcess(
+        max_diff_steps=cfg.denoiser.num_noise_levels,
+        action_noise_std=float(unified_cfg.get("action_noise_std", 1.0)),
+        block_sizes=list(bc_cfg.get("block_sizes", [1, 2, 4, 8, 16])),
+        ctx_dropout_prob=float(bc_cfg.get("ctx_dropout_prob", 0.1)),
+        ctx_tau_idx_min=bc_cfg.get("ctx_tau_idx_min", None),
+        ctx_tau_idx_max=bc_cfg.get("ctx_tau_idx_max", None),
+        couple_modality_tau=bool(bc_cfg.get("couple_modality_tau", False)),
+        device=device,
+    )
 
     tokenizer = tokenizer.to(device)
     denoiser = denoiser.to(device)
@@ -177,6 +191,7 @@ def build_models(cfg, device, local_rank):
         tokenizer, denoiser,
         diffuser, image_diffuser,
         video_pretraining_diffuser, action_pretraining_diffuser,
+        block_causal_sanity_diffuser,
     )
 
 
@@ -231,6 +246,7 @@ def train_epoch(
     image_diffuser,
     video_pretraining_diffuser,
     action_pretraining_diffuser,
+    block_causal_sanity_diffuser,
     optim,
     scheduler,
     tb_writer,
@@ -295,11 +311,14 @@ def train_epoch(
     _mp_unified = float(mode_probs_cfg.get("unified", 1.0 / 3.0))
     _mp_video = float(mode_probs_cfg.get("video_pretraining", 1.0 / 3.0))
     _mp_action = float(mode_probs_cfg.get("action_pretraining", 1.0 / 3.0))
-    _mp_total = _mp_unified + _mp_video + _mp_action
+    # New placeholder mode; defaults to 0 so existing configs are unaffected.
+    _mp_block = float(mode_probs_cfg.get("block_causal_sanity", 0.0))
+    _mp_total = _mp_unified + _mp_video + _mp_action + _mp_block
     assert _mp_total > 0, "at least one of train.unified.mode_probs.* must be > 0"
     mp_unified = _mp_unified / _mp_total
     mp_video = _mp_video / _mp_total
-    # mp_action = _mp_action / _mp_total  # implicit remainder
+    mp_action = _mp_action / _mp_total
+    # mp_block = _mp_block / _mp_total  # implicit remainder
 
     # Dataset-modality forcing: if the dataset lacks one modality, pin the
     # mode for long/short branches to the marginal that doesn't need it.
@@ -314,10 +333,19 @@ def train_epoch(
     step_times = []
     data_times = []
 
+    # Raw (pre-scaler) per-modality losses — the progress signal we actually
+    # want to read in wandb. The scaler normalizes the backward losses to
+    # unit RMS, which flattens them and hides progress.
     accum_obs_flow = 0.0
     accum_act_flow = 0.0
+    # Scaled per-modality losses — diagnostic only. With the scaler active
+    # these hover near 1.0 in steady state; useful for sanity-checking the
+    # scaler itself, not for tracking training progress.
+    accum_obs_flow_scaled = 0.0
+    accum_act_flow_scaled = 0.0
     accum_reward = 0.0
-    accum_total = 0.0
+    accum_total = 0.0           # scaled total — matches the backward signal
+    accum_total_raw = 0.0       # raw obs_raw + act_raw — interpretable as progress
     accum_branch = "short"  # set on the first micro of each window
     # Mode within long/short branches: unified | video_pretraining | action_pretraining.
     # Set on the first micro of each window via the same rank-0-broadcast pattern
@@ -377,14 +405,17 @@ def train_epoch(
                         mode_code = 0
                     elif r_mode < mp_unified + mp_video:
                         mode_code = 1
-                    else:
+                    elif r_mode < mp_unified + mp_video + mp_action:
                         mode_code = 2
+                    else:
+                        mode_code = 3
                 mode_code_t = torch.tensor([mode_code], device=device, dtype=torch.long)
             else:
                 mode_code_t = torch.zeros(1, device=device, dtype=torch.long)
             dist.broadcast(mode_code_t, src=0)
             accum_mode = (
                 "unified", "video_pretraining", "action_pretraining",
+                "block_causal_sanity",
             )[int(mode_code_t.item())]
 
             if accum_branch == "short" and max_seq > short_seq_len:
@@ -456,6 +487,16 @@ def train_epoch(
                     rewards=rewards if train_reward else None,
                     scaler=loss_scaler,
                 )
+            elif accum_mode == "block_causal_sanity":
+                diffused_info = block_causal_sanity_diffuser(z_clean, actions)
+                losses = compute_block_causal_sanity_loss(
+                    diffused_info, denoiser, device=device,
+                    rewards=rewards if train_reward else None,
+                    # RMS scaler hardcoded OFF for block-causal (obs/act on raw
+                    # scales, so obs keeps its natural gradient emphasis). Flip
+                    # to `scaler=loss_scaler` for the RMS-on ablation later.
+                    scaler=None,
+                )
             else:  # accum_mode == "unified"
                 diffused_info = diffuser(z_clean, actions)
                 losses = compute_unified_uwm_loss(
@@ -475,11 +516,18 @@ def train_epoch(
 
         loss_micro.backward()
 
-        accum_obs_flow += obs_flow_loss.mean().item()
-        accum_act_flow += act_flow_loss.mean().item()
+        # Raw losses for progress tracking.
+        obs_flow_loss_raw = losses["obs_flow_loss_raw"]
+        act_flow_loss_raw = losses["act_flow_loss_raw"]
+        accum_obs_flow += obs_flow_loss_raw.item()
+        accum_act_flow += act_flow_loss_raw.item()
+        accum_total_raw += (obs_flow_loss_raw + act_flow_loss_raw).item() / cfg.train.accum_grad_steps
+        # Scaled losses for scaler diagnostics.
+        accum_obs_flow_scaled += obs_flow_loss.detach().item()
+        accum_act_flow_scaled += act_flow_loss.detach().item()
         if reward_loss is not None:
             accum_reward += reward_loss.item()
-        accum_total += loss_micro.item()
+        accum_total += loss_micro.item()  # scaled total — drives backward
 
         # --- Optimizer step at end of accumulation window ---
         if is_last_micro:
@@ -495,9 +543,16 @@ def train_epoch(
 
             if rank == 0:
                 lr = scheduler.get_last_lr()[0]
-                tb_writer.add_scalar("train/total_loss", sync_loss, global_update)
+                # Primary loss curves are RAW (pre-scaler) — readable training
+                # progress signal regardless of whether the scaler is active.
+                tb_writer.add_scalar("train/total_loss", accum_total_raw, global_update)
                 tb_writer.add_scalar("train/obs_flow_loss", accum_obs_flow, global_update)
                 tb_writer.add_scalar("train/act_flow_loss", accum_act_flow, global_update)
+                # Scaled curves for scaler-stability diagnostics (~1.0 in
+                # steady state when scaler is active; equal to raw when off).
+                tb_writer.add_scalar("train/total_loss_scaled", sync_loss, global_update)
+                tb_writer.add_scalar("train/obs_flow_loss_scaled", accum_obs_flow_scaled, global_update)
+                tb_writer.add_scalar("train/act_flow_loss_scaled", accum_act_flow_scaled, global_update)
                 if train_reward:
                     tb_writer.add_scalar("train/reward_loss", accum_reward, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
@@ -508,7 +563,7 @@ def train_epoch(
                     ns = "train/image"
                 else:
                     ns = f"train/{accum_branch}_{accum_mode}"
-                tb_writer.add_scalar(f"{ns}/total_loss", sync_loss, global_update)
+                tb_writer.add_scalar(f"{ns}/total_loss", accum_total_raw, global_update)
                 tb_writer.add_scalar(f"{ns}/obs_flow_loss", accum_obs_flow, global_update)
                 tb_writer.add_scalar(f"{ns}/act_flow_loss", accum_act_flow, global_update)
                 if train_reward:
@@ -518,7 +573,12 @@ def train_epoch(
                 # Mode trace: 0=unified, 1=video, 2=action, -1=image branch (no mode).
                 _mode_code = (
                     -1 if accum_branch == "image" else
-                    {"unified": 0, "video_pretraining": 1, "action_pretraining": 2}[accum_mode]
+                    {
+                        "unified": 0,
+                        "video_pretraining": 1,
+                        "action_pretraining": 2,
+                        "block_causal_sanity": 3,
+                    }[accum_mode]
                 )
                 tb_writer.add_scalar("train/mode_code", _mode_code, global_update)
 
@@ -527,7 +587,7 @@ def train_epoch(
                     print(
                         f"  [step {global_update}]"
                         f"  [{tag}]"
-                        f"  loss: {sync_loss:.4f}"
+                        f"  loss: {accum_total_raw:.4f}"
                         f"  obs: {accum_obs_flow:.4f}"
                         f"  act: {accum_act_flow:.4f}"
                         f"  lr: {lr:.2e}"
@@ -549,8 +609,11 @@ def train_epoch(
 
             accum_obs_flow = 0.0
             accum_act_flow = 0.0
+            accum_obs_flow_scaled = 0.0
+            accum_act_flow_scaled = 0.0
             accum_reward = 0.0
             accum_total = 0.0
+            accum_total_raw = 0.0
 
         torch.cuda.synchronize(device)
         step_times.append(time.perf_counter() - step_start)
@@ -606,6 +669,7 @@ def main(cfg: DictConfig):
         tokenizer, denoiser,
         diffuser, image_diffuser,
         video_pretraining_diffuser, action_pretraining_diffuser,
+        block_causal_sanity_diffuser,
     ) = build_models(cfg, device, local_rank)
     if rank == 0:
         n_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)
@@ -684,6 +748,7 @@ def main(cfg: DictConfig):
             image_diffuser=image_diffuser,
             video_pretraining_diffuser=video_pretraining_diffuser,
             action_pretraining_diffuser=action_pretraining_diffuser,
+            block_causal_sanity_diffuser=block_causal_sanity_diffuser,
             optim=optim,
             scheduler=scheduler,
             tb_writer=tb_writer,

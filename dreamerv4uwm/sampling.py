@@ -766,7 +766,8 @@ class AutoRegressiveForwardDynamics:
                  context_cond_tau=0.9,
                  denoising_step_count=4,
                  device="cuda",
-                 dtype=torch.float32):
+                 dtype=torch.float32,
+                 cond_class=None):
         assert mode in ('wm', 'policy'), f"mode must be 'wm' or 'policy', got '{mode}'"
 
         self.denoiser = denoiser
@@ -779,6 +780,11 @@ class AutoRegressiveForwardDynamics:
         self.denoising_step_count = denoising_step_count
         self.max_forward_steps = max_forward_steps
         self.current_frame_index = 0
+        # AdaLN class conditioning: an int class index (or None = unconditioned,
+        # bit-equivalent to a non-conditioned model). Materialized into a (B,)
+        # tensor in reset(); passed to every denoiser.forward_step call.
+        self.cond_class = cond_class
+        self.cond_class_t = None
 
         N = denoiser.cfg.denoiser.num_noise_levels
         assert (denoising_step_count & (denoising_step_count - 1)) == 0, \
@@ -815,6 +821,12 @@ class AutoRegressiveForwardDynamics:
 
         self.current_z = latents[:, -1:].clone()
         self.current_act = actions_ctx[:, -1:].clone()
+
+        # Build the (B,) class-conditioning tensor once per rollout.
+        self.cond_class_t = (
+            None if self.cond_class is None
+            else torch.full((B,), int(self.cond_class), dtype=torch.long, device=self.device)
+        )
 
         # ---- tokenizer decoder cache: prime with clean context latents ----
         self.tokenizer.init_cache(batch_size=B,
@@ -855,6 +867,7 @@ class AutoRegressiveForwardDynamics:
             act_step_idx=step_idx,
             start_step_idx=0,
             update_cache=True,
+            cond_class=self.cond_class_t,
         )
 
         self.current_frame_index = T_ctx
@@ -918,6 +931,7 @@ class AutoRegressiveForwardDynamics:
                 act_step_idx=step_idx,
                 start_step_idx=self.current_frame_index,
                 update_cache=False,
+                cond_class=self.cond_class_t,
             )
             denom = max(1.0 - tau, 1e-5)
             v_obs = (obs_pred - z_obs) / denom
@@ -938,6 +952,7 @@ class AutoRegressiveForwardDynamics:
             act_step_idx=step_idx,
             start_step_idx=self.current_frame_index,
             update_cache=True,
+            cond_class=self.cond_class_t,
         )
 
         imgs_recon = self.tokenizer.decode_step(z_obs,
@@ -979,6 +994,7 @@ class AutoRegressiveForwardDynamics:
                 act_step_idx=step_idx,
                 start_step_idx=self.current_frame_index,
                 update_cache=False,
+                cond_class=self.cond_class_t,
             )
             act_pred = act_pred.squeeze(-2)  # (B, 1, n_act)
 
@@ -1005,6 +1021,7 @@ class AutoRegressiveForwardDynamics:
             act_step_idx=step_idx,
             start_step_idx=self.current_frame_index,
             update_cache=True,
+            cond_class=self.cond_class_t,
         )
 
         imgs_recon = self.tokenizer.decode_step(z_obs,

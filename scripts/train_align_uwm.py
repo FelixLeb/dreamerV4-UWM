@@ -64,6 +64,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dreamerv4uwm.datasets import create_distributed_dataloader
 from dreamerv4uwm.loss_new import (
     ActionPretrainingForwardProcess,
+    RMSLossScaler,
     UnifiedForwardProcess,
     VideoPretrainingForwardProcess,
     compute_action_pretraining_loss,
@@ -421,6 +422,7 @@ def train_epoch(
     trainable_params, lora_enabled, rng,
     path_weights_cpu, play_fractions,
     causal_eps, ramp_beta,
+    loss_scaler,
 ):
     denoiser.train()
     epoch_start = time.perf_counter()
@@ -481,18 +483,21 @@ def train_epoch(
                     causal_eps=causal_eps,
                     ramp_beta=ramp_beta,
                     rewards=rewards if train_reward else None,
+                    scaler=loss_scaler,
                 )
             elif path == 'video':
                 info = video_diffuser(z_clean, actions)
                 losses = compute_video_pretraining_loss(
                     info, denoiser, device=device,
                     rewards=rewards if train_reward else None,
+                    scaler=loss_scaler,
                 )
             elif path == 'action_sampler':
                 info = action_diffuser(z_clean, actions)
                 losses = compute_action_pretraining_loss(
                     info, denoiser, device=device,
                     rewards=rewards if train_reward else None,
+                    scaler=loss_scaler,
                 )
             else:
                 raise RuntimeError(f"unknown alignment path: {path!r}")
@@ -507,8 +512,13 @@ def train_epoch(
 
         loss_micro.backward()
 
-        obs_mean = obs.mean().item()
-        act_mean = act.mean().item()
+        # Progress signal: prefer raw (pre-scaler) losses when the scaler is
+        # active. Scaled losses normalize to unit RMS in steady state and
+        # therefore can't be read as a training-progress curve.
+        obs_for_log = losses.get('obs_flow_loss_raw', obs)
+        act_for_log = losses.get('act_flow_loss_raw', act)
+        obs_mean = obs_for_log.mean().item()
+        act_mean = act_for_log.mean().item()
         accum_total += loss_micro.item()
         accum_obs   += obs_mean
         accum_act   += act_mean
@@ -666,6 +676,17 @@ def main(cfg: DictConfig):
     causal_eps = float(unified_cfg.get('causal_eps', 1e-3))
     ramp_beta = float(unified_cfg.get('ramp_beta', 1.0))
 
+    # --- Loss scaler (RMS-normalizes obs vs act loss magnitudes) ---
+    # Mirrors the pattern in train_dynamics_uwm_new.py. State isn't persisted
+    # with the checkpoint — first ~100 steps post-resume run at slightly
+    # mis-scaled magnitudes while the EMA reconverges (usually negligible).
+    rms_enabled = bool(unified_cfg.get('rms_scale_loss', True))
+    rms_decay = float(unified_cfg.get('rms_scale_decay', 0.99))
+    loss_scaler = RMSLossScaler(decay=rms_decay) if rms_enabled else None
+    if rank == 0:
+        print(f"RMS loss scaler: {'enabled' if rms_enabled else 'disabled'}"
+              + (f" (decay={rms_decay})" if rms_enabled else ""))
+
     # --- Optimizer + scheduler ---
     optim = torch.optim.AdamW(
         trainable_params,
@@ -743,6 +764,7 @@ def main(cfg: DictConfig):
         trainable_params=trainable_params, lora_enabled=lora_enabled, rng=rng,
         path_weights_cpu=path_weights_cpu, play_fractions=play_fractions,
         causal_eps=causal_eps, ramp_beta=ramp_beta,
+        loss_scaler=loss_scaler,
     )
     epoch_losses.append(avg_loss)
     epoch_times.append(epoch_time)

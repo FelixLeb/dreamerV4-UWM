@@ -634,6 +634,7 @@ class EfficientTransformerLayer(nn.Module):
         qk_norm: bool = True,
         is_causal: bool = True,
         rope_embedder: Optional[RopeEmbedding] = None,
+        cond_adaln: bool = False,
     ):
         super().__init__()
         assert isinstance(layer_type, LayerType)
@@ -667,13 +668,49 @@ class EfficientTransformerLayer(nn.Module):
         self.ffn = FeedForwardSwiGLU(model_dim, None, dropout_prob)
         self.dropout = nn.Dropout(dropout_prob)
 
+        # --- Optional AdaLN-Zero conditioning ---
+        # Produces (shift1, scale1, shift2, scale2) from a conditioning embedding
+        # and additively modulates the two RMSNorm outputs:
+        #   norm(x) -> norm(x) * (1 + scale) + shift
+        # The projection is ZERO-initialized (weight & bias), so at init the
+        # modulation is identity and the layer is bit-equivalent to the pretrained
+        # (non-conditioned) layer. NOTE: there is deliberately NO residual gate —
+        # the pretrained attn/FFN residual branches are left untouched, unlike
+        # canonical DiT AdaLN-Zero (which would zero them out at init).
+        if cond_adaln:
+            self.adaln = nn.Linear(model_dim, 4 * model_dim)
+            nn.init.zeros_(self.adaln.weight)
+            nn.init.zeros_(self.adaln.bias)
+        else:
+            self.adaln = None
+
+    @staticmethod
+    def _modulate(h: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Apply AdaLN modulation: h * (1 + scale) + shift.
+
+        h:            (B, T, S, D)
+        shift, scale: (B, D) — broadcast across the (T, S) token axes.
+        """
+        shift = shift.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, D)
+        scale = scale.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, D)
+        return h * (1 + scale) + shift
+
+    def _adaln_chunks(self, cond_emb: Optional[torch.Tensor]):
+        """Return (shift1, scale1, shift2, scale2) or None if conditioning is
+        inactive (module not registered or no embedding supplied)."""
+        if self.adaln is None or cond_emb is None:
+            return None
+        return self.adaln(F.silu(cond_emb)).chunk(4, dim=-1)
+
     def forward(self,
                 x,
                 spatial_mask=None,
                 kv_cache: Optional[KVCache] = None,
                 update_cache: bool = True,
                 position_ids: Optional[torch.Tensor] = None,
-                is_horizon: Optional[torch.Tensor] = None):
+                is_horizon: Optional[torch.Tensor] = None,
+                temporal_attn_mask: Optional[torch.Tensor] = None,
+                cond_emb: Optional[torch.Tensor] = None):
         """
         compute one transformer layer block as:
         x = drop_out(Attn(RMSNorm(x))) + x
@@ -687,56 +724,80 @@ class EfficientTransformerLayer(nn.Module):
                 causal between context frames and bidirectional within the
                 horizon block. Ignored in spatial layers and in the cached
                 forward_step path. None = unchanged causal behavior.
+            temporal_attn_mask: optional precomputed temporal mask, broadcastable
+                to (T, T) or (B, ..., T, T). Polarity True = allowed. When given
+                (uncached path only) it takes precedence over is_horizon and the
+                rolling-window construction — used by the block-causal protocol.
+            cond_emb: optional (B, D) AdaLN conditioning embedding. When provided
+                and self.adaln is registered, modulates the two RMSNorm outputs
+                (shift+scale). None = no modulation (bit-equivalent to pre-cond).
         Returns:
             x: (B, T, S, D) output tensor
         """
+        mod = self._adaln_chunks(cond_emb)
         # Attention block
         h = self.norm1(x)
+        if mod is not None:
+            h = self._modulate(h, mod[0], mod[1])
         if self.layer_type == LayerType.TEMPORAL:
             T = h.shape[1]
             uncached = kv_cache is None
-            window_active = (
-                uncached
-                and self.context_length is not None
-                and self.context_length < T
-                and self.is_causal
-            )
-            horizon_active = (
-                uncached
-                and is_horizon is not None
-                and self.is_causal
-            )
-            if window_active or horizon_active:
-                attn_window = self.context_length if window_active else None
-                temporal_mask = create_horizon_aware_temporal_mask(
-                    T=T,
-                    is_horizon=is_horizon if horizon_active else None,
-                    attention_window=attn_window,
-                    device=h.device,
-                )
+            if uncached and temporal_attn_mask is not None:
+                # Caller-supplied temporal mask (e.g. block-causal) overrides
+                # is_horizon / window mask construction. True = allowed.
                 h = self.attn(
                     h, h, h, dim=1,
-                    mask=temporal_mask,   # True=allowed
+                    mask=temporal_attn_mask,
                     causal=False,         # MUST be False since we pass mask
                     kv_cache=None,
                     kv_position_ids=position_ids,
                     q_position_ids=position_ids,
                 )
             else:
-                h = self.attn(h, h, h, dim=1,
-                            mask=None,
-                            causal=self.is_causal,
-                            kv_cache = kv_cache,
-                            update_cache=update_cache,
-                            kv_position_ids=position_ids,
-                            q_position_ids=position_ids,
-                            ) # Temporal dimension has caching
+                window_active = (
+                    uncached
+                    and self.context_length is not None
+                    and self.context_length < T
+                    and self.is_causal
+                )
+                horizon_active = (
+                    uncached
+                    and is_horizon is not None
+                    and self.is_causal
+                )
+                if window_active or horizon_active:
+                    attn_window = self.context_length if window_active else None
+                    built_mask = create_horizon_aware_temporal_mask(
+                        T=T,
+                        is_horizon=is_horizon if horizon_active else None,
+                        attention_window=attn_window,
+                        device=h.device,
+                    )
+                    h = self.attn(
+                        h, h, h, dim=1,
+                        mask=built_mask,   # True=allowed
+                        causal=False,      # MUST be False since we pass mask
+                        kv_cache=None,
+                        kv_position_ids=position_ids,
+                        q_position_ids=position_ids,
+                    )
+                else:
+                    h = self.attn(h, h, h, dim=1,
+                                mask=None,
+                                causal=self.is_causal,
+                                kv_cache = kv_cache,
+                                update_cache=update_cache,
+                                kv_position_ids=position_ids,
+                                q_position_ids=position_ids,
+                                ) # Temporal dimension has caching
         else:
             h = self.attn(h, h, h, dim=2, mask=spatial_mask) # Spatial dimension has no caching (check here)
         x = x + self.dropout(h)
 
         # FFN block
         h = self.norm2(x)
+        if mod is not None:
+            h = self._modulate(h, mod[2], mod[3])
         h = self.ffn(h)
         x = x + self.dropout(h)
 
@@ -747,7 +808,8 @@ class EfficientTransformerLayer(nn.Module):
                            spatial_mask: Optional[torch.Tensor],
                            kv_cache: Optional[KVCache],
                            commit_first_k: int,
-                           position_ids: torch.Tensor) -> torch.Tensor:
+                           position_ids: torch.Tensor,
+                           cond_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Hybrid cached chunk forward over a single layer.
 
         Temporal layer  → routes through `AxialAttention.forward_chunk_step`
@@ -755,7 +817,10 @@ class EfficientTransformerLayer(nn.Module):
         Spatial  layer  → runs the regular uncached spatial attention on
                           the (B, m, S, D) chunk; no cache involvement.
         """
+        mod = self._adaln_chunks(cond_emb)
         h = self.norm1(x)
+        if mod is not None:
+            h = self._modulate(h, mod[0], mod[1])
         if self.layer_type == LayerType.TEMPORAL:
             assert kv_cache is not None, (
                 "forward_chunk_step on a temporal layer requires a KVCache."
@@ -774,6 +839,8 @@ class EfficientTransformerLayer(nn.Module):
         x = x + self.dropout(h)
 
         h = self.norm2(x)
+        if mod is not None:
+            h = self._modulate(h, mod[2], mod[3])
         h = self.ffn(h)
         x = x + self.dropout(h)
         return x
@@ -797,6 +864,7 @@ class EfficientTransformerBlock(nn.Module):
         qk_norm: bool = True,
         is_causal: bool = True,
         layer_types: Optional[List[LayerType]] = None,
+        cond_adaln: bool = False,
     ):
         super().__init__()
         self.model_dim = model_dim
@@ -831,6 +899,7 @@ class EfficientTransformerBlock(nn.Module):
                         qk_norm=qk_norm,
                         is_causal=is_causal,
                         rope_embedder=RopeEmbedding(model_dim // n_heads, temporal_dim_max_seq_len),
+                        cond_adaln=cond_adaln,
                     )
                 )
             else:
@@ -845,20 +914,25 @@ class EfficientTransformerBlock(nn.Module):
                         qk_norm=qk_norm,
                         is_causal=False,
                         rope_embedder=RopeEmbedding(model_dim // n_heads, modality_dim_max_seq_len),
+                        cond_adaln=cond_adaln,
                     )
                 )
 
-    def forward(self, x, spatial_mask=None, is_horizon: Optional[torch.Tensor] = None):
+    def forward(self, x, spatial_mask=None, is_horizon: Optional[torch.Tensor] = None,
+                temporal_attn_mask: Optional[torch.Tensor] = None,
+                cond_emb: Optional[torch.Tensor] = None):
         assert x.size(-1) == self.model_dim
         for i, layer in enumerate(self.layers):
-            x = layer(x, spatial_mask=spatial_mask, is_horizon=is_horizon)
+            x = layer(x, spatial_mask=spatial_mask, is_horizon=is_horizon,
+                      temporal_attn_mask=temporal_attn_mask, cond_emb=cond_emb)
         return x
-    
+
     def forward_step(self,
                      x: torch.Tensor,
                      spatial_mask: Optional[torch.Tensor],
                      start_step_idx: int,
-                     update_cache: bool = True):
+                     update_cache: bool = True,
+                     cond_emb: Optional[torch.Tensor] = None):
         assert self.is_causal, "KV caching only valid for causal models."
         assert self.caches is not None, "Caches not initialized. Call init_cache() before forward_step."
         B, T, _, _ = x.shape
@@ -873,9 +947,10 @@ class EfficientTransformerBlock(nn.Module):
                           spatial_mask=spatial_mask,
                           kv_cache=self.caches[i],
                           position_ids=pos_ids,
-                          update_cache=update_cache)
+                          update_cache=update_cache,
+                          cond_emb=cond_emb)
             else:
-                x = layer(x, spatial_mask=spatial_mask)
+                x = layer(x, spatial_mask=spatial_mask, cond_emb=cond_emb)
 
         return x
 
@@ -883,7 +958,8 @@ class EfficientTransformerBlock(nn.Module):
                            x: torch.Tensor,
                            spatial_mask: Optional[torch.Tensor],
                            start_step_idx: int,
-                           commit_first_k: int = 0):
+                           commit_first_k: int = 0,
+                           cond_emb: Optional[torch.Tensor] = None):
         """Block-level hybrid chunk forward.
 
         Runs the m-frame chunk through every layer. Temporal layers use
@@ -912,6 +988,7 @@ class EfficientTransformerBlock(nn.Module):
                     kv_cache=self.caches[i],
                     commit_first_k=commit_first_k,
                     position_ids=pos_ids,
+                    cond_emb=cond_emb,
                 )
             else:
                 x = layer.forward_chunk_step(
@@ -920,6 +997,7 @@ class EfficientTransformerBlock(nn.Module):
                     kv_cache=None,
                     commit_first_k=0,
                     position_ids=pos_ids,
+                    cond_emb=cond_emb,
                 )
         return x
 

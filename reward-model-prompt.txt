@@ -1,1 +1,0 @@
-answer = model.query(image, "A robotic arm is positioned over a light-colored wooden table. The arm's goal is to holding a gray bag or case up and hold it there. A red and yellow strap is attached to the bag. Answer with 1 if the robot is successful and 0 otherwise")["answer"]

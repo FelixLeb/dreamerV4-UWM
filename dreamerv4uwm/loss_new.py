@@ -498,6 +498,7 @@ def compute_unified_uwm_loss(
     ramp_beta: float = 1.0,
     rewards: Optional[torch.Tensor] = None,
     scaler: Optional[RMSLossScaler] = None,
+    cond_class: Optional[torch.Tensor] = None,
 ):
     """Flow-matching loss with causality-aware per-modality weighting.
 
@@ -529,6 +530,7 @@ def compute_unified_uwm_loss(
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
         is_horizon=info.get("is_horizon"),
+        cond_class=cond_class,
     )
 
     obs_flow_sq = (z_hat - x).pow(2).mean(dim=(-1, -2))  # (B, T)
@@ -540,15 +542,21 @@ def compute_unified_uwm_loss(
         eps=causal_eps,
         ramp_beta=ramp_beta,
     )
-    obs_flow_loss = (obs_flow_sq * w_obs).mean()
-    act_flow_loss = (act_flow_sq * w_act).mean()
+    # Raw (unscaled) per-modality losses — these are the actual training-progress
+    # signal. The scaled versions (below) drive backward but are normalized to
+    # unit RMS by the scaler, so they're uninformative for monitoring progress.
+    obs_flow_loss_raw = (obs_flow_sq * w_obs).mean()
+    act_flow_loss_raw = (act_flow_sq * w_act).mean()
 
     # Rebalance obs vs act magnitudes if a scaler is supplied. Each term
     # divides by its own running RMS — equalizes long-run scale while
     # preserving the causality weighting's per-step relative dynamics.
     if scaler is not None:
-        obs_flow_loss = scaler("obs", obs_flow_loss)
-        act_flow_loss = scaler("act", act_flow_loss)
+        obs_flow_loss = scaler("obs", obs_flow_loss_raw)
+        act_flow_loss = scaler("act", act_flow_loss_raw)
+    else:
+        obs_flow_loss = obs_flow_loss_raw
+        act_flow_loss = act_flow_loss_raw
 
     reward_loss = None
     if pred_rewards is not None:
@@ -560,8 +568,10 @@ def compute_unified_uwm_loss(
         reward_loss = compute_reward_mtp_loss(pred_rewards, rewards)
 
     return {
-        "obs_flow_loss": obs_flow_loss,
-        "act_flow_loss": act_flow_loss,
+        "obs_flow_loss": obs_flow_loss,                    # scaled (drives backward)
+        "act_flow_loss": act_flow_loss,                    # scaled (drives backward)
+        "obs_flow_loss_raw": obs_flow_loss_raw.detach(),   # raw (for progress logging)
+        "act_flow_loss_raw": act_flow_loss_raw.detach(),   # raw (for progress logging)
         "reward_loss": reward_loss,
     }
 
@@ -655,6 +665,7 @@ def compute_image_loss(
     device='cpu',
     rewards: Optional[torch.Tensor] = None,
     scaler: Optional[RMSLossScaler] = None,
+    cond_class: Optional[torch.Tensor] = None,
 ):
     """Marginal state-flow loss for the image (single-frame) pathway.
 
@@ -686,9 +697,10 @@ def compute_image_loss(
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
         is_horizon=info.get("is_horizon"),
+        cond_class=cond_class,
     )
 
-    obs_flow_loss = (z_hat - x).pow(2).mean()
+    obs_flow_loss_raw = (z_hat - x).pow(2).mean()
     # Keep `action_projector` in the autograd graph — `* 0.0` zeros the
     # contribution but preserves the backward edge (mirrors the legacy
     # `*.mean()*0.` pattern in compute_uwm_loss for non-action modes).
@@ -697,7 +709,9 @@ def compute_image_loss(
     # Scale only the meaningful (obs) term so the shared "obs" EMA isn't
     # polluted by the zeroed-out act term.
     if scaler is not None:
-        obs_flow_loss = scaler("obs", obs_flow_loss)
+        obs_flow_loss = scaler("obs", obs_flow_loss_raw)
+    else:
+        obs_flow_loss = obs_flow_loss_raw
 
     reward_loss = None
     if pred_rewards is not None:
@@ -709,8 +723,10 @@ def compute_image_loss(
         reward_loss = compute_reward_mtp_loss(pred_rewards, rewards)
 
     return {
-        "obs_flow_loss": obs_flow_loss,
-        "act_flow_loss": act_flow_loss,
+        "obs_flow_loss": obs_flow_loss,                    # scaled (drives backward)
+        "act_flow_loss": act_flow_loss,                    # already zero
+        "obs_flow_loss_raw": obs_flow_loss_raw.detach(),   # raw (for progress logging)
+        "act_flow_loss_raw": act_flow_loss.detach(),       # zero, kept for shape consistency
         "reward_loss": reward_loss,
     }
 
@@ -884,6 +900,7 @@ def compute_video_pretraining_loss(
     device='cpu',
     rewards: Optional[torch.Tensor] = None,
     scaler: Optional[RMSLossScaler] = None,
+    cond_class: Optional[torch.Tensor] = None,
 ):
     """Multi-frame video-pretraining loss: state-only x-prediction.
 
@@ -909,15 +926,18 @@ def compute_video_pretraining_loss(
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
         is_horizon=info.get("is_horizon"),
+        cond_class=cond_class,
     )
 
-    obs_flow_loss = (z_hat - x).pow(2).mean()
+    obs_flow_loss_raw = (z_hat - x).pow(2).mean()
     act_flow_loss = (a_hat - a).pow(2).mean() * 0.0
 
     # Scale only the meaningful (obs) term — same shared "obs" key as the
     # unified loss so the EMA pools obs-loss magnitudes across modes.
     if scaler is not None:
-        obs_flow_loss = scaler("obs", obs_flow_loss)
+        obs_flow_loss = scaler("obs", obs_flow_loss_raw)
+    else:
+        obs_flow_loss = obs_flow_loss_raw
 
     reward_loss = None
     if pred_rewards is not None:
@@ -929,8 +949,10 @@ def compute_video_pretraining_loss(
         reward_loss = compute_reward_mtp_loss(pred_rewards, rewards)
 
     return {
-        "obs_flow_loss": obs_flow_loss,
-        "act_flow_loss": act_flow_loss,
+        "obs_flow_loss": obs_flow_loss,                    # scaled (drives backward)
+        "act_flow_loss": act_flow_loss,                    # zero
+        "obs_flow_loss_raw": obs_flow_loss_raw.detach(),   # raw (for progress logging)
+        "act_flow_loss_raw": act_flow_loss.detach(),       # zero
         "reward_loss": reward_loss,
     }
 
@@ -941,6 +963,7 @@ def compute_action_pretraining_loss(
     device='cpu',
     rewards: Optional[torch.Tensor] = None,
     scaler: Optional[RMSLossScaler] = None,
+    cond_class: Optional[torch.Tensor] = None,
 ):
     """Multi-frame action-pretraining loss: action-only x-prediction.
 
@@ -965,15 +988,18 @@ def compute_action_pretraining_loss(
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
         is_horizon=info.get("is_horizon"),
+        cond_class=cond_class,
     )
 
-    act_flow_loss = (a_hat - a).pow(2).mean()
+    act_flow_loss_raw = (a_hat - a).pow(2).mean()
     obs_flow_loss = (z_hat - x).pow(2).mean() * 0.0
 
     # Scale only the meaningful (act) term — same shared "act" key as the
     # unified loss so the EMA pools act-loss magnitudes across modes.
     if scaler is not None:
-        act_flow_loss = scaler("act", act_flow_loss)
+        act_flow_loss = scaler("act", act_flow_loss_raw)
+    else:
+        act_flow_loss = act_flow_loss_raw
 
     reward_loss = None
     if pred_rewards is not None:
@@ -985,7 +1011,258 @@ def compute_action_pretraining_loss(
         reward_loss = compute_reward_mtp_loss(pred_rewards, rewards)
 
     return {
-        "obs_flow_loss": obs_flow_loss,
-        "act_flow_loss": act_flow_loss,
+        "obs_flow_loss": obs_flow_loss,                    # zero
+        "act_flow_loss": act_flow_loss,                    # scaled (drives backward)
+        "obs_flow_loss_raw": obs_flow_loss.detach(),       # zero
+        "act_flow_loss_raw": act_flow_loss_raw.detach(),   # raw (for progress logging)
+        "reward_loss": reward_loss,
+    }
+
+
+# ============================================================================
+# Block-causal sanity mode  (block-wise diffusion forcing)
+# ============================================================================
+#
+# Block-causal flow matching for joint state-action (policy) generation. The
+# sequence is partitioned into blocks of size K; attention is bidirectional
+# WITHIN a block and strictly causal ACROSS blocks (block N sees 0..N). This
+# matches the chunked-autoregressive sampler's inference mask, so training and
+# rollout share the same causality structure — the motivation for the mode.
+#
+# Supervision (block-wise Diffusion Forcing): the first `num_ctx_blocks` blocks
+# are near-clean CONTEXT; EVERY subsequent block is a TARGET, each drawn its OWN
+# independent noise level, and the flow-matching loss covers ALL target blocks
+# at once. (Earlier versions supervised a single target block — wasteful,
+# especially for small K. This is the fix.) With K=1 this reduces to standard
+# per-frame Diffusion Forcing with a clean prefix; the size-1 block has no
+# intra-block bidir, so its attention is purely causal — preserving the
+# single-frame prediction paradigm of the old stable recipe.
+#
+# Noise schedule (τ convention: τ=1 clean, τ=0 pure noise):
+#   • Context blocks → near-clean, one τ per batch item from the high band
+#     [ctx_tau_idx_min, ctx_tau_idx_max) (exposure-bias robustness).
+#   • Target blocks  → full-range τ, INDEPENDENT per (batch item, block, modality),
+#     broadcast within each block so each block resolves at its own level.
+#   • Context dropout → with prob `ctx_dropout_prob` there are 0 context blocks
+#     (every block is a target) → fully unconditional generation.
+
+
+class BlockCausalSanityForwardProcess(nn.Module):
+    """Block-causal (block-wise Diffusion-Forcing) forward process.
+
+    Construct- and call-compatible with the other forward processes
+    (`forward(z_clean, a_clean)`), but additionally emits `is_target` (T,) for
+    loss masking and `temporal_attn_mask` (T, T, True=allowed) for the
+    block-causal attention pattern.
+    """
+
+    def __init__(
+        self,
+        max_diff_steps: int = 128,
+        action_noise_std: float = 1.0,
+        block_sizes=(1, 2, 4, 8, 16),
+        ctx_dropout_prob: float = 0.1,
+        ctx_tau_idx_min: Optional[int] = None,
+        ctx_tau_idx_max: Optional[int] = None,
+        couple_modality_tau: bool = False,
+        device='cpu',
+    ):
+        super().__init__()
+        self.max_diff_steps = int(max_diff_steps)
+        self.action_noise_std = float(action_noise_std)
+        self.block_sizes = [int(k) for k in block_sizes]
+        assert len(self.block_sizes) > 0, "block_sizes must be non-empty"
+        assert 0.0 <= ctx_dropout_prob <= 1.0
+        self.ctx_dropout_prob = float(ctx_dropout_prob)
+        # Context near-clean band (τ-index; τ=1 clean). Default: top ~8% of the
+        # grid, [max-10, max-1) — slightly noisy history for exposure-bias
+        # robustness, matching CausVid/Self-Forcing context augmentation.
+        self.ctx_tau_idx_min = (
+            int(ctx_tau_idx_min) if ctx_tau_idx_min is not None
+            else self.max_diff_steps - 10
+        )
+        self.ctx_tau_idx_max = (
+            int(ctx_tau_idx_max) if ctx_tau_idx_max is not None
+            else self.max_diff_steps - 1
+        )
+        assert 0 < self.ctx_tau_idx_min < self.ctx_tau_idx_max <= self.max_diff_steps - 1, (
+            f"require 0 < ctx_tau_idx_min ({self.ctx_tau_idx_min}) < "
+            f"ctx_tau_idx_max ({self.ctx_tau_idx_max}) <= max-1 ({self.max_diff_steps - 1})"
+        )
+        self.couple_modality_tau = bool(couple_modality_tau)
+        self.device = device
+
+    def _sample_block_structure(self, T: int):
+        """Pick K (dividing T into ≥2 blocks) and a batch-shared context boundary.
+
+        The first `num_ctx_blocks` blocks are context; every block at or after it
+        is a target. Returns
+        (block_idx (T,), num_blocks, is_ctx (T,), is_target (T,), attn_mask (T,T)).
+        """
+        valid = [k for k in self.block_sizes if T % k == 0 and (T // k) >= 2]
+        assert len(valid) > 0, (
+            f"no block size in {self.block_sizes} divides T={T} into >=2 blocks"
+        )
+        K = valid[int(torch.randint(len(valid), (1,)).item())]
+        num_blocks = T // K
+
+        block_idx = torch.arange(T, device=self.device) // K          # (T,)
+        # Number of leading context blocks ∈ [1, num_blocks-1] (≥1 target block);
+        # dropout → 0 context blocks (everything is a target → unconditional).
+        num_ctx_blocks = int(torch.randint(1, num_blocks, (1,)).item())
+        if torch.rand(1, device=self.device).item() < self.ctx_dropout_prob:
+            num_ctx_blocks = 0
+
+        is_ctx = block_idx < num_ctx_blocks                          # (T,) bool
+        is_target = block_idx >= num_ctx_blocks                      # (T,) bool — ALL non-ctx blocks
+
+        # Block-causal mask: query in block q attends to keys in blocks <= q.
+        # True = allowed (SDPA bool convention, matches horizon mask).
+        q_block = block_idx.view(T, 1)
+        k_block = block_idx.view(1, T)
+        attn_mask = (k_block <= q_block)                             # (T, T) bool
+        return block_idx, num_blocks, is_ctx, is_target, attn_mask
+
+    def _build_tau_idx(self, B: int, T: int, block_idx: torch.Tensor,
+                       num_blocks: int, is_ctx: torch.Tensor):
+        """Per-(batch, frame) τ-index for block-wise Diffusion Forcing:
+        every block draws its OWN independent full-range target level; context
+        frames are overwritten with one near-clean draw per batch item."""
+        # Independent per-(batch, block) target level, gathered to per-frame.
+        block_tau = torch.randint(
+            0, self.max_diff_steps - 1, (B, num_blocks), device=self.device,
+        )
+        gather_idx = block_idx.view(1, T).expand(B, T)               # (B, T) long
+        tau_idx = block_tau.gather(1, gather_idx)                    # (B, T)
+        # Near-clean context: one draw per batch item, broadcast over ctx frames.
+        ctx_idx = torch.randint(
+            self.ctx_tau_idx_min, self.ctx_tau_idx_max, (B, 1), device=self.device,
+        ).expand(B, T)
+        is_ctx_b = is_ctx.view(1, T).expand(B, T)
+        tau_idx = torch.where(is_ctx_b, ctx_idx, tau_idx)
+        return tau_idx
+
+    def forward(
+        self,
+        z_clean: torch.Tensor,  # (B, T, N_lat, D_lat)
+        a_clean: torch.Tensor,  # (B, T, 1, n_actions)
+    ):
+        B, T, N_lat, D_lat = z_clean.shape
+        block_idx, num_blocks, is_ctx, is_target, attn_mask = \
+            self._sample_block_structure(T)
+
+        obs_tau_idx = self._build_tau_idx(B, T, block_idx, num_blocks, is_ctx)
+        if self.couple_modality_tau:
+            act_tau_idx = obs_tau_idx.clone()
+        else:
+            act_tau_idx = self._build_tau_idx(B, T, block_idx, num_blocks, is_ctx)
+        obs_tau = obs_tau_idx.float() / self.max_diff_steps
+        act_tau = act_tau_idx.float() / self.max_diff_steps
+
+        z0 = torch.randn_like(z_clean)
+        obs_tau_b = obs_tau.unsqueeze(-1).unsqueeze(-1)                # (B,T,1,1)
+        z_tau = (1.0 - obs_tau_b) * z0 + obs_tau_b * z_clean
+
+        a0 = self.action_noise_std * torch.randn_like(a_clean)
+        act_tau_b = act_tau.unsqueeze(-1).unsqueeze(-1)                # (B,T,1,1)
+        a_tau = (1.0 - act_tau_b) * a0 + act_tau_b * a_clean
+
+        return {
+            "x": z_clean,
+            "x0": z0,
+            "x_tau": z_tau,
+            "obs_tau": obs_tau,
+            "obs_tau_idx": obs_tau_idx,
+            "a": a_clean,
+            "a0": a0,
+            "a_tau": a_tau,
+            "act_tau": act_tau,
+            "act_tau_idx": act_tau_idx,
+            "is_target": is_target,             # (T,) bool — loss mask
+            "temporal_attn_mask": attn_mask,    # (T,T) bool, True=allowed
+        }
+
+
+def compute_block_causal_sanity_loss(
+    info: dict,
+    denoiser: DreamerV4Denoiser,
+    device='cpu',
+    rewards: Optional[torch.Tensor] = None,
+    scaler: Optional[RMSLossScaler] = None,
+    cond_class: Optional[torch.Tensor] = None,
+    ramp_tau_coef: float = 0.8,
+    ramp_bias: float = 0.2,
+):
+    """Block-causal joint state-action loss over ALL target blocks.
+
+    x-prediction MSE on both channels, masked to every target frame (all
+    non-context blocks) and weighted per-frame by a ramp `w(τ) = ramp_tau_coef·τ
+    + ramp_bias` (τ = cleanness; τ=1 clean). The default `0.8·τ + 0.2`
+    down-weights the noisy end less aggressively than the legacy `0.9·τ + 0.1`,
+    putting a bit more weight on the high-noise regime. The block-causal
+    `temporal_attn_mask` is forwarded so each block attends bidirectionally
+    within itself and causally to earlier blocks. Returns the standard
+    {obs_flow_loss, act_flow_loss, *_raw, reward_loss} dict.
+    """
+    x = info["x"]
+    B, T, N_lat, D_lat = x.shape
+    x_tau = info["x_tau"]
+    obs_tau_idx = info["obs_tau_idx"]
+    a = info["a"]
+    a_tau = info["a_tau"]
+    act_tau_idx = info["act_tau_idx"]
+    is_target = info["is_target"].to(device)            # (T,) bool
+    temporal_attn_mask = info["temporal_attn_mask"]
+
+    step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
+
+    z_hat, a_hat, pred_rewards = denoiser(
+        noisy_act=a_tau.squeeze(-2),
+        noisy_obs=x_tau,
+        obs_sigma_idx=obs_tau_idx,
+        obs_step_idx=step_idx,
+        act_sigma_idx=act_tau_idx,
+        act_step_idx=step_idx,
+        is_horizon=None,
+        temporal_attn_mask=temporal_attn_mask,
+        cond_class=cond_class,
+    )
+
+    obs_sq = (z_hat - x).pow(2).mean(dim=(-1, -2))       # (B, T)
+    act_sq = (a_hat - a).pow(2).mean(dim=(-1, -2))       # (B, T)
+
+    # Per-frame ramp weight (τ = cleanness): w = ramp_tau_coef·τ + ramp_bias.
+    w_obs = ramp_tau_coef * info["obs_tau"] + ramp_bias  # (B, T)
+    w_act = ramp_tau_coef * info["act_tau"] + ramp_bias  # (B, T)
+
+    # Mask to ALL target frames; normalize over (batch × target frames). The
+    # ramp scales each term but normalization is by target-frame count (matches
+    # the legacy `(sq*w)[:, ctx:].mean()` convention — weight scales, not norms).
+    tgt = is_target.view(1, T).to(obs_sq.dtype)          # (1, T)
+    denom = (tgt.sum() * B).clamp_min(1.0)
+    obs_flow_loss_raw = (obs_sq * w_obs * tgt).sum() / denom
+    act_flow_loss_raw = (act_sq * w_act * tgt).sum() / denom
+
+    if scaler is not None:
+        obs_flow_loss = scaler("obs", obs_flow_loss_raw)
+        act_flow_loss = scaler("act", act_flow_loss_raw)
+    else:
+        obs_flow_loss = obs_flow_loss_raw
+        act_flow_loss = act_flow_loss_raw
+
+    reward_loss = None
+    if pred_rewards is not None:
+        if rewards is None:
+            raise RuntimeError(
+                "denoiser was built with train_reward_model=True but "
+                "compute_block_causal_sanity_loss was called without `rewards`."
+            )
+        reward_loss = compute_reward_mtp_loss(pred_rewards, rewards)
+
+    return {
+        "obs_flow_loss": obs_flow_loss,                    # scaled (drives backward)
+        "act_flow_loss": act_flow_loss,                    # scaled (drives backward)
+        "obs_flow_loss_raw": obs_flow_loss_raw.detach(),   # raw (for progress logging)
+        "act_flow_loss_raw": act_flow_loss_raw.detach(),   # raw (for progress logging)
         "reward_loss": reward_loss,
     }

@@ -1,0 +1,126 @@
+# @package _global_
+# Block-causal / unified alignment with AdaLN-Zero class conditioning
+# (g1-large, 1536). Consumed by scripts/train_align_cond_new.py.
+defaults:
+ - /tokenizer: /g1
+
+dual_stream: false
+# REQUIRED base weights (1536-dim G1, unified-loss pretrained). Loaded
+# strict=False; conditioning params zero-initialized. VERIFY the arch matches.
+dynamics_ckpt: /scratch/rk4342/projects/dreamerV4-UWM/checkpoints/dynamics/g1-may19-unified-scratch-v2/122500.pt
+reload_checkpoint: null
+output_dir: checkpoints/align/cond-new-g1-large/${now:%Y-%m-%d_%H-%M-%S}
+plot_every: 1000
+print_every: 100
+log_every: 25
+save_every: 1000
+seed: 42
+
+dataset:
+  has_states: true
+  has_actions: true
+  kind: g1_chunked
+  play_data_dir: /scratch/rk4342/datasets/G1/wm
+  demo_data_dir: /scratch/rk4342/datasets/G1/demo
+  data_dir: /scratch/rk4342/datasets/G1/wm
+  train_episodes_fraction: 1.0
+  split_seed: 123
+
+denoiser:
+  dual_stream: false
+  num_action_tokens: 1
+  num_latent_tokens: 256
+  num_register_tokens: 4
+  context_length: 64
+  max_sequence_length: 128
+  model_dim: 1536
+  latent_dim: 32
+  n_layers: 6
+  n_heads: 24
+  n_kv_heads: 24
+  dropout_prob: 0.0
+  qk_norm: false
+  num_noise_levels: 128
+  n_actions: 22
+  is_causal: true
+  layer_types: [spatial, temporal, spatial, temporal]
+  train_reward_model: false
+  mtp_length: 8
+  # OFF for block-causal (it supplies its own (T,T) mask and is_horizon=None).
+  horizon_aware: false
+  # --- AdaLN-Zero class conditioning (null / play / demo) ---
+  cond_adaln: true
+  num_cond_classes: 3
+
+train:
+  device: 'cuda:0'
+  use_compile: true
+  num_training_steps: 30000
+  warmup_steps: 500
+  batch_per_gpu: 8
+  long_seq_batch_per_gpu: 1
+  short_sequence_length: 32
+  # Short branch only (matches g1-large dynamics recipe).
+  long_seq_prob: 0.0
+  image_prob: 0.0
+  image_batch_per_gpu: 64
+  accum_grad_steps: 2
+  lr: 1.0e-4
+  weight_decay: 0.01
+  num_workers: 12
+  enable_fast_matmul: true
+  clip_grad_norm: 1.0
+  reward_weight: 1.0
+  absolute_actions: false
+
+  freeze_backbone: true
+  null_play_fraction: 0.5
+
+  unified:
+    action_noise_std: 1.0
+    theta_id_prob: 0.15
+    theta_policy_prob: 0.15
+    theta_wm_prob: 0.15
+    theta_continuum_prob: 0.55
+    profile_step_prob: 0.3
+    profile_progressive_prob: 0.15
+    profile_constant_prob: 0.15
+    profile_diffusion_forcing_prob: 0.4
+    profile_reverse_step_prob: 0.15
+    r_beta_alpha: 1.0
+    r_beta_beta: 1.0
+    causal_eps: 1.0e-3
+    ramp_beta: 0.33
+    # Block-causal only (matches g1-large dynamics).
+    mode_probs:
+      unified: 0.0
+      video_pretraining: 0.0
+      action_pretraining: 0.0
+      block_causal_sanity: 1.0
+    pretraining_bidir_prob: 0.5
+    diffusion_forcing_bidir_prob: 0.5
+    # Block-causal mode hardcodes the RMS scaler OFF in the train dispatch; this
+    # flag only affects unified/pretraining modes (unused here).
+    rms_scale_loss: false
+    rms_scale_decay: 0.99
+    block_causal:
+      block_sizes: [1, 2, 4, 8, 16]
+      ctx_dropout_prob: 0.1
+      ctx_tau_idx_min: null
+      ctx_tau_idx_max: null
+      couple_modality_tau: false
+
+lora:
+  enabled: false
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  bias: "none"
+  target_modules: "all-linear"
+  modules_to_save: null
+  save_merged_final: true
+
+wandb:
+  enable: false
+  project: "UWM-G1-align-cond"
+  run_name: null

@@ -4,8 +4,9 @@ defaults:
 
 dual_stream: false
 # REQUIRED: model weights are initialized from this checkpoint; optimizer
-# and scheduler start fresh (no `reload_checkpoint` resume).
-dynamics_ckpt: /home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/dynamics/pushT/final/joint-model/v1/432360.pt
+# and scheduler start fresh (no `reload_checkpoint` resume). Override per
+# experiment from the slurm script.
+dynamics_ckpt: /scratch/rk4342/projects/dreamerV4-UWM/checkpoints/dynamics/pushT-may19-unified-loss-large/45000.pt
 reload_checkpoint: null
 output_dir: checkpoints/align/mix-uwm-pushT/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
@@ -22,28 +23,29 @@ dataset:
   dt: 0.2
   resolution: [256, 256]
   load_to_ram: true
-  play_data_dir: /home/mim-server/datasets/pushT/sharded
-  demo_data_dir: /home/mim-server/datasets/pushT/sharded-demo
+  play_data_dir: /scratch/rk4342/datasets/pushT/play
+  demo_data_dir: /scratch/rk4342/datasets/pushT/ablation/sharded-demo
   split_seed: 123
   train_episodes_fraction: 1.0
   # Legacy single-source field unused by the alignment loader; kept for code
   # paths that may read cfg.dataset.data_dir.
-  data_dir: /home/mim-server/datasets/pushT/sharded
+  data_dir: /scratch/rk4342/datasets/pushT/play
   kind: sharded_hdf5
 
 denoiser:
-  # Must match the play-trained pushT checkpoint architecture exactly.
+  # Must match the play-trained pushT-large checkpoint architecture exactly
+  # (see scripts/config/dynamics/pushT-large.yaml).
   dual_stream: false
   num_action_tokens: 1
   num_latent_tokens: 256
   num_register_tokens: 4
   context_length: 64
-  max_sequence_length: 64
-  model_dim: 768
+  max_sequence_length: 96      # also drives the alignment loader window
+  model_dim: 1024
   latent_dim: 32
-  n_layers: 6
-  n_heads: 12
-  n_kv_heads: 12
+  n_layers: 8
+  n_heads: 16
+  n_kv_heads: 16
   dropout_prob: 0.0
   qk_norm: false
   num_noise_levels: 128
@@ -51,9 +53,9 @@ denoiser:
   is_causal: true
   layer_types: [spatial, temporal, spatial, temporal]
   train_reward_model: false
-  # Must match the pretrained checkpoint's setting. Pretraining on
-  # pushT.yaml uses horizon_aware=true; keep it on here so the
-  # frame_id_embedder shape matches at load time.
+  mtp_length: 8
+  # Must match the pretrained checkpoint's setting (pushT-large.yaml uses
+  # horizon_aware=true so the frame_id_embedder shape matches at load time).
   horizon_aware: true
 
 train:
@@ -61,8 +63,8 @@ train:
   use_compile: true            # compile+LoRA is fragile; auto-disabled when lora.enabled=true
   # Single source of truth for run length: total optimizer (gradient) steps.
   num_training_steps: 30000
-  batch_per_gpu: 4             # play batch size
-  demo_batch_per_gpu: 4        # demo batch size (can be smaller if memory-bound)
+  batch_per_gpu: 2             # play batch size — pushT-large at T=96 ≈ ~2/GPU on H200
+  demo_batch_per_gpu: 2        # demo batch size (can be smaller if memory-bound)
   accum_grad_steps: 2
   lr: 1.0e-4
   weight_decay: 0.01
@@ -70,8 +72,9 @@ train:
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
-  # Warmup length in grad steps. When null, falls back to 5% of num_training_steps.
-  warmup_steps: 500
+  # Warmup is short since we start from a pretrained dynamics checkpoint
+  # (no need to re-walk the early-LR regime).
+  warmup_steps: 100
   absolute_actions: false
 
   # Reward-MTP ignored unless denoiser.train_reward_model=true.
@@ -134,6 +137,12 @@ train:
     # diffusion_forcing_bidir_prob applies to the corresponding r-profile
     # inside the unified diffuser when wm/id paths pick that profile.
     diffusion_forcing_bidir_prob: 0.5
+    # RMS loss scaler — equalizes obs vs act flow-matching loss magnitudes
+    # via a running per-modality EMA of loss². Mirrors the knob added to
+    # train_dynamics_uwm_new.py. State isn't checkpointed; first ~100 steps
+    # post-resume run slightly mis-scaled while the EMA reconverges.
+    rms_scale_loss: true
+    rms_scale_decay: 0.99
 
 # Optional LoRA. Default OFF (full fine-tune); flip lora.enabled=true to try
 # the LoRA variant later.
