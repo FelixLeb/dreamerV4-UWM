@@ -9,14 +9,18 @@ Two layers:
   latent states and whose edges are short ``pi_prior`` rollouts, scored by a
   basic pluggable :mod:`reward`.
 """
-from . import rollout, reward, mcts
+from . import rollout, reward, mcts, easy_mcts
 from .rollout import policy, transition, imagine
-from .reward import RewardFn, ZeroReward, GoalLatentReward, CallableReward
+from .reward import (RewardFn, ZeroReward, GoalLatentReward, CallableReward,
+                     TCenterReward, score_t_centered, annotate_t)
 from .mcts import MCTS, PlanConfig, Node, Edge
+from .easy_mcts import EasyMCTS, EasyPlanConfig, EasyNode
 
 __all__ = [
-    "rollout", "reward", "mcts",
+    "rollout", "reward", "mcts", "easy_mcts",
     "policy", "transition", "imagine",
     "RewardFn", "ZeroReward", "GoalLatentReward", "CallableReward",
+    "TCenterReward", "score_t_centered", "annotate_t",
     "MCTS", "PlanConfig", "Node", "Edge",
+    "EasyMCTS", "EasyPlanConfig", "EasyNode",
 ]
