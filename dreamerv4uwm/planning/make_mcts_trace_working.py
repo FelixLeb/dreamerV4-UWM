@@ -50,8 +50,7 @@ THUMB = 132   # node thumbnail px
 
 # --- the working start + a small, legible search ---------------------------
 START_IDX, START_FRAME, T_ctx = 12000, 14, 8
-SCORE_KW = dict(center_xy=(0.5, 0.5), sigma=0.22, w_center=0.6, w_orient=0.4,
-                orient_method="vertical")
+SCORE_KW = dict(center_xy=(0.5, 0.5), sigma=0.22)
 # Kept shallow (max_depth=2, branching=3 -> <=13 nodes) so the tree renders
 # legibly, but with long edges + the winning diversity knobs so a 2-step plan
 # still moves the T a long way toward centered+vertical. The search is small and

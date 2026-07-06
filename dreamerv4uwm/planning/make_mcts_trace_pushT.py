@@ -83,9 +83,8 @@ def main():
         plan_cz = tokenizer.encode(imgs).float()
     plan_ca = b["action"][sl, :cfg.denoiser.n_actions][None].to(device)
 
-    # task reward: red T centered + vertical (robust LR-symmetry orientation)
-    reward = TCenterReward(decode_fn=decode, center_xy=(0.5, 0.5), sigma=0.22,
-                           orient_method="vertical")
+    # task reward: red T centered (orientation ignored)
+    reward = TCenterReward(decode_fn=decode, center_xy=(0.5, 0.5), sigma=0.22)
 
     # small, legible search (longer edges than the mock so the T can move)
     cfg_plan = EasyPlanConfig(

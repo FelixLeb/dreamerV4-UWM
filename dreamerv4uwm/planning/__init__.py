@@ -20,7 +20,7 @@ __all__ = [
     "rollout", "reward", "mcts", "easy_mcts",
     "policy", "transition", "imagine",
     "RewardFn", "ZeroReward", "GoalLatentReward", "CallableReward",
-    "TCenterReward", "score_t_centered", "annotate_t",
+    "TCenterReward", "score_t_centered", "annotate_t", "score_loc",
     "MCTS", "PlanConfig", "Node", "Edge",
     "EasyMCTS", "EasyPlanConfig", "EasyNode",
 ]

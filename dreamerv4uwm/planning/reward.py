@@ -22,8 +22,9 @@ Two families here:
   weak, uninformative signal (planning barely beats random with it).
 * **Pixel / task** rewards (``TCenterReward``) — decode the latent to an image
   and score the *task* directly. For the real-robot pushT scene this segments
-  the red **T** and rewards it being **centered and straight**. Much more
-  informative; the price is a tokenizer ``decode`` per evaluated state.
+  the red **T** and rewards it being **centered** (orientation is intentionally
+  ignored). Much more informative than latent L2; the price is a tokenizer
+  ``decode`` per evaluated state.
 """
 from __future__ import annotations
 
@@ -94,7 +95,7 @@ class CallableReward:
 
 
 # ===========================================================================
-# pushT pixel reward — red T "centered and straight"
+# pushT pixel reward — red T "centered"
 # ===========================================================================
 
 def _red_mask(hsv, s_min, v_min, hue_lo, hue_hi):
@@ -103,63 +104,42 @@ def _red_mask(hsv, s_min, v_min, hue_lo, hue_hi):
     lo2 = np.array([hue_hi, s_min, v_min], np.uint8); hi2 = np.array([180, 255, 255], np.uint8)
     return cv2.inRange(hsv, lo1, hi1) | cv2.inRange(hsv, lo2, hi2)
 
+def score_loc(
+        loc_xy: Tuple[float, float],  # normalized image coords
+        *,
+        center_xy: Tuple[float, float] = (0.5, 0.5),   # target, normalized image coords
+        sigma: float = 0.25
+) -> float:
+    """Score how well a normalized image location is *centered* in the image.
 
-def _lr_symmetry(comp: np.ndarray) -> float:
-    """IoU of the mask with its reflection about its own vertical centroid line.
-
-    A robust, shape-aware "is it vertically aligned?" measure. A T (or any shape)
-    that is upright is left-right symmetric → IoU near 1; tilting breaks the
-    symmetry → IoU drops. Unlike principal-axis / moment orientation, this does
-    NOT rely on the shape being anisotropic — crucial for a T, whose second-order
-    axes are near-degenerate (stem length ≈ crossbar width), so its moment angle
-    is unstable and useless for orientation."""
-    ys, xs = np.nonzero(comp)
-    if len(xs) == 0:
-        return 0.0
-    cx = int(round(xs.mean())); W = comp.shape[1]
-    nx = 2 * cx - xs
-    ok = (nx >= 0) & (nx < W)
-    refl = np.zeros_like(comp)
-    refl[ys[ok], nx[ok]] = 1
-    inter = int((comp & refl).sum())
-    union = int((comp | refl).sum())
-    return inter / max(union, 1)
-
+    Returns a score in [0, 1], where 1 is at the target and 0 is far away.
+    """
+    d = float(np.hypot(loc_xy[0] - center_xy[0], loc_xy[1] - center_xy[1]))
+    return float(np.exp(-0.5 * (d / sigma) ** 2))
 
 def score_t_centered(
     rgb: np.ndarray,                       # (H, W, 3) uint8 RGB
     *,
     center_xy: Tuple[float, float] = (0.5, 0.5),   # target, normalized image coords
     sigma: float = 0.25,                   # center-Gaussian width (normalized)
-    w_center: float = 0.6,
-    w_orient: float = 0.4,
     s_min: int = 90, v_min: int = 60,      # red HSV gates
     hue_lo: int = 12, hue_hi: int = 168,
     min_area_frac: float = 0.0015,         # reject specks / "T vanished"
-    orient_method: str = "vertical",       # "vertical" (robust) | "axis" | "match"
-    target_angle_deg: Optional[float] = 90,  # for "match": canonical angle
-    sym_lo: float = 0.35, sym_hi: float = 0.72,  # "vertical" LR-sym -> [0,1] gates
     floor: float = 0.0,
     open_ksize: int = 3,
 ) -> Tuple[float, dict]:
-    """Score how well the red **T** is *centered and straight* in one frame.
+    """Score how well the red **T** is *centered* in one frame.
 
-    Segment the red T (largest red connected component), then combine:
+    Segment the red T (largest red connected component), then score purely by how
+    close its centroid is to ``center_xy``::
 
-    * **center** = ``exp(-½ (d/σ)²)`` with ``d`` the normalized distance from the
-      T centroid to ``center_xy`` (1 at the target, →0 far away);
-    * **orient** — how "straight" the T is, via ``orient_method``:
-        - ``"vertical"`` (**default; recommended for a T**): left-right
-          reflection symmetry (:func:`_lr_symmetry`) gated ``[sym_lo,sym_hi]→
-          [0,1]``. Robust — a T's moment axis is near-degenerate and unstable,
-          but its mirror symmetry is a reliable "upright?" signal.
-        - ``"axis"``: ``|cos 2θ|`` from image moments (1 = axis-aligned, 0 at
-          45°). **Unreliable for a near-isotropic T**; fine for elongated shapes.
-        - ``"match"``: ``½(1+cos 2(θ-θ*))`` toward ``target_angle_deg``.
+        score = exp(-½ (d/σ)²),   d = normalized distance from centroid to target
 
-    Returns ``(score, debug)``; ``score = w_center·center + w_orient·orient`` in
-    ``[floor, w_center+w_orient]``, or ``floor`` if no T is found. ``debug`` holds
-    the mask / centroid / angle / lr_sym for :func:`annotate_t`.
+    (1 at the target, →0 far away). Orientation / uprightness is intentionally
+    ignored — we only care that the T is centered.
+
+    Returns ``(score, debug)``; ``score`` in ``[floor, 1]``, or ``floor`` if no T
+    is found. ``debug`` holds the mask / centroid for :func:`annotate_t`.
     """
     if cv2 is None:
         raise ImportError("score_t_centered needs opencv-python (cv2).")
@@ -170,7 +150,7 @@ def score_t_centered(
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                                 np.ones((open_ksize, open_ksize), np.uint8))
     n, lab, stats, cent = cv2.connectedComponentsWithStats(mask)
-    dbg = dict(found=False, score=floor, center=0.0, orient=0.0, area=0)
+    dbg = dict(found=False, score=floor, center=0.0, area=0)
     if n <= 1:
         return floor, dbg
     i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
@@ -179,32 +159,20 @@ def score_t_centered(
         return floor, {**dbg, "area": area}
 
     cx, cy = float(cent[i][0]), float(cent[i][1])
-    d = float(np.hypot(cx / W - center_xy[0], cy / H - center_xy[1]))
-    center = float(np.exp(-0.5 * (d / sigma) ** 2))
+    # d = float(np.hypot(cx / W - center_xy[0], cy / H - center_xy[1]))
+    # center = float(np.exp(-0.5 * (d / sigma) ** 2))
+    center = score_loc((cx / W, cy / H), center_xy=center_xy, sigma=sigma)
 
     comp = (lab == i).astype(np.uint8)
-    mu = cv2.moments(comp, binaryImage=True)
-    theta = 0.5 * np.arctan2(2 * mu["mu11"], (mu["mu20"] - mu["mu02"]) + 1e-9)
-    lr = _lr_symmetry(comp)
-    if orient_method == "vertical":
-        orient = float(np.clip((lr - sym_lo) / (sym_hi - sym_lo + 1e-9), 0.0, 1.0))
-    elif orient_method == "match" and target_angle_deg is not None:
-        ta = np.radians(target_angle_deg)
-        orient = float(0.5 * (1 + np.cos(2 * (theta - ta))))
-    else:  # "axis"
-        orient = float(abs(np.cos(2 * theta)))
-
-    score = w_center * center + w_orient * orient
-    dbg = dict(found=True, score=float(score), center=center, orient=orient,
-               area=area, centroid=(cx, cy), angle_deg=float(np.degrees(theta)),
-               lr_sym=float(lr), mask=comp)
+    score = center
+    dbg = dict(found=True, score=float(score), center=center,
+               area=area, centroid=(cx, cy), mask=comp)
     return float(score), dbg
-
 
 def annotate_t(rgb: np.ndarray, debug: dict) -> np.ndarray:
     """Overlay the reward's view onto ``rgb`` (RGB uint8): image-center cross,
-    T contour, centroid, principal axis, and the scalar score. For eyeballing
-    what the reward sees. Returns a new RGB uint8 image."""
+    T contour, centroid, and the scalar score. For eyeballing what the reward
+    sees. Returns a new RGB uint8 image."""
     if cv2 is None:
         raise ImportError("annotate_t needs opencv-python (cv2).")
     out = np.ascontiguousarray(rgb.copy())
@@ -212,13 +180,8 @@ def annotate_t(rgb: np.ndarray, debug: dict) -> np.ndarray:
     cv2.drawMarker(out, (W // 2, H // 2), (0, 255, 0), cv2.MARKER_CROSS, 14, 1)
     if debug.get("found"):
         cx, cy = debug["centroid"]
-        th = np.radians(debug["angle_deg"])
         cnts, _ = cv2.findContours(debug["mask"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(out, cnts, -1, (255, 255, 0), 1)
-        L = 0.28 * max(H, W)
-        p1 = (int(cx - L * np.cos(th)), int(cy - L * np.sin(th)))
-        p2 = (int(cx + L * np.cos(th)), int(cy + L * np.sin(th)))
-        cv2.line(out, p1, p2, (255, 0, 255), 1)
         cv2.circle(out, (int(cx), int(cy)), 3, (255, 255, 255), -1)
     cv2.putText(out, f"{debug.get('score', 0.0):.2f}", (4, H - 6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
@@ -226,15 +189,15 @@ def annotate_t(rgb: np.ndarray, debug: dict) -> np.ndarray:
 
 
 class TCenterReward:
-    """Reward the red pushT **T** being *centered and straight* (pixel space).
+    """Reward the red pushT **T** being *centered* (pixel space).
 
     Plugs into the planner's reward contract: ``__call__(z) -> r`` over latent
     states ``(..., N_lat, D_lat)``. It **decodes** each latent to an image and
     scores it with :func:`score_t_centered`. Pass either a ``decode_fn``
     (``lat (M,1,N,D) -> img (M,1,3,H,W) in [0,1]``) or a ``tokenizer`` (its
     ``decode`` is used under bf16 autocast). Extra keyword args are forwarded to
-    :func:`score_t_centered` (``center_xy``, ``sigma``, ``w_center``,
-    ``w_orient``, ``target_angle_deg``, ...).
+    :func:`score_t_centered` (``center_xy``, ``sigma``, ``s_min``, ``v_min``,
+    ``min_area_frac``, ...).
 
     Note: one tokenizer ``decode`` per evaluated state — the dominant planning
     cost. Keep the tree modest, or evaluate fewer frames.

@@ -1,45 +1,34 @@
-"""EasyMCTS — a faithful re-implementation of the WorldPlanner MCTS planner.
+"""EasyMCTS - re-implementation of the WorldPlanner MCTS planner.
 
-Reference: Khorrambakht, Ortiz-Haro et al., *WorldPlanner: Monte Carlo Tree
-Search and MPC with Action-Conditioned Visual World Models* (2025), Alg. 1.
+Reference: Khorrambakht, Ortiz-Haro et al., *WorldPlanner* (2025).
 
-This is the **classic UCT** formulation (as opposed to the progressive-widening
-/ AlphaZero variant in :mod:`mcts`). Nodes are states; edges are short rollouts
-from the prior policy ``pi_prior``; the world model provides the transition. The
-four textbook steps per iteration:
+Nodes are states; edges are short rollouts from the prior policy ``pi_prior`` 
+derived from UWT formulation;  the world model provides the transition. 
+The four textbook steps per iteration:
 
-1. **Selection** — from the root, descend by picking the child with the largest
-   UCB1 score (Eq. 4)::
+1. **Selection** - from the root, descend by picking the child with the largest
+   UCB1 score::
 
        UCB1(child) = V_total(child) / n(child)
                      + c * sqrt( ln n(parent) / n(child) )
 
    until a leaf (an un-expanded node) is reached.
-2. **Expansion** — if that leaf has already been simulated once
+2. **Expansion** - if that leaf has already been simulated once
    (``n_visit > 0``), sample a *fixed* ``branching`` number of short action
    rollouts from ``pi_prior`` and roll them out through the world model, in
    parallel; the last state of each becomes a child. Descend to the first new
    child.
-3. **Simulation** — from the current node, run ``sim_rollouts`` (``M_sim``)
+3. **Simulation** - from the current node, run ``sim_rollouts`` (``M_sim``)
    rollouts of the prior policy for ``sim_horizon`` (``H_sim``) steps and score
-   them with the *best cumulative reward over any rollout and any prefix*
-   (Eq. 5)::
+   them with the *best cumulative reward over any rollout and any prefix*::
 
        R = max_{k in rollouts, T in 0..H_sim}  sum_{t=0}^{T} gamma^t r(s_t^k)
 
-4. **Backpropagation** — add ``R`` to ``V_total`` and increment ``n_visit`` for
+4. **Backpropagation** - add ``R`` to ``V_total`` and increment ``n_visit`` for
    every node on the path from the simulated node back to the root.
 
 After ``n_iterations`` the plan is the path from the root to the node with the
 highest **average** value among nodes visited more than ``n_min`` times.
-
-Differences from :mod:`mcts` (kept deliberately, to match the paper):
-
-* fixed branching factor (expand all children at once) vs. progressive widening;
-* UCT1 ``sqrt(ln N / n)`` exploration vs. AlphaZero ``sqrt(N)/(1+n)``;
-* value = best-cumulative simulation score (Eq. 5) vs. discounted edge return;
-* **raw** (un-normalized) UCB, as written in the paper — so the exploration
-  constant ``c`` must be tuned to the reward scale.
 
 The planner can emit a structured **trace** (``trace=True``) that records every
 selection / expansion / simulation / backpropagation event, consumed by the
@@ -69,21 +58,21 @@ class EasyPlanConfig:
     horizon: int = 3              # H: frames per expansion rollout (edge length)
     branching: int = 3            # B: children created per expansion (parallel rollouts)
     edge_mode: str = "imagine"    # "imagine" (joint) or "two_stage" (policy -> world model)
-    # --- simulation (Eq. 5) ---
+    # --- simulation ---
     sim_horizon: int = 8          # H_sim: frames per simulation rollout
     sim_rollouts: int = 4         # M_sim: parallel simulation rollouts
     # --- search ---
     n_iterations: int = 48        # tree-building iterations
     c_ucb: float = 1.0            # UCT exploration constant
-    gamma: float = 1.0            # per-frame discount (1.0 == paper's undiscounted Eq. 5)
+    gamma: float = 1.0            # per-frame discount (1.0 == undiscounted)
     n_min: int = 1                # min visits for a node to be a valid solution
     max_depth: int = 4            # cap on tree depth
     # --- rollout / bookkeeping ---
-    K_steps: int = 6
-    ctx_noise: float = 0.5        # diversity so pi_prior branches (see policy study)
-    ctx_noise_honest: bool = True
-    action_temp: float = 1.0
-    max_ctx: int = 16
+    K_steps: int = 6              # number of denoiser steps per rollout 
+    ctx_noise: float = 0.5        # diversity so pi_prior branches 
+    ctx_noise_honest: bool = True # False -> lie to the denoiser about the context noise
+    action_temp: float = 1.0      # temperature for sampling actions from pi_prior
+    max_ctx: int = 16             # max context length (frames) to keep in the tree
     dtype: Optional[torch.dtype] = torch.bfloat16
 
 
@@ -95,16 +84,16 @@ class EasyPlanConfig:
 class EasyNode:
     ctx_z: torch.Tensor           # (1, Tc, N_lat, D_lat) conditioning context
     ctx_a: torch.Tensor           # (1, Tc, n_act)
-    depth: int
-    id: int
-    parent: Optional["EasyNode"] = None
+    depth: int                    # depth in the tree (root=0)
+    id: int                       # unique node id (for tracing / debugging)
+    parent: Optional["EasyNode"] = None     # parent node (None for root)
     edge_a: Optional[torch.Tensor] = None   # (H, n_act) rollout that reached this node
     edge_z: Optional[torch.Tensor] = None   # (H, N_lat, D_lat)
-    edge_val: float = 0.0                    # terminal reward of the reaching edge (diagnostic)
-    n_visit: int = 0
-    V_total: float = 0.0
-    children: List["EasyNode"] = field(default_factory=list)
-    expanded: bool = False
+    edge_val: float = 0.0                   # terminal reward of the reaching edge (diagnostic)
+    n_visit: int = 0              # number of times this node has been visited
+    V_total: float = 0.0          # total value accumulated from simulations
+    children: List["EasyNode"] = field(default_factory=list)  # child nodes
+    expanded: bool = False        # True if children have been created
 
     @property
     def value(self) -> float:
@@ -126,7 +115,7 @@ class EasyNode:
 # ---------------------------------------------------------------------------
 
 class EasyMCTS:
-    """WorldPlanner-style UCT planner. See module docstring."""
+    """WorldPlanner-style planner. See module docstring."""
 
     def __init__(
         self,
@@ -286,7 +275,7 @@ class EasyMCTS:
         """
         m = self.cfg.max_ctx
         self.root = self._new_node(ctx_z[:, -m:].clone(), ctx_a[:, -m:].clone(), depth=0)
-        self._expand(self.root)                      # "Expand v0" (Alg. 1 init)
+        self._expand(self.root)
         if self.tracing:
             self._log(type="root", node=self.root.id)
         for i in range(self.cfg.n_iterations):
