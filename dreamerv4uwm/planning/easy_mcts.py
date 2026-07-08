@@ -225,7 +225,7 @@ class EasyMCTS:
             self._log(type="expand", node=node.id,
                       children=[ch.id for ch in node.children])
 
-    # ---- 3. simulation (Eq. 5) ---------------------------------------------
+    # ---- 3. simulation ---------------------------------------------
     def _simulate(self, node: EasyNode) -> float:
         c = self.cfg
         z, _ = self._sample_edges(node, c.sim_rollouts, c.sim_horizon)   # (M,Hsim,N,D)
