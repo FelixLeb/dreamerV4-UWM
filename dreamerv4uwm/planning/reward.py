@@ -26,21 +26,70 @@ Two families here:
   ignored). Much more informative than latent L2; the price is a tokenizer
   ``decode`` per evaluated state.
 """
+
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Protocol, Tuple, runtime_checkable
 
 import numpy as np
 import torch
+import cv2
 
-try:
-    import cv2
-except ImportError:  # pragma: no cover
-    cv2 = None
+
+# ===========================================================================
+# Template Reward Model
+# ===========================================================================
+
+@runtime_checkable
+class RewardModel(Protocol):
+    """The contract a reward must satisfy to plug into the planner.
+
+    A reward maps a batch of latent **states** to scalar rewards: it reduces the
+    two trailing latent dims and preserves every leading (batch / time) dim::
+
+        reward(z) -> r      z: (..., N_lat, D_lat)  ->  r: (...)
+
+    Requirements on the output ``r``:
+      * a **float** ``torch.Tensor`` of shape exactly ``z.shape[:-2]``;
+      * on ``z.device`` (the search builds a discount tensor on ``r.device``
+        and multiplies element-wise).
+
+    The planner evaluates it on ``(B, 1, N, D)`` terminal states (expansion) and
+    on ``(M, H, N, D)`` rollouts (simulation), so it must accept arbitrary
+    leading dims. Reward *scale* is free — the search only compares and
+    accumulates rewards — but keeping it roughly O(1) per frame keeps the UCB
+    exploration constant ``c_ucb`` meaningful.
+
+    This is a structural ``Protocol``: any object with a matching ``__call__``
+    plugs in (a plain function via :class:`CallableReward`, an ``nn.Module``, a
+    decode-then-score object like :class:`TCenterReward`, ...). It exists to
+    document the contract and to allow ``isinstance(obj, RewardModel)`` checks.
+    """
+
+    def __call__(self, z: torch.Tensor) -> torch.Tensor: ...
+
+
+# ===========================================================================
+# Callable Reward
+# ===========================================================================
 
 RewardFn = Callable[[torch.Tensor], torch.Tensor]
 
+class CallableReward:
+    """Adapt a plain ``z -> r`` callable (e.g. a decoded-pixel scorer) to the
+    reward contract, so arbitrary user functions drop into the planner."""
+
+    def __init__(self, fn: RewardFn):
+        self.fn = fn
+
+    def __call__(self, z: torch.Tensor) -> torch.Tensor:
+        return self.fn(z)
+
+
+# ===========================================================================
+# Zero Reward
+# ===========================================================================
 
 class ZeroReward:
     """Reward ≡ 0. Use for pure world-model exploration / debugging the search."""
@@ -48,6 +97,10 @@ class ZeroReward:
     def __call__(self, z: torch.Tensor) -> torch.Tensor:
         return z.new_zeros(z.shape[:-2])
 
+
+# ===========================================================================
+# Goal Latent Reward
+# ===========================================================================
 
 class GoalLatentReward:
     """Negative distance from each state's latent to a fixed **goal latent**.
@@ -83,19 +136,8 @@ class GoalLatentReward:
         return -dist / self.scale
 
 
-class CallableReward:
-    """Adapt a plain ``z -> r`` callable (e.g. a decoded-pixel scorer) to the
-    reward contract, so arbitrary user functions drop into the planner."""
-
-    def __init__(self, fn: RewardFn):
-        self.fn = fn
-
-    def __call__(self, z: torch.Tensor) -> torch.Tensor:
-        return self.fn(z)
-
-
 # ===========================================================================
-# pushT pixel reward — red T "centered"
+# pushT pixel reward - red T "centered"
 # ===========================================================================
 
 def _red_mask(hsv, s_min, v_min, hue_lo, hue_hi):
