@@ -9,15 +9,14 @@ clean — into the three operating points a planner needs:
 * :func:`transition` — world-model step. Horizon **action** given & held clean,
   horizon **state** integrated. ``s, a -> s'``.
 * :func:`imagine`    — **joint** short rollout ``(a, o') ~ p(. | o_{<=t})``: both
-  action and state integrated together. This is the MCTS *edge generator*
-  (``pi_prior``): one denoiser pass per Euler step yields a full action+state
-  rollout.
+  action and state integrated together. This is the MCTS *edge generator*: one 
+  denoiser pass per Euler step yields a full action+state rollout.
 
 All three share the same diversity knobs, which is the whole point of keeping
 them in one place — the policy-diversity experiments and the planner pull the
 same levers:
 
-* ``ctx_noise`` ∈ [0, 1] — noise level mixed into the **observation** context
+* ``ctx_noise`` in [0, 1] — noise level mixed into the **observation** context
   (``o <- (1-tau)*eps + tau*o``, ``tau = 1 - ctx_noise``). 0 = clean.
 * ``ctx_noise_honest`` — if True, the context's ``sigma_idx`` is set to the
   *true* (noised) cleanness so the model knows the state is uncertain (a

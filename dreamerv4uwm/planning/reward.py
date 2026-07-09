@@ -1,10 +1,4 @@
-"""Basic, pluggable reward functions for planning.
-
-The current checkpoint has **no learned reward head** (``train_reward_model=
-False``), and a reward model is *not* the focus of the project right now — so
-these are deliberately simple, hand-specified scorers over tokenizer latents.
-Swap in a learned head later by writing any object with the same call
-signature.
+"""Reward Models for Planning with MCTS
 
 Contract
 --------
@@ -16,10 +10,10 @@ i.e. it reduces the two trailing latent dims and preserves all leading (batch /
 time) dims. The planner calls it on imagined horizon states ``(B, H, N_lat,
 D_lat)`` and gets per-frame rewards ``(B, H)``.
 
-Two families here:
+Two families here (for now):
 
 * **Latent** rewards (``GoalLatentReward``) — cheap, but latent L2 to a goal is a
-  weak, uninformative signal (planning barely beats random with it).
+  weak, uninformative signal (using DINO encoder would certainly be better).
 * **Pixel / task** rewards (``TCenterReward``) — decode the latent to an image
   and score the *task* directly. For the real-robot pushT scene this segments
   the red **T** and rewards it being **centered** (orientation is intentionally
@@ -92,7 +86,8 @@ class CallableReward:
 # ===========================================================================
 
 class ZeroReward:
-    """Reward ≡ 0. Use for pure world-model exploration / debugging the search."""
+    """Reward is the null function. 
+    Use for pure world-model exploration / debugging the search."""
 
     def __call__(self, z: torch.Tensor) -> torch.Tensor:
         return z.new_zeros(z.shape[:-2])
@@ -175,9 +170,9 @@ def score_t_centered(
     Segment the red T (largest red connected component), then score purely by how
     close its centroid is to ``center_xy``::
 
-        score = exp(-½ (d/σ)²),   d = normalized distance from centroid to target
+        score = exp(-(1/2) (d/sigma)²),   d = normalized distance from centroid to target
 
-    (1 at the target, →0 far away). Orientation / uprightness is intentionally
+    (1 at the target, 0 far away). Orientation / uprightness is intentionally
     ignored — we only care that the T is centered.
 
     Returns ``(score, debug)``; ``score`` in ``[floor, 1]``, or ``floor`` if no T

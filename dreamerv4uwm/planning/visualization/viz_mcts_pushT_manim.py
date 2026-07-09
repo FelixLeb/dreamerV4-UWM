@@ -1,6 +1,6 @@
 """Simple, teachable manimgl visualization of MCTS on pushT.
 
-Replays a trace from ``make_mcts_trace_pushT_v2.py`` and shows *only* what you
+Replays a trace from ``make_mcts_trace_pushT.py`` and shows *only* what you
 need to understand the algorithm:
 
   * the search tree growing — every node is a decoded world-model **state**,

@@ -1,5 +1,5 @@
 """Generate replayable MCTS traces for the **branchable vs collapsed** pushT
-contrast (notebook ``planning-mcts-experiments_v3_clean.ipynb``, Part IV).
+contrast (notebook ``planning-mcts-experiments.ipynb``, Part IV).
 
 Both regimes run the *same* WorldPlanner UCT search, from the *same* pushT start
 context, with the *same* branching / iteration budget. Only two knobs differ:
@@ -27,7 +27,7 @@ Output (next to this file):
     frames_<regime>/edge_<id>.png            # decoded rollout filmstrip per edge
     frames_<regime>/{start,best}.png
 
-Run (conda env with the model deps):  python make_mcts_trace_pushT_v2.py
+Run (conda env with the model deps):  python make_mcts_trace_pushT.py
 """
 import json
 import math
