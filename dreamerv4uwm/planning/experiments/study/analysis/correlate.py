@@ -58,6 +58,9 @@ def partial_spearman(df, x, y, controls) -> float:
     if not controls:
         return float(stats.pearsonr(rx, ry)[0])
     Z = R[controls].to_numpy(float)
+    Z = Z[:, Z.std(0) > 0]                       # drop constant controls (unswept factors in OFAT)
+    if Z.shape[1] == 0:
+        return float(stats.pearsonr(rx, ry)[0])
     if np.linalg.matrix_rank(np.column_stack([np.ones(len(d)), Z])) < Z.shape[1] + 1:
         return np.nan
     ex, ey = _residualize(rx, Z), _residualize(ry, Z)
