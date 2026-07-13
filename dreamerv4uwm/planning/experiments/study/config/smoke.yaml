@@ -1,0 +1,46 @@
+# Tiny local smoke: 3 configs x 2 inits = 6 fast trees. Verifies the sweep + CSV end to end.
+output_dir: /tmp/mcts_sweep_smoke
+seed: 0
+n_inits: 2
+Tc: 4
+n_random: 6
+
+model:
+  dynamics_ckpt: /home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/blockcausal/pushT-post-train/97500.pt
+  tokenizer_ckpt: /home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/tokenizer/pushT.pt
+  config_name: dynamics/pushT-large
+  overrides: [denoiser.horizon_aware=false]
+
+data:
+  data_dir: /home/mim-server/datasets/pushT/h5/play
+  window_size: 64
+
+reward:
+  center_xy: [0.5, 0.5]
+  sigma: 0.25
+
+descriptor:
+  dup_eps: 0.05
+
+base_plan:
+  horizon: 6
+  branching: 3
+  edge_mode: imagine
+  sim_horizon: 8
+  sim_rollouts: 2
+  n_iterations: 6
+  c_ucb: 0.5
+  gamma: 0.98
+  n_min: 0
+  max_depth: 2
+  K_steps: 6
+  ctx_noise: 0.5
+  ctx_noise_honest: true
+  action_temp: 1.0
+  max_ctx: 16
+
+sweep:
+  ofat:
+    ctx_noise: [0.0, 0.7]     # base(0.5) + 2 perturbations = 3 configs
+  random:
+    n_samples: 0

@@ -266,4 +266,7 @@ dependencies:
       - zerorpc==0.6.3
       - zope-event==6.1
       - zope-interface==8.1.1
+      - pandas==3.0.3
+      - scikit-learn==1.9.0
+      - pyarrow==25.0.0
 prefix: /home/mim-server/miniconda3/envs/dreamerv4uwm
