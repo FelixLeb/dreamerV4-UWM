@@ -11,7 +11,7 @@ per tree, and writes CSV shards for analysis. Metrics/rationale: [`../../mcts_pl
 | `data.py` | sample reproducible initial contexts from real PushT shards |
 | `descriptors.py` | `StateDescriptor` — T-pose (PushT) + env-agnostic fallbacks |
 | `metrics.py` | `compute_tree_metrics` → ~47 tree metrics (families A–E + tree-internal F) |
-| `baselines.py` | in-model outcomes `g_rand`, `g_policy` |
+| `baselines.py` | in-model outcomes `g_shootN`, `g_1shot` |
 | `run_tree.py` | `run_one_tree` → one flat CSV row |
 | `run_sweep.py` | expand grid → job list → CSV shard (array-sliced, resumable) |
 | `curate.py` | descriptor-assisted proposer → diverse curated init set (YAML + contact sheet) |
@@ -73,7 +73,7 @@ accordingly. Rough plan-doc estimate: Tier-1 OFAT (~30 cfg × 20 init ≈ 600 tr
 
 ## Output
 `shard_<task>.csv`, one row per tree: `config_id, config_tag, window_idx, t0, init_id`, all
-`PlanConfig` factors, timing, outcome (`tree_peak, g_rand, g_policy, delta_over_root, …`), and every
+`PlanConfig` factors, timing, outcome (`tree_peak, g_shootN, g_1shot, delta_over_root, …`), and every
 tree metric. Concatenate shards for analysis.
 
 ## Analyse (after the sweep)
@@ -83,7 +83,7 @@ $PY -m dreamerv4uwm.planning.experiments.study.analysis.report \
 ```
 Produces `trees_all.parquet`, correlation tables (`metric_outcome.csv`, `factor_outcome.csv`,
 `importance_*.csv`), `figures/` (response curves, correlation heatmap, mechanism scatter, per-link
-importance bars), and `REPORT.md` (ranked early-warning metrics for `g_policy`/`g_rand`). The
+importance bars), and `REPORT.md` (ranked early-warning metrics for `g_1shot`/`g_shootN`). The
 `analysis/` modules also run standalone (`aggregate`, `correlate`, `plots`).
 
 ## Status / next

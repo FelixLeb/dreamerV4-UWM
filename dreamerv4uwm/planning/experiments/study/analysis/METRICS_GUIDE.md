@@ -16,7 +16,7 @@ Every row of `trees_all.parquet` / `shard_*.csv` is **one MCTS tree**. Its colum
 - **Process metrics** — properties measured *on the finished tree*: diversity, value spread, how
   visits were allocated, tree shape. These are the *candidate predictors* — cheap signals you could
   read online to tell if a tree is planning well.
-- **Outcomes** — did planning actually help (`g_policy`, `g_rand`, …). The *dependent* variables.
+- **Outcomes** — did planning actually help (`g_1shot`, `g_shootN`, …). The *dependent* variables.
 
 The analysis asks: **which process metrics (and which knobs) predict good outcomes?**
 
@@ -50,16 +50,16 @@ baselines* at equal budget. All computed in `run_tree.py` / `baselines.py`.
 |---|---|---|
 | `tree_peak` | best single-frame reward over the frames of the **returned plan** | how good a state the plan reaches |
 | `root_reward` | reward of the **start** state (last context frame) | the starting point |
-| `rand_peak` | best reward over `n_random` **undirected** rollouts (same length/budget) | what blind sampling gets |
-| `policy_peak` | best reward over **one** policy-prior rollout, no search | what the raw policy gets |
-| **`g_rand`** | `tree_peak − rand_peak` | **did the *search* beat undirected sampling?** >0 = yes |
-| **`g_policy`** | `tree_peak − policy_peak` | **did planning beat the policy alone?** the headline outcome |
+| `shootN_peak` | best reward over `n_random` **undirected** rollouts (same length/budget) | what blind sampling gets |
+| `oneshot_peak` | best reward over **one** policy-prior rollout, no search | what the raw policy gets |
+| **`g_shootN`** | `tree_peak − shootN_peak` | **did the *search* beat undirected sampling?** >0 = yes |
+| **`g_1shot`** | `tree_peak − oneshot_peak` | **did planning beat the policy alone?** the headline outcome |
 | `delta_over_root` | `tree_peak − root_reward` | did the plan improve on the start at all? |
-| `success_policy` | `1 if g_policy > 0` | binary success label (derived) |
+| `success_1shot` | `1 if g_1shot > 0` | binary success label (derived) |
 | `success_peak` | `1 if tree_peak ≥ 0.7` | reached a well-centred T (derived) |
 
-**`g_policy` is the main target.** `g_policy ≤ 0` is the precise statement of "planning did nothing the
-policy couldn't do alone." `g_rand ≤ 0` is stronger: the search didn't even beat random — the classic
+**`g_1shot` is the main target.** `g_1shot ≤ 0` is the precise statement of "planning did nothing the
+policy couldn't do alone." `g_shootN ≤ 0` is stronger: the search didn't even beat random — the classic
 sign of *incoherent* edges (diverse but useless).
 
 ---
@@ -163,7 +163,7 @@ K_steps, ctx_noise, ctx_noise_honest, action_temp, max_ctx`.
 
 ## 7. How to read `REPORT.md`
 
-- **Dataset block** — sanity: `rows / configs / inits`, the overall `success_policy rate`, columns that
+- **Dataset block** — sanity: `rows / configs / inits`, the overall `success_1shot rate`, columns that
   are heavily NaN (a metric undefined for many trees), `degenerate trees` (n_nodes ≤ B+1), and how many
   metrics are actually usable (constant ones are dropped).
 - **"Which knobs move the outcome"** — the `factor_outcome` table: Spearman + MI of each **knob** vs the
@@ -182,17 +182,17 @@ K_steps, ctx_noise, ctx_noise_honest, action_temp, max_ctx`.
 - **`response_<factor>.png`** (e.g. `response_ctx_noise.png`) — a grid of panels, each a metric's
   **mean ± SEM vs the swept factor**. Read the *shape* of each curve:
   - *monotone* (e.g. `bci` ↓ as `ctx_noise` ↑) = a clean lever;
-  - *inverted-U* (e.g. `g_policy` peaks at 0.7) = a sweet spot — this is where non-monotone effects that
+  - *inverted-U* (e.g. `g_1shot` peaks at 0.7) = a sweet spot — this is where non-monotone effects that
     correlations miss become visible;
-  - *cliff* (e.g. `g_rand` crashing at 0.9) = a regime boundary.
+  - *cliff* (e.g. `g_shootN` crashing at 0.9) = a regime boundary.
   This is the most information-dense figure for OFAT.
 - **`corr_heatmap.png`** — metric (rows) × outcome (cols) Spearman, **red = +, blue = −**, top metrics by
   \|corr\|. A quick visual of who predicts what and in which direction.
-- **`mechanism_scatter.png`** — one dot per tree: `x = outcome_div`, `y = val_std`, **colour = g_policy**.
+- **`mechanism_scatter.png`** — one dot per tree: `x = outcome_div`, `y = val_std`, **colour = g_1shot**.
   Look at *where the colours live*: failed-planning (dark) points clustering at low-x/low-y is the
   "collapse corner"; a mostly-vertical colour gradient means `val_std` predicts success more directly
   than diversity does.
-- **`importance_g_policy.png` / `importance_g_rand.png`** — horizontal bars of \|Spearman\| per metric,
+- **`importance_g_1shot.png` / `importance_g_shootN.png`** — horizontal bars of \|Spearman\| per metric,
   **coloured by causal link (L1–L5)**. Shows which *links* dominate the outcome (e.g. lots of L3/L4 bars
   ⇒ value-separation + selection are what matter).
 
@@ -209,7 +209,7 @@ K_steps, ctx_noise, ctx_noise_honest, action_temp, max_ctx`.
 | `commit_top1`, `subtree_size_gini` | high | low (uniform) |
 | `exploit_explore_ratio` | moderate | ≫1 (noise) or ≪1 (greedy) |
 | `mean_visited_depth` | grows with budget | pinned ~1 |
-| `g_policy`, `g_rand` | > 0 | ≤ 0 |
+| `g_1shot`, `g_shootN` | > 0 | ≤ 0 |
 
 ---
 
@@ -217,7 +217,7 @@ K_steps, ctx_noise, ctx_noise_honest, action_temp, max_ctx`.
 
 1. **OFAT dilutes pooled factor correlations.** A knob varied in only a few configs sits at baseline in
    most rows → weak pooled ρ even for a real effect. Use response curves / per-factor slices.
-2. **Non-monotone effects hide from Spearman.** `ctx_noise` has an inverted-U on `g_policy`; its ρ≈0 but
+2. **Non-monotone effects hide from Spearman.** `ctx_noise` has an inverted-U on `g_1shot`; its ρ≈0 but
    the *curve* and MI reveal it. Always cross-check MI and the response figure.
 3. **Cumsum value scale.** `val_std`/`Q` grow with `sim_horizon`; they mean "discrimination" only at
    fixed scale. Across `sim_horizon`, higher `val_std` can coincide with *worse* outcomes.

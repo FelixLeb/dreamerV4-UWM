@@ -19,10 +19,10 @@ FACTORS = ["ctx_noise", "horizon", "sim_horizon", "branching", "action_temp",
            "gamma", "max_ctx", "n_min", "ctx_noise_honest"]
 
 # dependent variables (did planning help?)
-OUTCOMES = ["g_rand", "g_policy", "delta_over_root", "tree_peak"]
+OUTCOMES = ["g_shootN", "g_1shot", "delta_over_root", "tree_peak"]
 
 # outcome intermediates that are not themselves predictors
-_OUTCOME_AUX = ["root_reward", "rand_peak", "policy_peak", "best_node_value",
+_OUTCOME_AUX = ["root_reward", "shootN_peak", "oneshot_peak", "best_node_value",
                 "best_edge_val_on_plan", "best_edge_val_tree"]
 
 # process metrics grouped by causal-chain link (plan §1). Only those present in the
@@ -48,12 +48,26 @@ LINKS = {
                      "root_value_stability"],
 }
 
+# legacy outcome column names (pre-rename runs) -> current names
+LEGACY_RENAME = {
+    "g_policy": "g_1shot", "g_rand": "g_shootN",
+    "policy_peak": "oneshot_peak", "rand_peak": "shootN_peak",
+    "success_policy": "success_1shot",
+}
+
+
+def apply_legacy_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename old outcome columns to current names (idempotent) so CSVs written
+    before the g_policy->g_1shot / g_rand->g_shootN rename still load."""
+    ren = {k: v for k, v in LEGACY_RENAME.items() if k in df.columns and v not in df.columns}
+    return df.rename(columns=ren) if ren else df
+
 
 def process_cols(df: pd.DataFrame) -> List[str]:
     """Numeric columns that are candidate predictors (metrics), i.e. not meta,
     factor, outcome, or outcome-aux."""
     excluded = set(META + FACTORS + OUTCOMES + _OUTCOME_AUX
-                   + ["success_policy", "success_peak", "n_forward"])
+                   + ["success_1shot", "success_peak", "n_forward"])
     out = []
     for c in df.columns:
         if c in excluded:

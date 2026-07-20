@@ -15,11 +15,12 @@ from . import schema
 
 def load_shards(input_dir: str, pattern: str = "shard_*.csv") -> pd.DataFrame:
     """Concatenate all shard CSVs, de-duplicate on (config_id, init_id), and add
-    derived outcome columns (``success_policy``, ``success_peak``)."""
+    derived outcome columns (``success_1shot``, ``success_peak``)."""
     files = sorted(glob.glob(str(Path(input_dir) / pattern)))
     if not files:
         raise FileNotFoundError(f"no shards matching {pattern} in {input_dir}")
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    df = schema.apply_legacy_names(df)   # upgrade pre-rename runs (g_policy->g_1shot, ...)
     df = df.drop_duplicates(subset=["config_id", "init_id"], keep="last").reset_index(drop=True)
     return derive_outcomes(df)
 
@@ -27,8 +28,8 @@ def load_shards(input_dir: str, pattern: str = "shard_*.csv") -> pd.DataFrame:
 def derive_outcomes(df: pd.DataFrame, peak_tau: float = 0.7) -> pd.DataFrame:
     """Binary success labels: planning beat the policy prior, and the plan reached a
     well-centred T."""
-    if "g_policy" in df:
-        df["success_policy"] = (df["g_policy"] > 0).astype(int)
+    if "g_1shot" in df:
+        df["success_1shot"] = (df["g_1shot"] > 0).astype(int)
     if "tree_peak" in df:
         df["success_peak"] = (df["tree_peak"] >= peak_tau).astype(int)
     return df
@@ -40,9 +41,9 @@ def sanity_report(df: pd.DataFrame) -> str:
     lines = []
     lines.append(f"rows={len(df)}  configs={df['config_id'].nunique()}  "
                  f"inits={df['init_id'].nunique()}  tags={df['config_tag'].nunique()}")
-    if "success_policy" in df:
-        lines.append(f"success_policy rate = {df['success_policy'].mean():.3f}   "
-                     f"(g_policy>0 on {int(df['success_policy'].sum())}/{len(df)})")
+    if "success_1shot" in df:
+        lines.append(f"success_1shot rate = {df['success_1shot'].mean():.3f}   "
+                     f"(g_1shot>0 on {int(df['success_1shot'].sum())}/{len(df)})")
     # NaN-heavy columns
     frac = df.isna().mean().sort_values(ascending=False)
     heavy = frac[frac > 0.2]

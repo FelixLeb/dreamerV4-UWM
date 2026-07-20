@@ -18,7 +18,7 @@ from .correlate import metric_outcome_table
 
 # metrics that tell the L1->L5 story, for the response-curve panel
 STORY = ["root_bci", "div_outcome_div_mean", "div_action_div_mean", "val_std",
-         "q_margin", "exploit_explore_ratio", "visit_entropy", "g_rand", "g_policy"]
+         "q_margin", "exploit_explore_ratio", "visit_entropy", "g_shootN", "g_1shot"]
 
 
 def _agg(df, factor, col):
@@ -77,7 +77,7 @@ def corr_heatmap(df, top=25, out=None):
     return _save(fig, out)
 
 
-def mechanism_scatter(df, x="div_outcome_div_mean", y="val_std", hue="g_policy", out=None):
+def mechanism_scatter(df, x="div_outcome_div_mean", y="val_std", hue="g_1shot", out=None):
     """Diversity -> value separation, coloured by outcome: the L2->L3->outcome chain."""
     for c in (x, y, hue):
         if c not in df.columns:
@@ -93,7 +93,7 @@ def mechanism_scatter(df, x="div_outcome_div_mean", y="val_std", hue="g_policy",
     return _save(fig, out)
 
 
-def link_importance_bars(df, outcome="g_policy", out=None):
+def link_importance_bars(df, outcome="g_1shot", out=None):
     """|Spearman| of each metric with outcome, coloured by causal-chain link."""
     tab = metric_outcome_table(df)
     tab = tab[tab.outcome == outcome].sort_values("abs_spearman", ascending=True)
@@ -126,8 +126,8 @@ def make_all(df, out_dir, factor="ctx_noise"):
     made.append(response_curves(df, factor=factor, out=od / f"response_{factor}.png"))
     made.append(corr_heatmap(df, out=od / "corr_heatmap.png"))
     made.append(mechanism_scatter(df, out=od / "mechanism_scatter.png"))
-    made.append(link_importance_bars(df, "g_policy", out=od / "importance_g_policy.png"))
-    made.append(link_importance_bars(df, "g_rand", out=od / "importance_g_rand.png"))
+    made.append(link_importance_bars(df, "g_1shot", out=od / "importance_g_1shot.png"))
+    made.append(link_importance_bars(df, "g_shootN", out=od / "importance_g_shootN.png"))
     return [m for m in made if m]
 
 

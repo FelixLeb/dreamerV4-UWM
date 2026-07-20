@@ -2,7 +2,7 @@
 
 ``compute_tree_metrics(planner, descriptor)`` returns a flat ``dict`` of scalars
 (one CSV row's worth) covering families A–E and the tree-internal part of F from
-``../mcts_study_plan.md``. Baselines (g_rand, g_policy) and the root reward live
+``../mcts_study_plan.md``. Baselines (g_shootN, g_1shot) and the root reward live
 in ``baselines.py`` / ``run_tree.py`` because they need the model; everything here
 is computed from the finished tree object (+ its ``trace`` for time-resolved
 metrics) and a pluggable ``StateDescriptor`` for diversity.

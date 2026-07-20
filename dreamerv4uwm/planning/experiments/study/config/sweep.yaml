@@ -3,7 +3,7 @@
 
 output_dir: ???            # REQUIRED, e.g. /scratch/<net_id>/mcts_sweep/run1
 seed: 0                    # (random mode only) seed for initial-context sampling
-n_random: 16              # baseline undirected rollouts for g_rand
+n_random: 16              # baseline undirected rollouts for g_shootN
 
 # initial contexts: a curated set (recommended) or random sampling
 inits:

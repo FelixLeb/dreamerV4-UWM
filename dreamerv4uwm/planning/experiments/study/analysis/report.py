@@ -27,14 +27,14 @@ def run(input_dir: str, out_dir: str) -> None:
 
     figs = plots.make_all(df, od / "figures")
 
-    head_pol = headline(tables, "g_policy")
-    head_rand = headline(tables, "g_rand")
+    head_pol = headline(tables, "g_1shot")
+    head_rand = headline(tables, "g_shootN")
     factors = factor_outcome_table(df)
 
     lines = ["# MCTS sweep analysis report\n",
              "## Dataset\n```\n" + report + "\n```\n",
              "## Which knobs move the outcome (factor vs outcome, Spearman)\n```",
-             factors[factors.outcome == "g_policy"].head(12).to_string(index=False),
+             factors[factors.outcome == "g_1shot"].head(12).to_string(index=False),
              "```\n",
              "## " + head_pol.splitlines()[0] + "\n```",
              "\n".join(head_pol.splitlines()[1:]), "```\n",

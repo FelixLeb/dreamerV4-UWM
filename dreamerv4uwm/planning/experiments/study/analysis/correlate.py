@@ -114,7 +114,7 @@ def factor_outcome_table(df, factors=None, outcomes=None) -> pd.DataFrame:
                                           ascending=[True, False]).reset_index(drop=True)
 
 
-def feature_importance(df, outcome="g_policy", metrics=None, n_estimators=300) -> pd.DataFrame:
+def feature_importance(df, outcome="g_1shot", metrics=None, n_estimators=300) -> pd.DataFrame:
     """GBR permutation importance + standardized OLS beta for `outcome`."""
     from sklearn.ensemble import GradientBoostingRegressor
     from sklearn.inspection import permutation_importance
@@ -144,7 +144,7 @@ def feature_importance(df, outcome="g_policy", metrics=None, n_estimators=300) -
     return tab.sort_values("gbr_importance", ascending=False).reset_index(drop=True)
 
 
-def per_regime(df, metric, outcome="g_policy", regime="c_ucb", n_bins=3) -> pd.DataFrame:
+def per_regime(df, metric, outcome="g_1shot", regime="c_ucb", n_bins=3) -> pd.DataFrame:
     """Spearman(metric, outcome) within bins of a regime column."""
     d = df.copy()
     if d[regime].nunique() <= n_bins:
@@ -166,12 +166,12 @@ def analyze(df) -> dict:
     return {
         "metric_outcome": metric_outcome_table(df),
         "factor_outcome": factor_outcome_table(df),
-        "importance_g_policy": feature_importance(df, "g_policy"),
-        "importance_g_rand": feature_importance(df, "g_rand"),
+        "importance_g_1shot": feature_importance(df, "g_1shot"),
+        "importance_g_shootN": feature_importance(df, "g_shootN"),
     }
 
 
-def headline(tables: dict, outcome="g_policy", k=12) -> str:
+def headline(tables: dict, outcome="g_1shot", k=12) -> str:
     mo = tables["metric_outcome"]
     top = mo[mo.outcome == outcome].head(k)
     lines = [f"Top {k} early-warning metrics for {outcome} (|Spearman|, MI, partial|factors):"]
@@ -190,7 +190,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     df = load_shards(args.input_dir)
     tables = analyze(df)
-    print(headline(tables, "g_policy"))
+    print(headline(tables, "g_1shot"))
     if args.out_dir:
         from pathlib import Path
         od = Path(args.out_dir); od.mkdir(parents=True, exist_ok=True)
