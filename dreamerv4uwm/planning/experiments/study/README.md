@@ -86,6 +86,11 @@ Produces `trees_all.parquet`, correlation tables (`metric_outcome.csv`, `factor_
 importance bars), and `REPORT.md` (ranked early-warning metrics for `g_1shot`/`g_shootN`). The
 `analysis/` modules also run standalone (`aggregate`, `correlate`, `plots`).
 
+For **interactive** exploration open [`analysis/explore_results.ipynb`](analysis/explore_results.ipynb):
+sanity report, per-knob OFAT tables + effect sizes, response curves, the ranked predictor table
+(rho / mutual-info / partial), the mechanism plots, and `curve(factor, metric)` /
+`corr(metric)` helpers to plot *any* metric against *any* knob. Point `RUN_DIR` at any run.
+
 ## Status / next
 Built & verified: **M0–M3, M5** (see plan §9). **M4** SLURM is a template pending cluster paths.
 Next: run the real sweep, then **M6** P1/P2 metrics (fidelity E1–E3 → unlocks the diversity×fidelity

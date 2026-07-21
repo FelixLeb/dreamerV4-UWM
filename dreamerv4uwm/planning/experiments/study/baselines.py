@@ -50,7 +50,8 @@ def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: floa
         action_temp=cfg.action_temp, dtype=cfg.dtype, gen=gen)
     return dict(
         root_reward=root_reward,
-        shootN_peak=shootN_peak, oneshot_peak=oneshot_peak,
+        shootN_peak=shootN_peak, 
+        oneshot_peak=oneshot_peak,
         g_shootN=tree_peak - shootN_peak,
         g_1shot=tree_peak - oneshot_peak,
         delta_over_root=tree_peak - root_reward,

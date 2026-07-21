@@ -20,6 +20,11 @@ Every row of `trees_all.parquet` / `shard_*.csv` is **one MCTS tree**. Its colum
 
 The analysis asks: **which process metrics (and which knobs) predict good outcomes?**
 
+> **Programmatic version:** `schema.data_dictionary(df)` returns this same reference as a
+> table (`column, kind, link, dtype, description`) for the columns actually present in a run,
+> built from `schema.DESCRIPTIONS`. It's rendered in `explore_results.ipynb` §1, and flags any
+> column that lacks a description — so the code and this document can't silently drift apart.
+
 Process metrics are organized by the **causal chain** (a break anywhere ⇒ "planning leads to nothing"):
 
 | Link | Question | Metric family |
