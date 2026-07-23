@@ -13,7 +13,11 @@ written against this interface, so a new environment/reward is a descriptor swap
 
 Implementations:
 * ``TPoseDescriptor``     — PushT / ``TCenterReward``: decode + segment the red T,
-  return normalised ``(cx, cy[, theta, sqrt_area])``. Reuses ``score_t_centered``.
+  return normalised ``(cx, cy[, theta, sqrt_area])`` with ``theta`` the second-moment
+  *axis* (180-degree ambiguous). Reuses ``score_t_centered``.
+* ``THeadingDescriptor``  — same, but orientation is the up/down-resolved **heading**
+  encoded as ``(cos, sin)`` (circular, distinguishes upright from upside-down). Pair with
+  ``TCenterAngleReward`` when diversity should care which way up the T is.
 * ``RewardScalarDescriptor`` — env-agnostic fallback: the scalar reward itself as a
   1-D feature (weak: two different states with equal reward look identical).
 * ``LatentMeanDescriptor`` — trivial, model-free; for unit-testing metrics only.
@@ -31,7 +35,7 @@ try:
 except Exception:  # pragma: no cover - cv2 optional for non-pushT descriptors
     cv2 = None
 
-from ...reward import score_t_centered
+from ...reward import score_t_centered, _t_heading
 
 
 class StateDescriptor:
@@ -122,6 +126,66 @@ class TPoseDescriptor(StateDescriptor):
                         row.append(float(np.sqrt(dbg["area"])) / side)
                     found.append(True)
                 feats.append(row)
+        return np.asarray(feats, dtype=np.float32), np.asarray(found, dtype=bool)
+
+
+class THeadingDescriptor(TPoseDescriptor):
+    """Like :class:`TPoseDescriptor`, but with the T's **real orientation**.
+
+    ``TPoseDescriptor`` uses the second-moment ``theta`` — an *axis* in
+    ``[-pi/2, pi/2]``, so an upright and an upside-down T map to the **same** value and a
+    180-degree flip contributes **zero** to the diversity distance. This descriptor
+    instead uses the full **heading** ``phi`` from :func:`_t_heading` (the same
+    up/down-resolved angle :class:`~...reward.TCenterAngleReward` scores), encoded as a
+    circular pair::
+
+        phi_feat = (cx, cy [, w*cos(phi), w*sin(phi)] [, sqrt_area])
+
+    The ``(cos, sin)`` encoding is *circular* (no ``+pi/-pi`` wraparound artifact) and
+    makes a flipped T genuinely far away (distance ``~2*w`` for a 180-degree flip).
+    ``orient_weight`` (``w``, default 0.5) keeps the orientation pair on the same scale as
+    a full-frame centroid move (a flip then costs ``~1``), so ``dup_eps`` stays meaningful.
+
+    Use this when the diversity metrics should reflect *which way up* the T is (i.e. with
+    ``reward.kind=angle``); use :class:`TPoseDescriptor` when only the axis matters.
+    Decode/segment plumbing is inherited unchanged.
+    """
+
+    def __init__(self, decode_fn=None, tokenizer=None, *, use_theta: bool = True,
+                 use_area: bool = True, dup_eps: float = 0.05, orient_weight: float = 0.5,
+                 dtype: Optional[torch.dtype] = torch.bfloat16, max_batch: int = 64,
+                 **score_kwargs):
+        super().__init__(decode_fn=decode_fn, tokenizer=tokenizer, use_theta=use_theta,
+                         use_area=use_area, dup_eps=dup_eps, dtype=dtype,
+                         max_batch=max_batch, **score_kwargs)
+        self.orient_weight = float(orient_weight)
+        self.dim = 2 + 2 * int(use_theta) + int(use_area)   # orientation = (cos, sin)
+
+    @torch.no_grad()
+    def __call__(self, term_lat: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+        flat = term_lat.reshape(-1, term_lat.shape[-2], term_lat.shape[-1])
+        feats, found = [], []
+        for s in range(0, flat.shape[0], self.max_batch):
+            rgb = self._rgb_batch(flat[s:s + self.max_batch][:, None])
+            H, W = rgb.shape[1], rgb.shape[2]
+            side = float(np.sqrt(H * W))
+            for k in range(rgb.shape[0]):
+                _, dbg = score_t_centered(rgb[k], **self.score_kwargs)
+                phi = _t_heading(dbg["mask"]) if dbg.get("found") else float("nan")
+                # undefined pose: no T, or a mask too degenerate for a stable heading
+                if not dbg.get("found") or (self.use_theta and not np.isfinite(phi)):
+                    feats.append([np.nan] * self.dim)
+                    found.append(False)
+                    continue
+                cx, cy = dbg["centroid"]
+                row = [cx / W, cy / H]
+                if self.use_theta:
+                    row += [self.orient_weight * float(np.cos(phi)),
+                            self.orient_weight * float(np.sin(phi))]
+                if self.use_area:
+                    row.append(float(np.sqrt(dbg["area"])) / side)
+                feats.append(row)
+                found.append(True)
         return np.asarray(feats, dtype=np.float32), np.asarray(found, dtype=bool)
 
 

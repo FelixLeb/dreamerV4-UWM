@@ -16,11 +16,15 @@ data:
   window_size: 64
 
 reward:
+  kind: center             # center | straight | angle (override on CLI: reward.kind=angle)
   center_xy: [0.5, 0.5]
   sigma: 0.25
 
 descriptor:
+  kind: auto               # auto (heading iff reward.kind=angle) | pose | heading
   dup_eps: 0.05
+  dup_eps_heading: 0.06
+  orient_weight: 0.5
 
 base_plan:
   horizon: 6

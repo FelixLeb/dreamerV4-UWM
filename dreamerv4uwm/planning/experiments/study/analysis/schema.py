@@ -10,8 +10,8 @@ from typing import List, Optional
 import pandas as pd
 
 # identifiers / bookkeeping — never analysed as variables
-META = ["config_id", "config_tag", "window_idx", "t0", "init_id", "plan_seed",
-        "plan_secs", "dtype", "edge_mode"]
+META = ["config_id", "config_tag", "reward_kind", "descriptor_kind", "window_idx",
+        "t0", "init_id", "plan_seed", "plan_secs", "dtype", "edge_mode"]
 
 # swept knobs (independent variables)
 FACTORS = ["ctx_noise", "horizon", "sim_horizon", "branching", "action_temp",
@@ -104,6 +104,8 @@ DESCRIPTIONS = {
     # --- meta / bookkeeping ---
     "config_id": "index of the config in the sweep (0..n_configs-1)",
     "config_tag": "human tag of the config: 'base' or 'ofat.<knob>=<value>'",
+    "reward_kind": "reward that scored this tree: center | straight (axis) | angle (upright)",
+    "descriptor_kind": "diversity descriptor: pose (axis theta) | heading (up/down-resolved)",
     "window_idx": "dataset index of the demo window the initial context came from",
     "t0": "frame offset inside that window where the Tc-frame context starts",
     "init_id": "index of the curated initial state (decision point)",

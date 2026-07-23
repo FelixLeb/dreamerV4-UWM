@@ -64,12 +64,17 @@ def load_curated_contexts(dataset, tokenizer, spec: dict, *, device: torch.devic
                           n_actions: int, reward_fn=None, fingerprint_tol: float = 0.05,
                           resolution=(256, 256)) -> List[dict]:
     """Load a hand-curated init set (see config/inits/*.yaml). ``spec`` is the parsed
-    YAML: ``{Tc, inits:[{id, window_idx, t0, label, start_reward?}], ...}``.
+    YAML: ``{Tc, reward_kind?, inits:[{id, window_idx, t0, label, start_reward?,
+    start_center_fingerprint?}], ...}``.
 
-    If ``reward_fn`` and a stored ``start_reward`` are present, the reward of the
-    decision frame is recomputed and a drift warning is printed on mismatch — this
-    is the tripwire against a silently-remapped dataset (window_idx only means
-    something under a fixed dataset construction; see the yaml's ``dataset:`` block)."""
+    The drift tripwire compares a recomputed reward on the decision frame against the
+    stored **fingerprint** and warns on mismatch (window_idx only means something under a
+    fixed dataset construction; see the yaml's ``dataset:`` block). The fingerprint is the
+    stored ``start_center_fingerprint`` — the kind-independent CENTER score — so ``reward_fn`` should
+    be a center reward; this stays decode-robust regardless of the sweep's ``reward.kind``.
+    Older files without ``start_center_fingerprint`` fall back to ``start_reward`` (which they stored as
+    a center score). ``start_reward`` (the ``reward.kind`` score) is carried through
+    unchanged for reference."""
     Tc = int(spec["Tc"])
     out = []
     for e in spec["inits"]:
@@ -82,12 +87,15 @@ def load_curated_contexts(dataset, tokenizer, spec: dict, *, device: torch.devic
         ca = actions[:, t0:t0 + Tc].clone()
         item = dict(ctx_z=cz, ctx_a=ca, window_idx=widx, t0=t0,
                     init_id=int(e.get("id", len(out))), label=e.get("label"))
-        if reward_fn is not None and e.get("start_reward") is not None:
+        if e.get("start_reward") is not None:            # carry the kind score through (reference)
+            item["start_reward"] = float(e["start_reward"])
+        fp_key = "start_center_fingerprint" if e.get("start_center_fingerprint") is not None else "start_reward"
+        if reward_fn is not None and e.get(fp_key) is not None:
             r = float(reward_fn(cz[:, -1:]).reshape(-1)[0])
-            if abs(r - float(e["start_reward"])) > fingerprint_tol:
-                print(f"[warn] init {item['init_id']}: start_reward drift "
-                      f"(stored {float(e['start_reward']):.3f} vs recomputed {r:.3f}) "
+            if abs(r - float(e[fp_key])) > fingerprint_tol:
+                print(f"[warn] init {item['init_id']}: {fp_key} drift "
+                      f"(stored {float(e[fp_key]):.3f} vs recomputed {r:.3f}) "
                       f"— dataset construction may have changed.", flush=True)
-            item["start_reward"] = r
+            item["start_center_fingerprint"] = r
         out.append(item)
     return out

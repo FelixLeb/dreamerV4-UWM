@@ -2,6 +2,8 @@
 # An init = a decision point: Tc context frames ending at the decision frame.
 # window_idx is a ShardedHDF5Dataset index (NOT a random seed).
 # Changing any dataset field below remaps window_idx -> different frames.
+# start_reward = the reward_kind score (below); start_center_fingerprint = center-only score,
+# the kind-independent, decode-robust fingerprint the loader checks for drift.
 
 dataset:
   data_dir: /home/mim-server/datasets/pushT/h5/play
@@ -12,45 +14,47 @@ dataset:
   split_seed: 123
   shuffle_windows: False
 Tc: 8
+reward_kind: angle
+reward_combine: weighted_sum
 
 inits:
-  - {id: 0, window_idx: 40222, t0: 3, start_reward: 0.193, label: "mid-right, far, theta~-86deg"}
-  - {id: 1, window_idx: 28129, t0: 20, start_reward: 0.210, label: "bottom-right, far, theta~-54deg"}
-  - {id: 2, window_idx: 6613, t0: 31, start_reward: 0.221, label: "bottom-right, far, theta~0deg"}
-  - {id: 3, window_idx: 20581, t0: 24, start_reward: 0.222, label: "bottom-left, far, theta~88deg"}
-  - {id: 4, window_idx: 15029, t0: 20, start_reward: 0.231, label: "mid-left, far, theta~-75deg"}
-  - {id: 5, window_idx: 41119, t0: 25, start_reward: 0.264, label: "bottom-left, far, theta~-77deg"}
-  - {id: 6, window_idx: 20323, t0: 43, start_reward: 0.274, label: "bottom-right, far, theta~17deg"}
-  - {id: 7, window_idx: 19015, t0: 42, start_reward: 0.289, label: "mid-right, far, theta~-1deg"}
-  - {id: 8, window_idx: 41609, t0: 4, start_reward: 0.307, label: "mid-right, far, theta~55deg"}
-  - {id: 9, window_idx: 31134, t0: 25, start_reward: 0.329, label: "mid-right, far, theta~89deg"}
-  - {id: 10, window_idx: 1835, t0: 29, start_reward: 0.369, label: "mid-right, mid, theta~-16deg"}
-  - {id: 11, window_idx: 18354, t0: 24, start_reward: 0.400, label: "bottom-right, mid, theta~-67deg"}
-  - {id: 12, window_idx: 7662, t0: 6, start_reward: 0.412, label: "mid-left, mid, theta~71deg"}
-  - {id: 13, window_idx: 42367, t0: 43, start_reward: 0.426, label: "mid-left, mid, theta~89deg"}
-  - {id: 14, window_idx: 33809, t0: 28, start_reward: 0.442, label: "bottom-right, mid, theta~6deg"}
-  - {id: 15, window_idx: 27040, t0: 46, start_reward: 0.455, label: "bottom-left, mid, theta~17deg"}
-  - {id: 16, window_idx: 49436, t0: 16, start_reward: 0.456, label: "mid-left, mid, theta~37deg"}
-  - {id: 17, window_idx: 9034, t0: 5, start_reward: 0.492, label: "bottom-left, mid, theta~-10deg"}
-  - {id: 18, window_idx: 5776, t0: 15, start_reward: 0.528, label: "bottom-right, mid, theta~89deg"}
-  - {id: 19, window_idx: 46503, t0: 34, start_reward: 0.531, label: "bottom-right, mid, theta~-29deg"}
-  - {id: 20, window_idx: 18487, t0: 40, start_reward: 0.534, label: "bottom-center, mid, theta~80deg"}
-  - {id: 21, window_idx: 47546, t0: 55, start_reward: 0.557, label: "mid-right, mid, theta~-62deg"}
-  - {id: 22, window_idx: 43508, t0: 38, start_reward: 0.566, label: "mid-left, mid, theta~-23deg"}
-  - {id: 23, window_idx: 24287, t0: 44, start_reward: 0.594, label: "top-right, mid, theta~83deg"}
-  - {id: 24, window_idx: 21144, t0: 10, start_reward: 0.597, label: "bottom-right, mid, theta~-80deg"}
-  - {id: 25, window_idx: 5905, t0: 9, start_reward: 0.602, label: "top-left, mid, theta~-6deg"}
-  - {id: 26, window_idx: 58386, t0: 33, start_reward: 0.636, label: "top-right, mid, theta~-79deg"}
-  - {id: 27, window_idx: 45369, t0: 35, start_reward: 0.698, label: "mid-right, mid, theta~14deg"}
-  - {id: 28, window_idx: 18061, t0: 21, start_reward: 0.727, label: "top-right, near-goal, theta~8deg"}
-  - {id: 29, window_idx: 43999, t0: 37, start_reward: 0.750, label: "bottom-left, near-goal, theta~81deg"}
-  - {id: 30, window_idx: 1553, t0: 32, start_reward: 0.755, label: "bottom-center, near-goal, theta~-83deg"}
-  - {id: 31, window_idx: 4769, t0: 56, start_reward: 0.778, label: "bottom-left, near-goal, theta~75deg"}
-  - {id: 32, window_idx: 29282, t0: 17, start_reward: 0.810, label: "bottom-center, near-goal, theta~6deg"}
-  - {id: 33, window_idx: 63111, t0: 44, start_reward: 0.886, label: "bottom-center, near-goal, theta~47deg"}
-  - {id: 34, window_idx: 39471, t0: 22, start_reward: 0.908, label: "mid-right, near-goal, theta~3deg"}
-  - {id: 35, window_idx: 31052, t0: 4, start_reward: 0.939, label: "mid-center, near-goal, theta~-3deg"}
-  - {id: 36, window_idx: 21026, t0: 38, start_reward: 0.957, label: "mid-center, near-goal, theta~-76deg"}
-  - {id: 37, window_idx: 49985, t0: 18, start_reward: 0.967, label: "mid-center, near-goal, theta~89deg"}
-  - {id: 38, window_idx: 44538, t0: 23, start_reward: 0.992, label: "mid-center, near-goal, theta~83deg"}
-  - {id: 39, window_idx: 41795, t0: 11, start_reward: 0.995, label: "mid-center, near-goal, theta~-89deg"}
+  - {id: 0, window_idx: 40222, t0: 3, start_reward: 0.097, start_center_fingerprint: 0.193, label: "mid-right, far, T-down (94deg)"}
+  - {id: 1, window_idx: 28129, t0: 20, start_reward: 0.105, start_center_fingerprint: 0.210, label: "bottom-right, far, T-down (126deg)"}
+  - {id: 2, window_idx: 20581, t0: 24, start_reward: 0.111, start_center_fingerprint: 0.222, label: "bottom-left, far, T-down (88deg)"}
+  - {id: 3, window_idx: 6613, t0: 31, start_reward: 0.111, start_center_fingerprint: 0.221, label: "bottom-right, far, T-right (0deg)"}
+  - {id: 4, window_idx: 15029, t0: 20, start_reward: 0.115, start_center_fingerprint: 0.231, label: "mid-left, far, T-down (105deg)"}
+  - {id: 5, window_idx: 37146, t0: 25, start_reward: 0.123, start_center_fingerprint: 0.246, label: "mid-right, far, T-right (8deg)"}
+  - {id: 6, window_idx: 26654, t0: 29, start_reward: 0.139, start_center_fingerprint: 0.260, label: "mid-right, far, T-right (-19deg)"}
+  - {id: 7, window_idx: 17666, t0: 54, start_reward: 0.143, start_center_fingerprint: 0.286, label: "bottom-left, far, T-left (167deg)"}
+  - {id: 8, window_idx: 38254, t0: 47, start_reward: 0.199, start_center_fingerprint: 0.398, label: "mid-left, far, T-right (26deg)"}
+  - {id: 9, window_idx: 44446, t0: 39, start_reward: 0.201, start_center_fingerprint: 0.403, label: "bottom-right, far, T-down (56deg)"}
+  - {id: 10, window_idx: 6651, t0: 8, start_reward: 0.215, start_center_fingerprint: 0.351, label: "bottom-right, far, T-left (-146deg)"}
+  - {id: 11, window_idx: 20681, t0: 0, start_reward: 0.218, start_center_fingerprint: 0.358, label: "bottom-right, far, T-right (-34deg)"}
+  - {id: 12, window_idx: 33809, t0: 28, start_reward: 0.222, start_center_fingerprint: 0.442, label: "bottom-right, far, T-right (6deg)"}
+  - {id: 13, window_idx: 27040, t0: 46, start_reward: 0.227, start_center_fingerprint: 0.455, label: "bottom-left, far, T-right (17deg)"}
+  - {id: 14, window_idx: 49436, t0: 16, start_reward: 0.228, start_center_fingerprint: 0.456, label: "mid-left, far, T-right (37deg)"}
+  - {id: 15, window_idx: 17715, t0: 24, start_reward: 0.247, start_center_fingerprint: 0.480, label: "bottom-left, far, T-left (-163deg)"}
+  - {id: 16, window_idx: 18487, t0: 40, start_reward: 0.267, start_center_fingerprint: 0.534, label: "bottom-center, far, T-down (80deg)"}
+  - {id: 17, window_idx: 2390, t0: 31, start_reward: 0.287, start_center_fingerprint: 0.568, label: "bottom-right, far, T-left (-171deg)"}
+  - {id: 18, window_idx: 35394, t0: 39, start_reward: 0.300, start_center_fingerprint: 0.600, label: "bottom-right, far, T-left (154deg)"}
+  - {id: 19, window_idx: 5905, t0: 9, start_reward: 0.301, start_center_fingerprint: 0.602, label: "top-left, far, T-left (174deg)"}
+  - {id: 20, window_idx: 58868, t0: 8, start_reward: 0.331, start_center_fingerprint: 0.662, label: "mid-right, far, T-left (172deg)"}
+  - {id: 21, window_idx: 26653, t0: 12, start_reward: 0.349, start_center_fingerprint: 0.698, label: "top-right, far, T-right (17deg)"}
+  - {id: 22, window_idx: 30554, t0: 13, start_reward: 0.354, start_center_fingerprint: 0.706, label: "top-left, mid, T-right (1deg)"}
+  - {id: 23, window_idx: 48407, t0: 34, start_reward: 0.356, start_center_fingerprint: 0.243, label: "mid-right, mid, T-up (-59deg)"}
+  - {id: 24, window_idx: 37361, t0: 28, start_reward: 0.367, start_center_fingerprint: 0.548, label: "bottom-left, mid, T-right (-44deg)"}
+  - {id: 25, window_idx: 26087, t0: 5, start_reward: 0.383, start_center_fingerprint: 0.765, label: "mid-left, mid, T-down (129deg)"}
+  - {id: 26, window_idx: 23643, t0: 8, start_reward: 0.387, start_center_fingerprint: 0.768, label: "mid-right, mid, T-left (-170deg)"}
+  - {id: 27, window_idx: 63307, t0: 41, start_reward: 0.401, start_center_fingerprint: 0.292, label: "mid-left, mid, T-up (-61deg)"}
+  - {id: 28, window_idx: 30831, t0: 44, start_reward: 0.415, start_center_fingerprint: 0.534, label: "mid-left, mid, T-up (-129deg)"}
+  - {id: 29, window_idx: 40316, t0: 27, start_reward: 0.456, start_center_fingerprint: 0.907, label: "mid-center, mid, T-right (-10deg)"}
+  - {id: 30, window_idx: 59119, t0: 41, start_reward: 0.459, start_center_fingerprint: 0.901, label: "mid-right, mid, T-right (-19deg)"}
+  - {id: 31, window_idx: 37844, t0: 8, start_reward: 0.481, start_center_fingerprint: 0.580, label: "bottom-left, mid, T-up (-125deg)"}
+  - {id: 32, window_idx: 19914, t0: 56, start_reward: 0.486, start_center_fingerprint: 0.972, label: "mid-center, mid, T-down (72deg)"}
+  - {id: 33, window_idx: 27437, t0: 12, start_reward: 0.522, start_center_fingerprint: 0.684, label: "bottom-right, mid, T-up (-54deg)"}
+  - {id: 34, window_idx: 28415, t0: 29, start_reward: 0.555, start_center_fingerprint: 0.880, label: "mid-left, mid, T-up (-133deg)"}
+  - {id: 35, window_idx: 21342, t0: 22, start_reward: 0.583, start_center_fingerprint: 0.414, label: "mid-right, mid, T-up (-109deg)"}
+  - {id: 36, window_idx: 58386, t0: 33, start_reward: 0.775, start_center_fingerprint: 0.636, label: "top-right, near-goal, T-up (-79deg)"}
+  - {id: 37, window_idx: 4769, t0: 56, start_reward: 0.807, start_center_fingerprint: 0.778, label: "bottom-left, near-goal, T-up (-105deg)"}
+  - {id: 38, window_idx: 49550, t0: 42, start_reward: 0.925, start_center_fingerprint: 0.863, label: "top-center, near-goal, T-up (-94deg)"}
+  - {id: 39, window_idx: 58156, t0: 3, start_reward: 0.948, start_center_fingerprint: 0.922, label: "mid-center, near-goal, T-up (-96deg)"}

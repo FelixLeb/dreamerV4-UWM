@@ -30,10 +30,10 @@ import torch
 from omegaconf import OmegaConf
 
 from ...mcts import PlanConfig
-from ...reward import TCenterReward
+from ...reward import TCenterReward, TCenterStraightReward, TCenterAngleReward
 from .model import load_world_model, make_decode_fn, model_dims
 from .data import make_dataset, sample_initial_contexts, load_curated_contexts
-from .descriptors import TPoseDescriptor
+from .descriptors import TPoseDescriptor, THeadingDescriptor
 from .run_tree import run_one_tree
 
 _PLAN_FIELDS = {f.name for f in dataclasses.fields(PlanConfig)}
@@ -82,6 +82,71 @@ def make_plan_cfg(base: dict, override: dict) -> PlanConfig:
     merged = {**base, **override}
     kw = {k: merged[k] for k in merged if k in _PLAN_FIELDS}
     return PlanConfig(**kw)
+
+
+# ---------------------------------------------------------------------------
+# reward selection
+# ---------------------------------------------------------------------------
+
+# reward.kind -> (class, extra orientation kwargs it accepts beyond center_xy/sigma)
+_REWARDS = {
+    "center":   (TCenterReward,          ()),
+    "straight": (TCenterStraightReward,  ("target_theta_deg", "sigma_theta_deg")),
+    "angle":    (TCenterAngleReward,     ("target_heading_deg", "sigma_heading_deg")),
+}
+
+
+def build_reward(reward_cfg, decode):
+    """Instantiate the reward chosen by ``reward.kind`` and return
+    ``(reward, kind, seg_kw)``.
+
+    ``center`` scores only centering; ``straight`` adds an axis-alignment term (an
+    upright and an upside-down T score the same); ``angle`` adds a full-heading term
+    (upright is rewarded, upside-down penalised). ``center_xy``/``sigma`` (segmentation +
+    centering) apply to every kind; ``combine``/``w_center``/``w_orient`` and the
+    kind-specific ``target_*``/``sigma_*`` apply only to straight/angle. ``seg_kw`` is the
+    segmentation kwargs the descriptor and the fingerprint reward must mirror.
+    """
+    kind = str(reward_cfg.get("kind", "center")).lower()
+    if kind not in _REWARDS:
+        raise ValueError(f"unknown reward.kind={kind!r} (expected {'|'.join(_REWARDS)})")
+    seg_kw = dict(center_xy=tuple(reward_cfg.center_xy), sigma=float(reward_cfg.sigma))
+    cls, orient_keys = _REWARDS[kind]
+    kw = dict(seg_kw)
+    if kind != "center":
+        if "combine" in reward_cfg:
+            kw["combine"] = str(reward_cfg.combine)
+        for k in ("w_center", "w_orient"):
+            if k in reward_cfg:
+                kw[k] = float(reward_cfg[k])
+        for k in orient_keys:
+            if k in reward_cfg:
+                kw[k] = float(reward_cfg[k])
+    return cls(decode_fn=decode, **kw), kind, seg_kw
+
+
+def build_descriptor(desc_cfg, decode, reward_kind, seg_kw):
+    """Pick the diversity descriptor and return ``(descriptor, kind)``.
+
+    ``descriptor.kind``: ``auto`` (default) -> ``heading`` iff ``reward.kind == 'angle'``
+    else ``pose``; or force ``pose`` / ``heading``. ``pose`` (:class:`TPoseDescriptor`)
+    measures orientation as an *axis* (upright == upside-down); ``heading``
+    (:class:`THeadingDescriptor`) uses the up/down-resolved heading, so pairing it with
+    the angle reward makes the diversity metrics reflect *which way up* the T is. Each kind
+    reads its own near-duplicate threshold (``dup_eps`` for pose, ``dup_eps_heading`` for
+    heading) since the two live in differently-scaled feature spaces.
+    """
+    kind = str(desc_cfg.get("kind", "auto")).lower()
+    if kind == "auto":
+        kind = "heading" if reward_kind == "angle" else "pose"
+    if kind == "pose":
+        eps = float(desc_cfg.get("dup_eps", 0.05))
+        return TPoseDescriptor(decode_fn=decode, dup_eps=eps, **seg_kw), kind
+    if kind == "heading":
+        eps = float(desc_cfg.get("dup_eps_heading", 0.10))
+        w = float(desc_cfg.get("orient_weight", 0.5))
+        return THeadingDescriptor(decode_fn=decode, dup_eps=eps, orient_weight=w, **seg_kw), kind
+    raise ValueError(f"unknown descriptor.kind={kind!r} (expected auto|pose|heading)")
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +205,12 @@ def main(argv=None):
         device=device)
     dims = model_dims(denoiser)
     decode = make_decode_fn(tokenizer, device)
-    score_kw = dict(center_xy=tuple(cfg.reward.center_xy), sigma=float(cfg.reward.sigma))
-    reward = TCenterReward(decode_fn=decode, **score_kw)
-    descriptor = TPoseDescriptor(decode_fn=decode, dup_eps=float(cfg.get("descriptor", {}).get("dup_eps", 0.05)),
-                                 **score_kw)
+    reward, reward_kind, score_kw = build_reward(cfg.reward, decode)
+    descriptor, descriptor_kind = build_descriptor(cfg.get("descriptor", {}), decode, reward_kind, score_kw)
+    print(f"[sweep] reward.kind={reward_kind}  descriptor.kind={descriptor_kind}", flush=True)
+    # the curated start_reward fingerprint is a CENTER score (curate.py) -> a dataset
+    # tripwire, not a reward-choice one; check it with a center reward whatever the kind.
+    fp_reward = reward if reward_kind == "center" else TCenterReward(decode_fn=decode, **score_kw)
 
     inits_cfg = cfg.get("inits", None)
     mode = str(inits_cfg.mode) if (inits_cfg and "mode" in inits_cfg) else "random"
@@ -164,7 +231,7 @@ def main(argv=None):
                                split_seed=int(d.get("split_seed", 123)),
                                shuffle_windows=bool(d.get("shuffle_windows", False)))
         inits = load_curated_contexts(dataset, tokenizer, spec, device=device,
-                                      n_actions=dims["n_actions"], reward_fn=reward)
+                                      n_actions=dims["n_actions"], reward_fn=fp_reward)
         print(f"[sweep] loaded {len(inits)} curated inits from {ipath}", flush=True)
     else:
         dataset = make_dataset(cfg.data.data_dir, window_size=int(cfg.data.get("window_size", 64)))
@@ -190,13 +257,14 @@ def main(argv=None):
         row = run_one_tree(
             denoiser=denoiser, reward_fn=reward, descriptor=descriptor, plan_cfg=plan_cfg,
             ctx_z=init["ctx_z"], ctx_a=init["ctx_a"], plan_seed=int(init["init_id"]),
-            meta=dict(config_id=ci, config_tag=tag, window_idx=init["window_idx"],
+            meta=dict(config_id=ci, config_tag=tag, reward_kind=reward_kind,
+                      descriptor_kind=descriptor_kind, window_idx=init["window_idx"],
                       t0=init["t0"], init_id=init["init_id"]),
             n_random=int(cfg.get("n_random", 16)))
         if fieldnames is None:
-            fieldnames = (["config_id", "config_tag", "window_idx", "t0", "init_id"]
-                          + [k for k in row if k not in
-                             ("config_id", "config_tag", "window_idx", "t0", "init_id")])
+            _ids = ("config_id", "config_tag", "reward_kind", "descriptor_kind",
+                    "window_idx", "t0", "init_id")
+            fieldnames = list(_ids) + [k for k in row if k not in _ids]
         _append_row(shard, row, fieldnames)
         n_done += 1
         if n_done % 10 == 0 or n_done == 1:
