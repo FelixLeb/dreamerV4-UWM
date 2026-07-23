@@ -30,6 +30,8 @@ def derive_outcomes(df: pd.DataFrame, peak_tau: float = 0.7) -> pd.DataFrame:
     well-centred T."""
     if "g_1shot" in df:
         df["success_1shot"] = (df["g_1shot"] > 0).astype(int)
+    if "g_1shot_fair" in df:
+        df["success_1shot_fair"] = (df["g_1shot_fair"] > 0).astype(int)
     if "tree_peak" in df:
         df["success_peak"] = (df["tree_peak"] >= peak_tau).astype(int)
     return df

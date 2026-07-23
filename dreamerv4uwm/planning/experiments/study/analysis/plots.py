@@ -17,8 +17,10 @@ from . import schema
 from .correlate import metric_outcome_table
 
 # metrics that tell the L1->L5 story, for the response-curve panel
+# (g_1shot_fair is shown when present; absent columns are silently skipped)
 STORY = ["root_bci", "div_outcome_div_mean", "div_action_div_mean", "val_std",
-         "q_margin", "exploit_explore_ratio", "visit_entropy", "g_shootN", "g_1shot"]
+         "q_margin", "exploit_explore_ratio", "visit_entropy",
+         "g_shootN", "g_1shot", "g_1shot_fair"]
 
 
 def _agg(df, factor, col):
@@ -128,6 +130,8 @@ def make_all(df, out_dir, factor="ctx_noise"):
     made.append(mechanism_scatter(df, out=od / "mechanism_scatter.png"))
     made.append(link_importance_bars(df, "g_1shot", out=od / "importance_g_1shot.png"))
     made.append(link_importance_bars(df, "g_shootN", out=od / "importance_g_shootN.png"))
+    # fair-baseline importance (only produced when the *_fair columns are present)
+    made.append(link_importance_bars(df, "g_1shot_fair", out=od / "importance_g_1shot_fair.png"))
     return [m for m in made if m]
 
 

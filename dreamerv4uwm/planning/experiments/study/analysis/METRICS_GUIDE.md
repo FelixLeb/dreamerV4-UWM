@@ -51,21 +51,35 @@ number below is in this [0,1] scale.
 Because absolute reward isn't comparable across start states, the real outcomes are *gains over
 baselines* at equal budget. All computed in `run_tree.py` / `baselines.py`.
 
+There are **two baseline families**. The *flat* baselines roll out a single `sim_horizon`-frame
+trajectory; the ***fair*** baselines (`*_fair`) are built the **same way the plan is** —
+`max_depth` edges of `horizon` frames, re-conditioning the context after each edge — so they match
+the plan's lookahead *and* its construction. Prefer the fair ones (see the note below).
+
 | Column | Definition | Read as |
 |---|---|---|
 | `tree_peak` | best single-frame reward over the frames of the **returned plan** | how good a state the plan reaches |
 | `root_reward` | reward of the **start** state (last context frame) | the starting point |
-| `shootN_peak` | best reward over `n_random` **undirected** rollouts (same length/budget) | what blind sampling gets |
-| `oneshot_peak` | best reward over **one** policy-prior rollout, no search | what the raw policy gets |
-| **`g_shootN`** | `tree_peak − shootN_peak` | **did the *search* beat undirected sampling?** >0 = yes |
-| **`g_1shot`** | `tree_peak − oneshot_peak` | **did planning beat the policy alone?** the headline outcome |
+| `oneshot_peak` / `shootN_peak` | best reward over one / `n_random` **flat** `sim_horizon` rollouts | flat no-search / random-shooting |
+| `oneshot_fair_peak` / `shootN_fair_peak` | best reward over one / `n_random` **depth-deep re-conditioned** rollouts | fair no-search / random-shooting |
+| **`g_1shot`** | `tree_peak − oneshot_peak` | planning gain vs a **flat** rollout |
+| **`g_shootN`** | `tree_peak − shootN_peak` | search gain vs **flat** random shooting |
+| **`g_1shot_fair`** | `tree_peak − oneshot_fair_peak` | **planning gain at matched lookahead — the fair headline** |
+| **`g_shootN_fair`** | `tree_peak − shootN_fair_peak` | search gain vs **fair** random shooting |
 | `delta_over_root` | `tree_peak − root_reward` | did the plan improve on the start at all? |
-| `success_1shot` | `1 if g_1shot > 0` | binary success label (derived) |
+| `success_1shot`(`_fair`) | `1 if g_1shot(_fair) > 0` | binary success labels (derived) |
 | `success_peak` | `1 if tree_peak ≥ 0.7` | reached a well-centred T (derived) |
 
-**`g_1shot` is the main target.** `g_1shot ≤ 0` is the precise statement of "planning did nothing the
-policy couldn't do alone." `g_shootN ≤ 0` is stronger: the search didn't even beat random — the classic
-sign of *incoherent* edges (diverse but useless).
+**`g_1shot_fair` is the main target.** `g ≤ 0` is the precise statement of "planning did nothing a
+no-search rollout of the same lookahead couldn't do." The `_fair` variants are the honest ones: the
+flat `g_1shot`/`g_shootN` give the tree a **free lookahead advantage** (the plan reaches `horizon×max_depth`
+frames but the flat baseline only `sim_horizon`), and their baseline length **tracks `sim_horizon`** —
+which confounds the `sim_horizon` sweep. `g_shootN(_fair) ≤ 0` is the stronger signal: the search
+didn't even beat random shooting — the classic sign of *incoherent* edges (diverse but useless).
+
+> The `*_fair` columns only exist for runs made after the fair-baseline change; `run1` predates it
+> (re-run its baselines to get them). `schema.OUTCOMES` lists both, and the analysis skips whichever
+> are absent.
 
 ---
 

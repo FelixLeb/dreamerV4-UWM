@@ -18,11 +18,14 @@ FACTORS = ["ctx_noise", "horizon", "sim_horizon", "branching", "action_temp",
            "c_ucb", "max_depth", "n_iterations", "sim_rollouts", "K_steps",
            "gamma", "max_ctx", "n_min", "ctx_noise_honest"]
 
-# dependent variables (did planning help?)
-OUTCOMES = ["g_shootN", "g_1shot", "delta_over_root", "tree_peak"]
+# dependent variables (did planning help?). *_fair = vs a baseline built the same
+# way as the plan (depth-deep, re-conditioned); the un-suffixed = vs a flat rollout.
+OUTCOMES = ["g_1shot", "g_1shot_fair", "g_shootN", "g_shootN_fair",
+            "delta_over_root", "tree_peak"]
 
 # outcome intermediates that are not themselves predictors
-_OUTCOME_AUX = ["root_reward", "shootN_peak", "oneshot_peak", "best_node_value",
+_OUTCOME_AUX = ["root_reward", "shootN_peak", "oneshot_peak",
+                "shootN_fair_peak", "oneshot_fair_peak", "best_node_value",
                 "best_edge_val_on_plan", "best_edge_val_tree"]
 
 # process metrics grouped by causal-chain link (plan §1). Only those present in the
@@ -67,7 +70,7 @@ def process_cols(df: pd.DataFrame) -> List[str]:
     """Numeric columns that are candidate predictors (metrics), i.e. not meta,
     factor, outcome, or outcome-aux."""
     excluded = set(META + FACTORS + OUTCOMES + _OUTCOME_AUX
-                   + ["success_1shot", "success_peak", "n_forward"])
+                   + ["success_1shot", "success_1shot_fair", "success_peak", "n_forward"])
     out = []
     for c in df.columns:
         if c in excluded:
@@ -124,10 +127,15 @@ DESCRIPTIONS = {
     "root_reward": "reward of the start state (last context frame)",
     "oneshot_peak": "best reward over ONE prior rollout (no search)",
     "shootN_peak": "best reward over N undirected prior rollouts (random shooting)",
-    "g_1shot": "tree_peak - oneshot_peak: did planning beat acting once, no search? (HEADLINE)",
-    "g_shootN": "tree_peak - shootN_peak: did the SEARCH beat N-shot random shooting?",
+    "g_1shot": "tree_peak - oneshot_peak: planning gain over a FLAT (sim_horizon) rollout",
+    "g_shootN": "tree_peak - shootN_peak: search gain over FLAT random shooting",
+    "oneshot_fair_peak": "best reward over ONE depth-deep re-conditioned rollout (same lookahead & construction as the plan, no search)",
+    "shootN_fair_peak": "best reward over N depth-deep re-conditioned rollouts (fair random shooting)",
+    "g_1shot_fair": "tree_peak - oneshot_fair_peak: planning gain over a no-search rollout of the SAME lookahead (horizon*max_depth, re-conditioned). (FAIR HEADLINE)",
+    "g_shootN_fair": "tree_peak - shootN_fair_peak: search gain over fair random shooting at the same lookahead",
     "delta_over_root": "tree_peak - root_reward: did the plan improve on the start state at all?",
     "success_1shot": "derived label: 1 if g_1shot > 0",
+    "success_1shot_fair": "derived label: 1 if g_1shot_fair > 0",
     "success_peak": "derived label: 1 if tree_peak >= 0.7 (reached a well-centred T)",
     "best_node_value": "highest backed-up MEAN VALUE among nodes (cumulative-sum scale)",
     "best_edge_val_tree": "max terminal edge reward found anywhere in the tree",
@@ -193,7 +201,7 @@ def kind_of(col: str) -> str:
         return "factor"
     if col in OUTCOMES:
         return "outcome"
-    if col in _OUTCOME_AUX or col in ("success_1shot", "success_peak"):
+    if col in _OUTCOME_AUX or col in ("success_1shot", "success_1shot_fair", "success_peak"):
         return "outcome-aux"
     return "metric"
 
