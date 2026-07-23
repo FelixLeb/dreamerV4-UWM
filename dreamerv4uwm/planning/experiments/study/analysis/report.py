@@ -1,57 +1,47 @@
-"""One-shot report: aggregate shards -> sanity -> correlation tables -> figures ->
-REPORT.md headline. Run:
+"""Build the dataset and save a standard set of charts + a correlation table.
 
-    python -m dreamerv4uwm.planning.experiments.study.analysis.report \
-        --input-dir /scratch/mcts_sweep/run1 --out-dir /scratch/mcts_sweep/run1/analysis
+    python -m ...analysis.report --input-dir <run>/results --out-dir <run>/analysis
+
+Everything here is a few lines over ``dataset`` and ``charts``; edit freely.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from .aggregate import load_shards, sanity_report, save
-from .correlate import analyze, headline, factor_outcome_table
-from . import plots
+import matplotlib
+matplotlib.use("Agg")   # headless: this is a script
+
+from . import dataset, charts
+
+KNOBS = ["horizon", "max_depth", "ctx_noise", "sim_horizon", "branching", "c_ucb"]
 
 
-def run(input_dir: str, out_dir: str) -> None:
-    od = Path(out_dir); od.mkdir(parents=True, exist_ok=True)
-    df = load_shards(input_dir)
+def run(shards_dir, out_dir, outcome="g_1shot"):
+    od = Path(out_dir); figs = od / "figures"; figs.mkdir(parents=True, exist_ok=True)
 
-    report = sanity_report(df)
-    print(report)
-    save(df, od / "trees_all.parquet")
+    df = dataset.build(shards_dir, out=od / "trees.parquet")
+    (od / "overview.txt").write_text(dataset.overview(df, outcome) + "\n")
+    print(dataset.overview(df, outcome))
 
-    tables = analyze(df)
-    for name, t in tables.items():
-        t.to_csv(od / f"{name}.csv", index=False)
+    charts.correlations(df, outcome).to_csv(od / "correlations.csv", header=["spearman"])
+    charts.corr_bars(df, outcome, save=figs / "predictors.png")
+    charts.hist(df, outcome, save=figs / "outcome.png")
+    charts.scatter(df, "edge_val_std", outcome, color="ctx_noise", save=figs / "mechanism.png")
+    for k in KNOBS:
+        if k in df.columns and df[k].nunique() > 1:
+            charts.response(charts.ofat(df, k), k, outcome, save=figs / f"knob_{k}.png")
 
-    figs = plots.make_all(df, od / "figures")
-
-    head_pol = headline(tables, "g_1shot")
-    head_rand = headline(tables, "g_shootN")
-    factors = factor_outcome_table(df)
-
-    lines = ["# MCTS sweep analysis report\n",
-             "## Dataset\n```\n" + report + "\n```\n",
-             "## Which knobs move the outcome (factor vs outcome, Spearman)\n```",
-             factors[factors.outcome == "g_1shot"].head(12).to_string(index=False),
-             "```\n",
-             "## " + head_pol.splitlines()[0] + "\n```",
-             "\n".join(head_pol.splitlines()[1:]), "```\n",
-             "## " + head_rand.splitlines()[0] + "\n```",
-             "\n".join(head_rand.splitlines()[1:]), "```\n",
-             f"## Figures\n" + "\n".join(f"- `{Path(f).name}`" for f in figs)]
-    (od / "REPORT.md").write_text("\n".join(lines))
-    print(f"\nwrote tables, {len(figs)} figures, and REPORT.md to {od}")
+    print(f"wrote trees.parquet, correlations.csv, overview.txt and figures/ to {od}")
 
 
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input-dir", required=True)
+    ap.add_argument("--input-dir", required=True, help="dir with shard_*.csv")
     ap.add_argument("--out-dir", required=True)
-    args = ap.parse_args(argv)
-    run(args.input_dir, args.out_dir)
+    ap.add_argument("--outcome", default="g_1shot")
+    a = ap.parse_args(argv)
+    run(a.input_dir, a.out_dir, a.outcome)
 
 
 if __name__ == "__main__":

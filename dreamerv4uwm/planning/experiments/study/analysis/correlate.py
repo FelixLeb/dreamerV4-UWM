@@ -183,7 +183,7 @@ def headline(tables: dict, outcome="g_1shot", k=12) -> str:
 
 def main(argv=None):
     import argparse
-    from .aggregate import load_shards
+    from .dataset import build as load_shards
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--out-dir", default=None)

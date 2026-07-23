@@ -2,7 +2,9 @@
 
 Implements the sweep in [`../mcts_study_plan.md`](../mcts_study_plan.md). Builds many
 MCTS trees over a factor grid, computes a diagnostic metric vector + in-model outcome
-per tree, and writes CSV shards for analysis. Metrics/rationale: [`../../mcts_planning_diagnostics.tex`](../../mcts_planning_diagnostics.tex).
+per tree, and writes CSV shards for analysis. Metrics/rationale:
+[`analysis/METRICS_GUIDE.md`](analysis/METRICS_GUIDE.md) and
+[`analysis/metrics_reference.tex`](analysis/metrics_reference.tex).
 
 ## Package
 | file | role |
@@ -79,17 +81,20 @@ tree metric. Concatenate shards for analysis.
 ## Analyse (after the sweep)
 ```bash
 $PY -m dreamerv4uwm.planning.experiments.study.analysis.report \
-    --input-dir /scratch/mcts_sweep/run1 --out-dir /scratch/mcts_sweep/run1/analysis
+    --input-dir /scratch/mcts_sweep/run1/results --out-dir /scratch/mcts_sweep/run1/analysis
 ```
-Produces `trees_all.parquet`, correlation tables (`metric_outcome.csv`, `factor_outcome.csv`,
-`importance_*.csv`), `figures/` (response curves, correlation heatmap, mechanism scatter, per-link
-importance bars), and `REPORT.md` (ranked early-warning metrics for `g_1shot`/`g_shootN`). The
-`analysis/` modules also run standalone (`aggregate`, `correlate`, `plots`).
+Produces `trees.parquet` (one row per tree), `overview.txt`, `correlations.csv` (each metric's
+Spearman with `g_1shot`), and `figures/` (a per-knob response curve, the predictor bars, an outcome
+histogram, the mechanism scatter). For richer stats (mutual information, partial correlation,
+gradient-boosted importance) run the `correlate` module; for the polished deck figures run `plots --deck`.
 
 For **interactive** exploration open [`analysis/explore_results.ipynb`](analysis/explore_results.ipynb):
-sanity report, per-knob OFAT tables + effect sizes, response curves, the ranked predictor table
-(rho / mutual-info / partial), the mechanism plots, and `curve(factor, metric)` /
-`corr(metric)` helpers to plot *any* metric against *any* knob. Point `RUN_DIR` at any run.
+load a run's `trees.parquet` with `dataset.load`, then build charts with `charts.*` (knob response
+curves, ranked predictor bars, scatters, histograms) and read the column reference via
+`schema.data_dictionary`.
+
+**See [`analysis/README.md`](analysis/README.md)** for the analysis code (modules, data flow, recipes)
+and **[`analysis/METRICS_GUIDE.md`](analysis/METRICS_GUIDE.md)** for what every column and figure means.
 
 ## Status / next
 Built & verified: **M0–M3, M5** (see plan §9). **M4** SLURM is a template pending cluster paths.

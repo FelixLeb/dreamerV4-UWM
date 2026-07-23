@@ -1,9 +1,12 @@
 # Reading the MCTS sweep results — metrics & figures guide
 
-A reference for every column in the sweep CSVs, every number in `REPORT.md`, and every figure.
+A reference for every column in the sweep data, every statistic the analysis prints, and every figure.
 Definitions match the code exactly (`study/metrics.py`, `run_tree.py`, `baselines.py`,
-`analysis/`). Companion: the theory catalogue [`../../mcts_planning_diagnostics.tex`](../../mcts_planning_diagnostics.tex)
-and the design [`../mcts_study_plan.md`](../mcts_study_plan.md).
+`analysis/`). For **how to run** the code that produces these (build the parquet, make charts,
+regenerate the deck), see the companion [`README.md`](README.md). Further companions in this directory:
+[`metrics_reference.tex`](metrics_reference.tex) (full metric definitions) and
+[`diagnostic_studies.tex`](diagnostic_studies.tex) (the chart/study catalogue); the sweep design is
+[`../../mcts_study_plan.md`](../../mcts_study_plan.md).
 
 ---
 
@@ -67,8 +70,8 @@ the plan's lookahead *and* its construction. Prefer the fair ones (see the note 
 | **`g_1shot_fair`** | `tree_peak − oneshot_fair_peak` | **planning gain at matched lookahead — the fair headline** |
 | **`g_shootN_fair`** | `tree_peak − shootN_fair_peak` | search gain vs **fair** random shooting |
 | `delta_over_root` | `tree_peak − root_reward` | did the plan improve on the start at all? |
-| `success_1shot`(`_fair`) | `1 if g_1shot(_fair) > 0` | binary success labels (derived) |
-| `success_peak` | `1 if tree_peak ≥ 0.7` | reached a well-centred T (derived) |
+| `success_<gain>` (e.g. `success_g_1shot`) | `1 if <gain> > 0` | one binary label per gain outcome (derived by `dataset.build`) |
+| `success_tree_peak` | `1 if tree_peak ≥ 0.7` | reached a well-centred T (derived) |
 
 **`g_1shot_fair` is the main target.** `g ≤ 0` is the precise statement of "planning did nothing a
 no-search rollout of the same lookahead couldn't do." The `_fair` variants are the honest ones: the
@@ -85,7 +88,8 @@ didn't even beat random shooting — the classic sign of *incoherent* edges (div
 
 ## 4. Statistics vocabulary (how to read the correlation numbers)
 
-These appear in `REPORT.md`, `metric_outcome.csv`, `factor_outcome.csv`, `importance_*.csv`.
+These appear in `correlations.csv` (from `report.py`) and the optional `correlate.py` tables
+(`metric_outcome.csv`, `factor_outcome.csv`, `importance_*.csv`).
 
 | Term (aliases) | What it is | How to read |
 |---|---|---|
@@ -180,40 +184,61 @@ K_steps, ctx_noise, ctx_noise_honest, action_temp, max_ctx`.
 
 ---
 
-## 7. How to read `REPORT.md`
+## 7. How to read the report outputs
 
-- **Dataset block** — sanity: `rows / configs / inits`, the overall `success_1shot rate`, columns that
-  are heavily NaN (a metric undefined for many trees), `degenerate trees` (n_nodes ≤ B+1), and how many
-  metrics are actually usable (constant ones are dropped).
-- **"Which knobs move the outcome"** — the `factor_outcome` table: Spearman + MI of each **knob** vs the
-  outcome. ⚠️ **On OFAT data this is diluted** — for any one factor, most rows sit at the baseline value,
-  so a real main effect can look weak here. **Read the response-curve figure for true main effects.**
-- **"Top N early-warning metrics"** — the `metric_outcome` table: the **process metrics** most predictive
-  of the outcome, each with `rho` (monotone strength), `mi` (any-shape strength), `partial` (strength
-  beyond the knobs), and its causal `link`. This is the headline: *which cheap tree signals foretell
-  whether planning worked.* Prefer metrics whose `partial` stays high (genuine online signals) and whose
-  `link` you can act on.
+`report.py` writes, per run, into `<run>/analysis/`:
+
+- **`overview.txt`** — sanity: `rows / configs / inits`, the outcome's `success rate` (e.g.
+  `g_1shot success rate`), and any heavily-NaN columns (a metric undefined for many trees).
+- **`correlations.csv`** — the **headline**: each process metric and knob's Spearman correlation with
+  the chosen outcome, sorted. Read strength by \|ρ\| (see §4); this is the table behind
+  `figures/predictors.png`.
+- **`figures/`** — the charts described in §8.
+
+The optional `correlate.py` (run separately) adds three richer tables:
+
+- **`factor_outcome.csv`** — Spearman + MI of each **knob** vs the outcome. ⚠️ **On OFAT data this is
+  diluted** — for any one factor most rows sit at the baseline value, so a real main effect can look
+  weak. **Read the knob-response figures for true main effects.**
+- **`metric_outcome.csv`** — the **process metrics** most predictive of the outcome, each with `rho`
+  (monotone strength), `mi` (any-shape strength), `partial` (strength beyond the knobs), and its causal
+  `link`. *Which cheap tree signals foretell whether planning worked.* Prefer metrics whose `partial`
+  stays high (genuine online signals) and whose `link` you can act on.
+- **`importance_g_1shot.csv` / `importance_g_shootN.csv`** — gradient-boosted permutation importance +
+  standardized OLS beta, using all metrics jointly (captures nonlinear + interaction value).
 
 ---
 
 ## 8. How to read the figures
 
-- **`response_<factor>.png`** (e.g. `response_ctx_noise.png`) — a grid of panels, each a metric's
-  **mean ± SEM vs the swept factor**. Read the *shape* of each curve:
+**Report figures** (`report.py`, in `<run>/analysis/figures/`):
+
+- **`knob_<k>.png`** (e.g. `knob_ctx_noise.png`) — the outcome's **mean ± SEM vs one swept knob**, over
+  that knob's OFAT slice. Read the *shape*:
   - *monotone* (e.g. `bci` ↓ as `ctx_noise` ↑) = a clean lever;
-  - *inverted-U* (e.g. `g_1shot` peaks at 0.7) = a sweet spot — this is where non-monotone effects that
+  - *inverted-U* (e.g. `g_1shot` peaks mid-range) = a sweet spot — where non-monotone effects that
     correlations miss become visible;
-  - *cliff* (e.g. `g_shootN` crashing at 0.9) = a regime boundary.
-  This is the most information-dense figure for OFAT.
-- **`corr_heatmap.png`** — metric (rows) × outcome (cols) Spearman, **red = +, blue = −**, top metrics by
-  \|corr\|. A quick visual of who predicts what and in which direction.
-- **`mechanism_scatter.png`** — one dot per tree: `x = outcome_div`, `y = val_std`, **colour = g_1shot**.
-  Look at *where the colours live*: failed-planning (dark) points clustering at low-x/low-y is the
-  "collapse corner"; a mostly-vertical colour gradient means `val_std` predicts success more directly
-  than diversity does.
-- **`importance_g_1shot.png` / `importance_g_shootN.png`** — horizontal bars of \|Spearman\| per metric,
-  **coloured by causal link (L1–L5)**. Shows which *links* dominate the outcome (e.g. lots of L3/L4 bars
-  ⇒ value-separation + selection are what matter).
+  - *cliff* (e.g. `g_shootN` crashing at high noise) = a regime boundary.
+  The most information-dense view on OFAT data.
+- **`predictors.png`** — horizontal bars: Spearman of each metric with the outcome, **red = −, blue = +**,
+  strongest \|corr\| on top. Who predicts the outcome and in which direction.
+- **`mechanism.png`** — one dot per tree: `x = edge_val_std`, `y = the outcome`, **colour = `ctx_noise`**.
+  Where the successes live — reward-diverse edges (right) vs the collapse corner (left).
+- **`outcome.png`** — the distribution of the outcome across trees: how often planning helps, and by
+  how much.
+
+**Deck figures** (`plots.make_deck`, polished, in `../presentation/figures/`):
+
+- **`fig_knob_effects`** — effect size (max − min mean `g_1shot` across a knob's settings) per knob,
+  each bar labelled with its curve shape (`monotone` / `inverted-U` / `~flat`). Which knobs move planning.
+- **`fig_knob_curves`** — the 2×2 response curves (`horizon`, `max_depth`, `ctx_noise`, `sim_horizon`).
+- **`fig_ctxnoise`** — the headline story: `root_bci` rises with noise (more diverse edges) while
+  `g_1shot` / `g_shootN` **peak then cliff** (usefulness has a sweet spot).
+- **`fig_predictors`** — top per-tree predictors of `g_1shot`, bars **coloured by causal link (L1–L5)**,
+  with the **partial** correlation (controlling for all knobs) overlaid as a diamond. Which *links*
+  dominate, and which signals survive controlling for the config.
+- **`fig_mechanism`** — `edge_val_std` → mean `g_1shot` (left) and → planning-**success rate** (right):
+  reward-diverse edges give better *and* more reliable planning.
 
 ---
 

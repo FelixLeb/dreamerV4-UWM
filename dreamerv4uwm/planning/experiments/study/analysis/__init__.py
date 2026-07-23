@@ -1,2 +1,9 @@
-"""Analysis of MCTS sweep CSVs: aggregate shards, correlate metrics with outcome,
-and plot. See ``../../mcts_study_plan.md`` §8. Uses pandas/numpy/scipy/sklearn/matplotlib."""
+"""Analysis of the MCTS sweep.
+
+Two simple modules do the everyday work:
+    dataset.py  --  build/load the parquet (shards -> one dataframe, one row per tree)
+    charts.py   --  simple charts from that dataframe (response / scatter / hist / corr_bars)
+
+See `explore_results.ipynb` for a worked example. `plots.py` holds the polished
+figures for the LaTeX deck; `correlate.py`/`schema.py` add optional advanced stats.
+"""

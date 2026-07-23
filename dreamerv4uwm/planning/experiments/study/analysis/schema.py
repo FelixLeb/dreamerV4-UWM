@@ -28,6 +28,25 @@ _OUTCOME_AUX = ["root_reward", "shootN_peak", "oneshot_peak",
                 "shootN_fair_peak", "oneshot_fair_peak", "best_node_value",
                 "best_edge_val_on_plan", "best_edge_val_tree"]
 
+# gain outcomes: planning "succeeds" when these are positive (it beat the baseline).
+GAIN_OUTCOMES = ["g_1shot", "g_shootN", "g_1shot_fair", "g_shootN_fair", "delta_over_root"]
+PEAK_THRESHOLD = 0.7   # tree_peak >= this = reached a well-centred T (task success)
+
+
+def add_success(df: pd.DataFrame) -> List[str]:
+    """Add a ``success_<outcome>`` flag for each outcome present. Gains succeed when
+    positive (planning helped over the baseline); ``tree_peak`` succeeds at the task
+    threshold (a well-centred T). Mutates ``df`` in place; returns the columns added."""
+    added = []
+    for oc in GAIN_OUTCOMES:
+        if oc in df.columns:
+            df[f"success_{oc}"] = (df[oc] > 0).astype(int)
+            added.append(f"success_{oc}")
+    if "tree_peak" in df.columns:
+        df["success_tree_peak"] = (df["tree_peak"] >= PEAK_THRESHOLD).astype(int)
+        added.append("success_tree_peak")
+    return added
+
 # process metrics grouped by causal-chain link (plan §1). Only those present in the
 # dataframe are used; missing ones (e.g. fidelity E-metrics from M6) are ignored.
 LINKS = {
@@ -51,29 +70,14 @@ LINKS = {
                      "root_value_stability"],
 }
 
-# legacy outcome column names (pre-rename runs) -> current names
-LEGACY_RENAME = {
-    "g_policy": "g_1shot", "g_rand": "g_shootN",
-    "policy_peak": "oneshot_peak", "rand_peak": "shootN_peak",
-    "success_policy": "success_1shot",
-}
-
-
-def apply_legacy_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename old outcome columns to current names (idempotent) so CSVs written
-    before the g_policy->g_1shot / g_rand->g_shootN rename still load."""
-    ren = {k: v for k, v in LEGACY_RENAME.items() if k in df.columns and v not in df.columns}
-    return df.rename(columns=ren) if ren else df
-
 
 def process_cols(df: pd.DataFrame) -> List[str]:
     """Numeric columns that are candidate predictors (metrics), i.e. not meta,
     factor, outcome, or outcome-aux."""
-    excluded = set(META + FACTORS + OUTCOMES + _OUTCOME_AUX
-                   + ["success_1shot", "success_1shot_fair", "success_peak", "n_forward"])
+    excluded = set(META + FACTORS + OUTCOMES + _OUTCOME_AUX + ["n_forward"])
     out = []
     for c in df.columns:
-        if c in excluded:
+        if c in excluded or c.startswith("success"):     # success_* are derived labels
             continue
         if pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique(dropna=True) > 1:
             out.append(c)
@@ -134,9 +138,13 @@ DESCRIPTIONS = {
     "g_1shot_fair": "tree_peak - oneshot_fair_peak: planning gain over a no-search rollout of the SAME lookahead (horizon*max_depth, re-conditioned). (FAIR HEADLINE)",
     "g_shootN_fair": "tree_peak - shootN_fair_peak: search gain over fair random shooting at the same lookahead",
     "delta_over_root": "tree_peak - root_reward: did the plan improve on the start state at all?",
-    "success_1shot": "derived label: 1 if g_1shot > 0",
-    "success_1shot_fair": "derived label: 1 if g_1shot_fair > 0",
-    "success_peak": "derived label: 1 if tree_peak >= 0.7 (reached a well-centred T)",
+    # derived success flags (added by dataset.build via schema.add_success):
+    "success_g_1shot": "derived label: 1 if g_1shot > 0 (planning beat the flat 1-shot)",
+    "success_g_shootN": "derived label: 1 if g_shootN > 0 (search beat flat shooting)",
+    "success_g_1shot_fair": "derived label: 1 if g_1shot_fair > 0 (beat the fair 1-shot)",
+    "success_g_shootN_fair": "derived label: 1 if g_shootN_fair > 0 (beat fair shooting)",
+    "success_delta_over_root": "derived label: 1 if delta_over_root > 0 (plan beat the start state)",
+    "success_tree_peak": "derived label: 1 if tree_peak >= 0.7 (reached a well-centred T)",
     "best_node_value": "highest backed-up MEAN VALUE among nodes (cumulative-sum scale)",
     "best_edge_val_tree": "max terminal edge reward found anywhere in the tree",
     "best_edge_val_on_plan": "max terminal edge reward along the returned plan path",
@@ -201,7 +209,7 @@ def kind_of(col: str) -> str:
         return "factor"
     if col in OUTCOMES:
         return "outcome"
-    if col in _OUTCOME_AUX or col in ("success_1shot", "success_1shot_fair", "success_peak"):
+    if col in _OUTCOME_AUX or col.startswith("success"):
         return "outcome-aux"
     return "metric"
 

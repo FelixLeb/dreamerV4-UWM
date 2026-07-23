@@ -1,151 +1,217 @@
-"""Plots for the sweep (plan §8): context-noise (and other factor) response curves,
-metric-vs-outcome correlation heatmap, the diversity->value->outcome mechanism
-scatter, and per-link importance bars. Saves PNGs; headless (Agg) backend.
+"""The five publication figures the LaTeX deck embeds (``presentation/``).
+
+These are intentionally polished (Okabe-Ito palette, annotations) --- for everyday,
+simple exploration use ``charts.py`` instead. Each ``fig_*(df, out=None)`` returns the
+figure (inline) or saves it; ``make_deck`` writes all five as PDF+PNG.
+
+    python -m ...analysis.plots --parquet <trees.parquet> --deck --out-dir presentation/figures
 """
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
-from typing import List, Optional
 
-import matplotlib
-matplotlib.use("Agg")
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
+from scipy import stats
 
-from . import schema
-from .correlate import metric_outcome_table
+from . import dataset, schema
+from .correlate import partial_spearman
 
-# metrics that tell the L1->L5 story, for the response-curve panel
-# (g_1shot_fair is shown when present; absent columns are silently skipped)
-STORY = ["root_bci", "div_outcome_div_mean", "div_action_div_mean", "val_std",
-         "q_margin", "exploit_explore_ratio", "visit_entropy",
-         "g_shootN", "g_1shot", "g_1shot_fair"]
+# ---- style: Okabe-Ito (colourblind-safe) for the causal-chain links ----
+INK, MUTED = "#222222", "#666666"
+LINK_COLOR = {"L1_sampler": "#E69F00", "L2_diversity": "#009E73", "L3_value": "#0072B2",
+              "L4_selection": "#D55E00", "L5_structure": "#CC79A7", "other": "#999999"}
+LINK_LABEL = {"L1_sampler": "L1 sampler", "L2_diversity": "L2 diversity", "L3_value": "L3 value",
+              "L4_selection": "L4 selection", "L5_structure": "L5 structure"}
+ACCENT, ACCENT2 = "#0072B2", "#D55E00"
 
-
-def _agg(df, factor, col):
-    g = df.groupby(factor)[col]
-    m = g.mean()
-    sem = g.std() / np.sqrt(g.count().clip(lower=1))
-    return m.index.to_numpy(float), m.to_numpy(float), sem.to_numpy(float)
-
-
-def response_curves(df, factor="ctx_noise", metrics=None, out=None):
-    """mean ± SEM of each metric vs a swept factor (the headline inverted-U figure)."""
-    metrics = schema.present(metrics or STORY, df)
-    if df[factor].nunique() < 2:
-        return None
-    n = len(metrics)
-    ncol = 3
-    nrow = int(np.ceil(n / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 3 * nrow), squeeze=False)
-    for i, met in enumerate(metrics):
-        ax = axes[i // ncol][i % ncol]
-        x, m, s = _agg(df.replace([np.inf, -np.inf], np.nan), factor, met)
-        ax.errorbar(x, m, yerr=s, marker="o", capsize=3)
-        ax.set_title(met, fontsize=9)
-        ax.set_xlabel(factor)
-        ax.grid(alpha=0.3)
-    for j in range(n, nrow * ncol):
-        axes[j // ncol][j % ncol].axis("off")
-    fig.suptitle(f"Response curves vs {factor}", fontsize=12)
-    fig.tight_layout()
-    return _save(fig, out)
+mpl.rcParams.update({
+    "font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12, "legend.fontsize": 10,
+    "figure.facecolor": "white", "axes.facecolor": "white", "savefig.bbox": "tight",
+    "axes.edgecolor": MUTED, "axes.labelcolor": INK, "text.color": INK,
+    "xtick.color": MUTED, "ytick.color": MUTED, "pdf.fonttype": 42, "svg.fonttype": "none",
+})
 
 
-def corr_heatmap(df, top=25, out=None):
-    """Spearman(metric, outcome) heatmap for the top metrics by |correlation|."""
-    tab = metric_outcome_table(df)
-    if tab.empty:
-        return None
-    keep = (tab.groupby("metric")["abs_spearman"].max()
-            .sort_values(ascending=False).head(top).index.tolist())
-    piv = (tab[tab.metric.isin(keep)]
-           .pivot(index="metric", columns="outcome", values="spearman")
-           .reindex(keep))
-    fig, ax = plt.subplots(figsize=(1.6 * piv.shape[1] + 3, 0.35 * len(keep) + 1.5))
-    im = ax.imshow(piv.to_numpy(), cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
-    ax.set_xticks(range(piv.shape[1])); ax.set_xticklabels(piv.columns, rotation=30, ha="right")
-    ax.set_yticks(range(len(keep))); ax.set_yticklabels(keep, fontsize=8)
-    for i in range(len(keep)):
-        for j in range(piv.shape[1]):
-            v = piv.iloc[i, j]
-            if pd.notna(v):
-                ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=7,
-                        color="white" if abs(v) > 0.5 else "black")
-    fig.colorbar(im, ax=ax, label="Spearman")
-    ax.set_title("Metric vs outcome (rank correlation)")
-    fig.tight_layout()
-    return _save(fig, out)
+def despine(ax):
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.grid(True, color="#dddddd", lw=0.7, alpha=0.9)
+    ax.set_axisbelow(True)
 
 
-def mechanism_scatter(df, x="div_outcome_div_mean", y="val_std", hue="g_1shot", out=None):
-    """Diversity -> value separation, coloured by outcome: the L2->L3->outcome chain."""
-    for c in (x, y, hue):
-        if c not in df.columns:
-            return None
-    d = df[[x, y, hue]].replace([np.inf, -np.inf], np.nan).dropna()
-    fig, ax = plt.subplots(figsize=(6, 5))
-    sc = ax.scatter(d[x], d[y], c=d[hue], cmap="viridis", s=25, alpha=0.8)
-    fig.colorbar(sc, ax=ax, label=hue)
-    ax.set_xlabel(x); ax.set_ylabel(y)
-    ax.set_title(f"{x} → {y}  (colour = {hue})")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return _save(fig, out)
-
-
-def link_importance_bars(df, outcome="g_1shot", out=None):
-    """|Spearman| of each metric with outcome, coloured by causal-chain link."""
-    tab = metric_outcome_table(df)
-    tab = tab[tab.outcome == outcome].sort_values("abs_spearman", ascending=True)
-    if tab.empty:
-        return None
-    links = list(schema.LINKS) + ["other"]
-    cmap = {lk: plt.cm.tab10(i) for i, lk in enumerate(links)}
-    fig, ax = plt.subplots(figsize=(7, max(3, 0.3 * len(tab))))
-    ax.barh(tab.metric, tab.abs_spearman, color=[cmap[l] for l in tab.link])
-    ax.set_xlabel(f"|Spearman| with {outcome}")
-    ax.set_title(f"Metric importance for {outcome} (colour = causal link)")
-    handles = [plt.Rectangle((0, 0), 1, 1, color=cmap[l]) for l in links]
-    ax.legend(handles, links, fontsize=7, loc="lower right")
-    fig.tight_layout()
-    return _save(fig, out)
+def ofat(df, factor, col="g_1shot"):
+    """(x, mean, sem) of ``col`` at each ``factor`` setting, over that factor's OFAT
+    slice (falls back to all rows when ``factor`` is not an OFAT axis)."""
+    m = df.config_tag.str.startswith(f"ofat.{factor}=") | (df.config_tag == "base")
+    sub = df[m]
+    if sub[factor].nunique() < 2:
+        sub = df
+    g = sub.replace([np.inf, -np.inf], np.nan).groupby(factor)[col]
+    return g.mean().index.to_numpy(float), g.mean().to_numpy(float), g.sem().to_numpy(float)
 
 
 def _save(fig, out):
-    if out:
-        Path(out).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out, dpi=120)
-        plt.close(fig)
-        return out
-    return fig
+    if out is None:
+        return fig
+    out = Path(out); out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150); plt.close(fig)
+    return str(out)
 
 
-def make_all(df, out_dir, factor="ctx_noise"):
+def fig_knob_effects(df, out=None):
+    """Effect size (max-min mean g_1shot across a knob's settings), sorted."""
+    knobs = ["horizon", "sim_horizon", "max_depth", "ctx_noise", "branching", "action_temp", "c_ucb"]
+    rows = []
+    for k in knobs:
+        _, m, _ = ofat(df, k)
+        if len(m) < 2:
+            continue
+        eff = float(np.nanmax(m) - np.nanmin(m))
+        peak_interior = 0 < int(np.nanargmax(m)) < len(m) - 1
+        shape = ("~ flat" if eff < 0.05 else "inverted-U" if peak_interior
+                 else "monotone up" if m[-1] >= m[0] else "monotone down")
+        rows.append((k, eff, shape))
+    rows.sort(key=lambda r: r[1])
+    fig, ax = plt.subplots(figsize=(7.2, 3.8)); despine(ax)
+    y = np.arange(len(rows)); vals = [r[1] for r in rows]
+    ax.barh(y, vals, color=ACCENT, height=0.62)
+    ax.set_yticks(y); ax.set_yticklabels([r[0] for r in rows])
+    for i, (k, eff, shape) in enumerate(rows):
+        ax.text(eff + 0.004, i, shape, va="center", ha="left", fontsize=9.5, color=INK)
+    ax.set_xlabel("effect on planning gain  (max - min mean $g_{1shot}$ across settings)")
+    ax.set_xlim(0, max(vals) * 1.35); ax.set_title("Which knobs move planning")
+    return _save(fig, out)
+
+
+def fig_knob_curves(df, out=None):
+    knobs = [("horizon", "edge horizon"), ("max_depth", "max tree depth"),
+             ("ctx_noise", "context noise"), ("sim_horizon", "simulation horizon")]
+    fig, axes = plt.subplots(2, 2, figsize=(8.4, 6.0))
+    for ax, (k, lab) in zip(axes.ravel(), knobs):
+        despine(ax)
+        x, m, s = ofat(df, k)
+        ax.axhline(0, color=MUTED, lw=1, ls=(0, (4, 3)))
+        ax.errorbar(x, m, yerr=s, marker="o", ms=6, lw=2, capsize=3, color=ACCENT)
+        ax.set_xlabel(lab); ax.set_ylabel("$g_{1shot}$")
+    fig.suptitle("Planning gain vs each knob (one-factor-at-a-time)", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return _save(fig, out)
+
+
+def fig_ctxnoise(df, out=None):
+    """Headline: diversity rises monotonically, but usefulness peaks then cliffs."""
+    x, bci, bci_s = ofat(df, "ctx_noise", "root_bci")
+    _, gp, gp_s = ofat(df, "ctx_noise", "g_1shot")
+    _, gr, gr_s = ofat(df, "ctx_noise", "g_shootN")
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.6, 3.9)); despine(a1); despine(a2)
+    a1.errorbar(x, bci, yerr=bci_s, marker="o", ms=6, lw=2, capsize=3, color=LINK_COLOR["L2_diversity"])
+    a1.set_ylim(-0.03, 1.0); a1.set_xlabel("context noise"); a1.set_ylabel("branch-collapse index (root)")
+    a1.set_title("More noise -> more diverse edges")
+    a2.axhline(0, color=MUTED, lw=1, ls=(0, (4, 3)))
+    a2.errorbar(x, gp, yerr=gp_s, marker="o", ms=6, lw=2, capsize=3, color=ACCENT, label="$g_{1shot}$")
+    a2.errorbar(x, gr, yerr=gr_s, marker="s", ms=6, lw=2, capsize=3, color=ACCENT2, label="$g_{shootN}$")
+    ipk = int(np.argmax(gp))
+    a2.annotate("sweet spot", (x[ipk], gp[ipk]), (x[ipk] - 0.34, gp[ipk] + 0.03),
+                fontsize=9.5, color=ACCENT, arrowprops=dict(arrowstyle="->", color=ACCENT))
+    a2.annotate("incoherent /\nOOD diversity", (0.9, gr[-1]), (0.28, 0.05), fontsize=9.5,
+                color=ACCENT2, ha="center", arrowprops=dict(arrowstyle="->", color=ACCENT2))
+    a2.set_xlabel("context noise"); a2.set_ylabel("planning gain")
+    a2.set_title("...but usefulness peaks, then collapses"); a2.legend(frameon=False, loc="upper left")
+    fig.tight_layout()
+    return _save(fig, out)
+
+
+def fig_predictors(df, out=None):
+    """Top per-tree predictors of g_1shot, by |Spearman|, coloured by causal link;
+    partial correlation (controlling for all knobs) overlaid as a marker."""
+    mets = ["edge_val_std", "val_spread", "val_std", "q_margin", "visit_entropy",
+            "commit_top1", "exploit_explore_ratio", "subtree_size_gini",
+            "mean_visited_depth", "div_action_div_mean"]
+    controls = [c for c in ["horizon", "sim_horizon", "branching", "action_temp", "c_ucb",
+                            "max_depth", "n_iterations", "ctx_noise"] if df[c].nunique() > 1]
+    rows = [(m, stats.spearmanr(df[m], df.g_1shot, nan_policy="omit")[0],
+             partial_spearman(df, m, "g_1shot", controls), schema.link_of(m)) for m in mets]
+    rows.sort(key=lambda r: abs(r[1]))
+    fig, ax = plt.subplots(figsize=(7.8, 4.6)); despine(ax); ax.axvline(0, color=MUTED, lw=1)
+    for i, (m, rho, par, lk) in enumerate(rows):
+        ax.barh(i, rho, color=LINK_COLOR.get(lk, MUTED), height=0.6)
+        ax.plot(par, i, "D", ms=6, color=INK, mfc="white", mew=1.4, zorder=5)
+    ax.set_yticks(np.arange(len(rows))); ax.set_yticklabels([r[0] for r in rows])
+    ax.set_xlabel("Spearman correlation with $g_{1shot}$")
+    ax.set_title("Per-tree early-warning signals  (diamond = partial, controlling for all knobs)")
+    handles = [plt.Rectangle((0, 0), 1, 1, color=LINK_COLOR[k]) for k in LINK_LABEL]
+    ax.legend(handles, list(LINK_LABEL.values()), frameon=False, loc="lower right", fontsize=9)
+    return _save(fig, out)
+
+
+def fig_mechanism(df, out=None):
+    """Reward-diversity of the edges predicts whether planning helps."""
+    import pandas as pd
+    d = df[["edge_val_std", "g_1shot", "success_g_1shot"]].replace([np.inf, -np.inf], np.nan).dropna()
+    d = d.assign(bin=pd.qcut(d.edge_val_std, 6, duplicates="drop"))
+    g = d.groupby("bin", observed=True)
+    x = g.edge_val_std.mean().to_numpy()
+    gp, gp_s = g.g_1shot.mean().to_numpy(), g.g_1shot.sem().to_numpy()
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.6, 3.9)); despine(a1); despine(a2)
+    a1.axhline(0, color=MUTED, lw=1, ls=(0, (4, 3)))
+    a1.fill_between(x, gp - gp_s, gp + gp_s, color=LINK_COLOR["L2_diversity"], alpha=0.18)
+    a1.plot(x, gp, marker="o", ms=6, lw=2, color=LINK_COLOR["L2_diversity"])
+    a1.set_xlabel("edge reward diversity  (edge_val_std)"); a1.set_ylabel("mean $g_{1shot}$")
+    a1.set_title("More reward-diverse edges -> better planning")
+    a2.plot(x, 100 * g.success_g_1shot.mean().to_numpy(), marker="o", ms=6, lw=2, color=LINK_COLOR["L2_diversity"])
+    a2.set_xlabel("edge reward diversity  (edge_val_std)"); a2.set_ylabel("planning-success rate (%)")
+    a2.set_ylim(0, 100); a2.set_title("...and more reliable planning")
+    fig.tight_layout()
+    return _save(fig, out)
+
+
+def key_numbers(df, out=None):
+    """Headline numbers quoted in the deck; writes key_numbers.txt if ``out`` is a dir."""
+    L = [f"rows={len(df)}  configs={df.config_id.nunique()}  inits={df.init_id.nunique()}"]
+    for k in ["horizon", "max_depth", "ctx_noise", "sim_horizon", "c_ucb"]:
+        x, m, _ = ofat(df, k)
+        L.append(f"{k}: g_1shot " + ", ".join(f"{xi:g}->{mi:+.3f}" for xi, mi in zip(x, m)))
+    text = "\n".join(L) + "\n"
+    if out is not None:
+        (Path(out) / "key_numbers.txt").write_text(text)
+        print("  wrote key_numbers.txt")
+    return text
+
+
+DECK_FIGS = {"fig_knob_effects": fig_knob_effects, "fig_knob_curves": fig_knob_curves,
+             "fig_ctxnoise": fig_ctxnoise, "fig_predictors": fig_predictors,
+             "fig_mechanism": fig_mechanism}
+
+
+def make_deck(df, out_dir):
+    """Write all five figures (PDF + PNG) + key_numbers.txt for the LaTeX deck."""
     od = Path(out_dir); od.mkdir(parents=True, exist_ok=True)
-    made = []
-    made.append(response_curves(df, factor=factor, out=od / f"response_{factor}.png"))
-    made.append(corr_heatmap(df, out=od / "corr_heatmap.png"))
-    made.append(mechanism_scatter(df, out=od / "mechanism_scatter.png"))
-    made.append(link_importance_bars(df, "g_1shot", out=od / "importance_g_1shot.png"))
-    made.append(link_importance_bars(df, "g_shootN", out=od / "importance_g_shootN.png"))
-    # fair-baseline importance (only produced when the *_fair columns are present)
-    made.append(link_importance_bars(df, "g_1shot_fair", out=od / "importance_g_1shot_fair.png"))
-    return [m for m in made if m]
+    for name, fn in DECK_FIGS.items():
+        fig = fn(df, None)
+        for ext in ("pdf", "png"):
+            fig.savefig(od / f"{name}.{ext}", dpi=150)
+        plt.close(fig); print("  wrote", name)
+    key_numbers(df, od)
+    return od
 
 
 def main(argv=None):
-    import argparse
-    from .aggregate import load_shards
+    mpl.use("Agg")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input-dir", required=True)
-    ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--factor", default="ctx_noise")
-    args = ap.parse_args(argv)
-    df = load_shards(args.input_dir)
-    made = make_all(df, args.out_dir, factor=args.factor)
-    print(f"wrote {len(made)} figures to {args.out_dir}")
+    ap.add_argument("--parquet", help="a trees.parquet")
+    ap.add_argument("--input-dir", help="a dir of shard_*.csv (alternative to --parquet)")
+    ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parent.parent
+                    / "presentation" / "figures"))
+    ap.add_argument("--deck", action="store_true", help="(default action) write the deck figures")
+    a = ap.parse_args(argv)
+    if not (a.parquet or a.input_dir):
+        ap.error("give --parquet or --input-dir")
+    df = dataset.load(a.parquet) if a.parquet else dataset.build(a.input_dir)
+    make_deck(df, a.out_dir)
+    print("wrote deck figures to", a.out_dir)
 
 
 if __name__ == "__main__":
