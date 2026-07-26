@@ -1,34 +1,28 @@
 """In-model outcome baselines (Family F). No environment executor.
 
-Since there is no closed-loop simulator, "did planning help?" is measured
-*relative* to cheaper in-model alternatives. Two families of baseline:
+Since there is no closed-loop simulator, "did planning help?" is measured *relative* to
+cheaper in-model alternatives. **Both** baselines are built the SAME WAY the tree builds a
+plan (``max_depth`` edges of ``horizon`` frames, re-conditioning the context after each edge
+and truncating to ``max_ctx``, exactly like MCTS ``_advance_ctx``) — so they share the plan's
+lookahead (``horizon*max_depth``) and edge-by-edge construction, and ``g`` credits *search*,
+not horizon or roll-out style. They differ only in how many rollouts they draw:
 
-* **flat** (``_rollout_peak``) — a single ``sim_horizon``-frame rollout. Cheap, but
-  it looks only ``sim_horizon`` frames ahead while the plan reaches up to
-  ``horizon*max_depth`` frames, so it gives the tree a free lookahead advantage and
-  its length tracks ``sim_horizon`` (confounding that sweep).
-* **fair** (``_rollout_fair_peak``) — the honest control: built the SAME WAY the tree
-  builds a plan (``max_depth`` edges of ``horizon`` frames, re-conditioning the
-  context after each edge, exactly like MCTS ``_advance_ctx``), just with no search.
-  Same lookahead (``horizon*max_depth``) and same edge-by-edge, re-anchored
-  construction as the plan, so ``g`` credits *search*, not horizon or roll-out style.
+* **random** (``_rollout_random_peak``) — a SINGLE depth-deep rollout: one sample per edge,
+  no selection. The undirected control ("act on the prior once, roll forward").
+* **greedy** (``_rollout_greedy_peak``) — the best of ``n_random`` depth-deep rollouts
+  (random shooting): draw N and keep the best. The "greedily pick the best of N" control.
 
-**Caveat (edge_mode).** Both baseline families always build edges with the ``imagine``
-sampler (they respect the shared knobs ``ctx_noise`` / ``action_temp`` / ``action_prior``,
-but not ``edge_mode`` or the autoregressive-only ``action_noise``). So under
-``edge_mode='two_stage'`` or ``'autoregressive'`` the fair baseline still *imagines* each
-edge, and ``g_*_fair`` then also reflects the tree's edge-sampler choice, not search
-alone. If you want ``g_*_fair`` to isolate search under a non-default sampler, the fair
-baseline would need to build edges with that same sampler.
+**Caveat (edge_mode).** Both baselines build edges with the ``imagine`` sampler (they respect
+``ctx_noise`` / ``action_temp`` / ``action_prior`` but not ``edge_mode`` or the
+autoregressive-only ``action_noise``). So under ``edge_mode='two_stage'`` / ``'autoregressive'``
+the baselines still *imagine* each edge, and ``g_random`` / ``g_greedy`` then also reflect the
+tree's edge-sampler choice, not search alone. To isolate search under a non-default sampler,
+the baselines would need to build edges with that same sampler.
 
-Outputs (per tree):
-  flat: ``g_shootN``, ``g_1shot``       (baselines ``shootN_peak``, ``oneshot_peak``)
-  fair: ``g_shootN_fair``, ``g_1shot_fair`` (baselines ``shootN_fair_peak``, ``oneshot_fair_peak``)
-
-All peaks are "best reward over any frame of the rollout" (MPC-style, matching the
-tree's best-prefix objective; the start/context frame is excluded, as in ``tree_peak``).
-The ``shootN`` variants take the best of ``n_random`` rollouts (random shooting); the
-``1shot`` variants use a single rollout (act on the prior once, no search).
+Outputs (per tree): ``g_random`` (baseline ``random_peak``), ``g_greedy`` (baseline
+``greedy_peak``), and ``delta_over_root``. All peaks are "best reward over any frame of the
+rollout" (MPC-style, matching the tree's best-prefix objective; the start/context frame is
+excluded, as in ``tree_peak``).
 """
 from __future__ import annotations
 
@@ -38,27 +32,38 @@ from ... import rollout as R
 
 
 @torch.no_grad()
-def _rollout_peak(denoiser, reward_fn, ctx_z, ctx_a, *, H, B, K, ctx_noise,
-                  ctx_noise_honest, action_temp, action_prior, dtype, gen) -> float:
-    """Best single-frame reward over B rollouts of length H (one flat rollout each)."""
-    z, _ = R.imagine(denoiser, ctx_z, ctx_a, H, B=B, K=K, ctx_noise=ctx_noise,
-                     ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
-                     action_prior=action_prior, dtype=dtype, generator=gen)
-    r = reward_fn(z)                       # (B, H)
-    return float(r.max().item())
+def _rollout_random_peak(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, K, ctx_noise,
+                         ctx_noise_honest, action_temp, action_prior, dtype, max_ctx, gen) -> float:
+    """Best single-frame reward over ONE no-search rollout built like the tree's plan.
+
+    A single depth-deep trajectory: ``depth`` edges of ``H`` frames, re-conditioning the
+    context after each edge (imagined states/actions appended, truncated to ``max_ctx`` —
+    mirroring MCTS ``_advance_ctx``). One rollout per edge, no selection, so this is the
+    *undirected* control at the plan's lookahead (``depth*H`` frames): the tree adds *search*
+    over it.
+    """
+    cz, ca = ctx_z, ctx_a                                       # B = 1 (single rollout)
+    best = float("-inf")
+    for _ in range(max(int(depth), 1)):
+        z, a = R.imagine(denoiser, cz, ca, H, B=1, K=K, ctx_noise=ctx_noise,
+                         ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
+                         action_prior=action_prior, dtype=dtype, generator=gen)   # (1,H,N,D)
+        best = max(best, float(reward_fn(z).max().item()))         # exclude start frame, like tree_peak
+        cz = torch.cat([cz, z], dim=1)[:, -max_ctx:].contiguous()  # advance ctx (== _advance_ctx)
+        ca = torch.cat([ca, a], dim=1)[:, -max_ctx:].contiguous()
+    return best
 
 
 @torch.no_grad()
-def _rollout_fair_peak(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K, ctx_noise,
-                       ctx_noise_honest, action_temp, action_prior, dtype, max_ctx, gen) -> float:
-    """Best single-frame reward over B *no-search* rollouts built like the tree's plan.
+def _rollout_greedy_peak(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K, ctx_noise,
+                         ctx_noise_honest, action_temp, action_prior, dtype, max_ctx, gen) -> float:
+    """Best single-frame reward over B *no-search* depth-deep rollouts — random shooting.
 
-    Each of the B rollouts runs ``depth`` edges of ``H`` frames, and after every edge
-    the context window is advanced with the imagined states/actions and truncated to
-    ``max_ctx`` — mirroring MCTS ``_advance_ctx``. This matches the plan's lookahead
-    (``depth*H`` frames) AND its edge-by-edge, re-anchored construction, so the only
-    thing the tree adds over this baseline is the *search* (selecting which edge to
-    extend), not a longer or single-shot rollout.
+    Runs B independent depth-deep trajectories in parallel (each ``depth`` edges of ``H``
+    frames, re-conditioned on its OWN imagination, truncated to ``max_ctx`` like MCTS
+    ``_advance_ctx``) and keeps the best reward over all of them. Same lookahead and
+    construction as the plan; the only thing the tree adds is the *search* (which edge to
+    extend) beyond greedily taking the best of B shots.
     """
     cz = ctx_z.expand(B, -1, -1, -1).contiguous()   # (B, Tc, N, D)
     ca = ctx_a.expand(B, -1, -1).contiguous()        # (B, Tc, n_act)
@@ -66,23 +71,25 @@ def _rollout_fair_peak(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K, ctx
     for _ in range(max(int(depth), 1)):
         z, a = R.imagine(denoiser, cz, ca, H, B=B, K=K, ctx_noise=ctx_noise,
                          ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
-                         action_prior=action_prior, dtype=dtype, generator=gen)   # (B,H,N,D), (B,H,n_act)
-        best = max(best, float(reward_fn(z).max().item()))    # exclude start frame, like tree_peak
-        cz = torch.cat([cz, z], dim=1)[:, -max_ctx:].contiguous()   # advance ctx (== _advance_ctx)
+                         action_prior=action_prior, dtype=dtype, generator=gen)   # (B,H,N,D)
+        best = max(best, float(reward_fn(z).max().item()))
+        cz = torch.cat([cz, z], dim=1)[:, -max_ctx:].contiguous()
         ca = torch.cat([ca, a], dim=1)[:, -max_ctx:].contiguous()
     return best
 
 
 @torch.no_grad()
 def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: float,
-                      n_random: int = 16, seed: int = 12345, fair: bool = True,
-                      flat: bool = True) -> dict:
+                      n_random: int = 16, seed: int = 12345, random: bool = True,
+                      greedy: bool = True) -> dict:
     """Return the baseline peaks and planning gains for one tree.
 
-    ``tree_peak`` is the planner's achieved peak reward (computed in run_tree).
-    ``fair``/``flat`` toggle the two baseline families (both on by default). The fair
-    family costs ~``max_depth``x more decodes than the flat one — disable ``flat`` if
-    you only want the fair comparison.
+    ``tree_peak`` is the planner's achieved peak reward (computed in run_tree). Two
+    matched-lookahead, no-search controls (both on by default):
+      ``random`` -> a single depth-deep re-conditioned rollout (undirected);
+      ``greedy`` -> best of ``n_random`` depth-deep rollouts (random shooting).
+    ``greedy`` costs ~``n_random``x more decodes than ``random`` — disable it if you only want
+    the cheap single-rollout comparison.
     """
     dev = ctx_z.device
     gen = torch.Generator(device=dev).manual_seed(seed)
@@ -91,22 +98,16 @@ def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: floa
               action_temp=cfg.action_temp, action_prior=cfg.action_prior, dtype=cfg.dtype, gen=gen)
     out = {"root_reward": root_reward, "delta_over_root": tree_peak - root_reward}
 
-    if flat:  # single sim_horizon rollout (cheap, unequal lookahead)
-        shootN_peak = _rollout_peak(denoiser, reward_fn, ctx_z, ctx_a,
-                                    H=cfg.sim_horizon, B=n_random, **kw)
-        oneshot_peak = _rollout_peak(denoiser, reward_fn, ctx_z, ctx_a,
-                                     H=cfg.sim_horizon, B=1, **kw)
-        out.update(shootN_peak=shootN_peak, oneshot_peak=oneshot_peak,
-                   g_shootN=tree_peak - shootN_peak, g_1shot=tree_peak - oneshot_peak)
+    if random:  # one depth-deep re-conditioned rollout (undirected)
+        random_peak = _rollout_random_peak(denoiser, reward_fn, ctx_z, ctx_a,
+                                           depth=cfg.max_depth, H=cfg.horizon,
+                                           max_ctx=cfg.max_ctx, **kw)
+        out.update(random_peak=random_peak, g_random=tree_peak - random_peak)
 
-    if fair:  # depth-deep, re-conditioned rollout matching the plan's construction
-        shootN_fair = _rollout_fair_peak(denoiser, reward_fn, ctx_z, ctx_a,
-                                         depth=cfg.max_depth, H=cfg.horizon,
-                                         B=n_random, max_ctx=cfg.max_ctx, **kw)
-        oneshot_fair = _rollout_fair_peak(denoiser, reward_fn, ctx_z, ctx_a,
-                                          depth=cfg.max_depth, H=cfg.horizon,
-                                          B=1, max_ctx=cfg.max_ctx, **kw)
-        out.update(shootN_fair_peak=shootN_fair, oneshot_fair_peak=oneshot_fair,
-                   g_shootN_fair=tree_peak - shootN_fair, g_1shot_fair=tree_peak - oneshot_fair)
+    if greedy:  # best of n_random depth-deep rollouts (random shooting)
+        greedy_peak = _rollout_greedy_peak(denoiser, reward_fn, ctx_z, ctx_a,
+                                           depth=cfg.max_depth, H=cfg.horizon,
+                                           B=n_random, max_ctx=cfg.max_ctx, **kw)
+        out.update(greedy_peak=greedy_peak, g_greedy=tree_peak - greedy_peak)
 
     return out

@@ -42,7 +42,7 @@ def despine(ax):
     ax.set_axisbelow(True)
 
 
-def ofat(df, factor, col="g_1shot"):
+def ofat(df, factor, col="g_random"):
     """(x, mean, sem) of ``col`` at each ``factor`` setting, over that factor's OFAT
     slice (falls back to all rows when ``factor`` is not an OFAT axis)."""
     m = df.config_tag.str.startswith(f"ofat.{factor}=") | (df.config_tag == "base")
@@ -62,7 +62,7 @@ def _save(fig, out):
 
 
 def fig_knob_effects(df, out=None):
-    """Effect size (max-min mean g_1shot across a knob's settings), sorted."""
+    """Effect size (max-min mean g_random across a knob's settings), sorted."""
     knobs = ["horizon", "sim_horizon", "max_depth", "ctx_noise", "branching", "action_temp", "c_ucb"]
     rows = []
     for k in knobs:
@@ -81,7 +81,7 @@ def fig_knob_effects(df, out=None):
     ax.set_yticks(y); ax.set_yticklabels([r[0] for r in rows])
     for i, (k, eff, shape) in enumerate(rows):
         ax.text(eff + 0.004, i, shape, va="center", ha="left", fontsize=9.5, color=INK)
-    ax.set_xlabel("effect on planning gain  (max - min mean $g_{1shot}$ across settings)")
+    ax.set_xlabel("effect on planning gain  (max - min mean $g_{random}$ across settings)")
     ax.set_xlim(0, max(vals) * 1.35); ax.set_title("Which knobs move planning")
     return _save(fig, out)
 
@@ -95,7 +95,7 @@ def fig_knob_curves(df, out=None):
         x, m, s = ofat(df, k)
         ax.axhline(0, color=MUTED, lw=1, ls=(0, (4, 3)))
         ax.errorbar(x, m, yerr=s, marker="o", ms=6, lw=2, capsize=3, color=ACCENT)
-        ax.set_xlabel(lab); ax.set_ylabel("$g_{1shot}$")
+        ax.set_xlabel(lab); ax.set_ylabel("$g_{random}$")
     fig.suptitle("Planning gain vs each knob (one-factor-at-a-time)", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     return _save(fig, out)
@@ -104,15 +104,15 @@ def fig_knob_curves(df, out=None):
 def fig_ctxnoise(df, out=None):
     """Headline: diversity rises monotonically, but usefulness peaks then cliffs."""
     x, bci, bci_s = ofat(df, "ctx_noise", "root_bci")
-    _, gp, gp_s = ofat(df, "ctx_noise", "g_1shot")
-    _, gr, gr_s = ofat(df, "ctx_noise", "g_shootN")
+    _, gp, gp_s = ofat(df, "ctx_noise", "g_random")
+    _, gr, gr_s = ofat(df, "ctx_noise", "g_greedy")
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.6, 3.9)); despine(a1); despine(a2)
     a1.errorbar(x, bci, yerr=bci_s, marker="o", ms=6, lw=2, capsize=3, color=LINK_COLOR["L2_diversity"])
     a1.set_ylim(-0.03, 1.0); a1.set_xlabel("context noise"); a1.set_ylabel("branch-collapse index (root)")
     a1.set_title("More noise -> more diverse edges")
     a2.axhline(0, color=MUTED, lw=1, ls=(0, (4, 3)))
-    a2.errorbar(x, gp, yerr=gp_s, marker="o", ms=6, lw=2, capsize=3, color=ACCENT, label="$g_{1shot}$")
-    a2.errorbar(x, gr, yerr=gr_s, marker="s", ms=6, lw=2, capsize=3, color=ACCENT2, label="$g_{shootN}$")
+    a2.errorbar(x, gp, yerr=gp_s, marker="o", ms=6, lw=2, capsize=3, color=ACCENT, label="$g_{random}$")
+    a2.errorbar(x, gr, yerr=gr_s, marker="s", ms=6, lw=2, capsize=3, color=ACCENT2, label="$g_{greedy}$")
     ipk = int(np.argmax(gp))
     a2.annotate("sweet spot", (x[ipk], gp[ipk]), (x[ipk] - 0.34, gp[ipk] + 0.03),
                 fontsize=9.5, color=ACCENT, arrowprops=dict(arrowstyle="->", color=ACCENT))
@@ -125,22 +125,22 @@ def fig_ctxnoise(df, out=None):
 
 
 def fig_predictors(df, out=None):
-    """Top per-tree predictors of g_1shot, by |Spearman|, coloured by causal link;
+    """Top per-tree predictors of g_random, by |Spearman|, coloured by causal link;
     partial correlation (controlling for all knobs) overlaid as a marker."""
     mets = ["edge_val_std", "val_spread", "val_std", "q_margin", "visit_entropy",
             "commit_top1", "exploit_explore_ratio", "subtree_size_gini",
             "mean_visited_depth", "div_action_div_mean"]
     controls = [c for c in ["horizon", "sim_horizon", "branching", "action_temp", "c_ucb",
                             "max_depth", "n_iterations", "ctx_noise"] if df[c].nunique() > 1]
-    rows = [(m, stats.spearmanr(df[m], df.g_1shot, nan_policy="omit")[0],
-             partial_spearman(df, m, "g_1shot", controls), schema.link_of(m)) for m in mets]
+    rows = [(m, stats.spearmanr(df[m], df.g_random, nan_policy="omit")[0],
+             partial_spearman(df, m, "g_random", controls), schema.link_of(m)) for m in mets]
     rows.sort(key=lambda r: abs(r[1]))
     fig, ax = plt.subplots(figsize=(7.8, 4.6)); despine(ax); ax.axvline(0, color=MUTED, lw=1)
     for i, (m, rho, par, lk) in enumerate(rows):
         ax.barh(i, rho, color=LINK_COLOR.get(lk, MUTED), height=0.6)
         ax.plot(par, i, "D", ms=6, color=INK, mfc="white", mew=1.4, zorder=5)
     ax.set_yticks(np.arange(len(rows))); ax.set_yticklabels([r[0] for r in rows])
-    ax.set_xlabel("Spearman correlation with $g_{1shot}$")
+    ax.set_xlabel("Spearman correlation with $g_{random}$")
     ax.set_title("Per-tree early-warning signals  (diamond = partial, controlling for all knobs)")
     handles = [plt.Rectangle((0, 0), 1, 1, color=LINK_COLOR[k]) for k in LINK_LABEL]
     ax.legend(handles, list(LINK_LABEL.values()), frameon=False, loc="lower right", fontsize=9)
@@ -150,18 +150,18 @@ def fig_predictors(df, out=None):
 def fig_mechanism(df, out=None):
     """Reward-diversity of the edges predicts whether planning helps."""
     import pandas as pd
-    d = df[["edge_val_std", "g_1shot", "success_g_1shot"]].replace([np.inf, -np.inf], np.nan).dropna()
+    d = df[["edge_val_std", "g_random", "success_g_random"]].replace([np.inf, -np.inf], np.nan).dropna()
     d = d.assign(bin=pd.qcut(d.edge_val_std, 6, duplicates="drop"))
     g = d.groupby("bin", observed=True)
     x = g.edge_val_std.mean().to_numpy()
-    gp, gp_s = g.g_1shot.mean().to_numpy(), g.g_1shot.sem().to_numpy()
+    gp, gp_s = g.g_random.mean().to_numpy(), g.g_random.sem().to_numpy()
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.6, 3.9)); despine(a1); despine(a2)
     a1.axhline(0, color=MUTED, lw=1, ls=(0, (4, 3)))
     a1.fill_between(x, gp - gp_s, gp + gp_s, color=LINK_COLOR["L2_diversity"], alpha=0.18)
     a1.plot(x, gp, marker="o", ms=6, lw=2, color=LINK_COLOR["L2_diversity"])
-    a1.set_xlabel("edge reward diversity  (edge_val_std)"); a1.set_ylabel("mean $g_{1shot}$")
+    a1.set_xlabel("edge reward diversity  (edge_val_std)"); a1.set_ylabel("mean $g_{random}$")
     a1.set_title("More reward-diverse edges -> better planning")
-    a2.plot(x, 100 * g.success_g_1shot.mean().to_numpy(), marker="o", ms=6, lw=2, color=LINK_COLOR["L2_diversity"])
+    a2.plot(x, 100 * g.success_g_random.mean().to_numpy(), marker="o", ms=6, lw=2, color=LINK_COLOR["L2_diversity"])
     a2.set_xlabel("edge reward diversity  (edge_val_std)"); a2.set_ylabel("planning-success rate (%)")
     a2.set_ylim(0, 100); a2.set_title("...and more reliable planning")
     fig.tight_layout()
@@ -173,7 +173,7 @@ def key_numbers(df, out=None):
     L = [f"rows={len(df)}  configs={df.config_id.nunique()}  inits={df.init_id.nunique()}"]
     for k in ["horizon", "max_depth", "ctx_noise", "sim_horizon", "c_ucb"]:
         x, m, _ = ofat(df, k)
-        L.append(f"{k}: g_1shot " + ", ".join(f"{xi:g}->{mi:+.3f}" for xi, mi in zip(x, m)))
+        L.append(f"{k}: g_random " + ", ".join(f"{xi:g}->{mi:+.3f}" for xi, mi in zip(x, m)))
     text = "\n".join(L) + "\n"
     if out is not None:
         (Path(out) / "key_numbers.txt").write_text(text)

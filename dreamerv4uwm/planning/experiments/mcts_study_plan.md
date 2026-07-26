@@ -136,11 +136,11 @@ feed `h*` back as a recommended horizon ceiling. E2/E3 are **per-tree**.
 | ID | Metric | How | Why | Prio | Needs |
 |---|---|---|---|---|---|
 | F1 | `peak_reward`, `delta_over_root` | best node reward on plan path; minus root reward | did the tree find anything better than the start | P0 | tree |
-| F2 | `gain_vs_random` (`g_rand`) | `peak_reward − peak(random rollouts, equal budget)` | **honest in-model test:** did *search* beat undirected sampling | P0 | base |
-| F3 | `gain_vs_policy` (`g_policy`) | `peak_reward − reward(policy-prior unroll, no search)` | Hamrick-style: did planning beat the policy alone | P0 | base |
+| F2 | `g_greedy` (gain vs shooting) | `tree_peak − peak(best of N depth-deep re-conditioned rollouts)` | **honest in-model test:** did *search* beat best-of-N random shooting | P0 | base |
+| F3 | `g_random` (gain vs 1 rollout) | `tree_peak − (one depth-deep re-conditioned rollout, no search)` | did planning beat a single undirected rollout at matched lookahead | P0 | base |
 | F4 | `seed_success_rate`, `seed_var` | fraction of inits with `peak_reward ≥ τ`; variance across seeds | reliability, not luck (aggregated per **condition**, not per tree) | P0 | (analysis) |
 | F5 | `predicted_vs_realized_gap` | tree `peak_reward` − realized return of executing the plan | joint model+search error; **the real success signal** | P2 | exec |
-| F6 | `budget_efficiency` | `g_rand`/`q_margin` vs `n_iterations` | where does it saturate → min budget per condition | P2 | (sweep over budget) |
+| F6 | `budget_efficiency` | `g_greedy`/`q_margin` vs `n_iterations` | where does it saturate → min budget per condition | P2 | (sweep over budget) |
 
 **Minimal high-value core** (if time-boxed, implement these first): A1–A4, B1–B4,
 C1–C2, D1–D4, F1–F3 + F4. These span all five links and directly test the
@@ -159,7 +159,7 @@ planning/experiments/study/
   model.py          # load_world_model(cfg) -> (denoiser, tokenizer, rollout, dims); reuses models.utils, bf16
   data.py           # sample_initial_contexts(dataset_cfg, n, seed) -> list[(ctx_z, ctx_a)]  (from real shards)
   descriptors.py    # StateDescriptor protocol; TPoseDescriptor (reuses reward debug); RewardScalarDescriptor; EncoderEmbedDescriptor (fallback)
-  baselines.py      # random_rollout_peak(...), policy_prior_peak(...)  -> g_rand, g_policy
+  baselines.py      # _rollout_random_peak(...), _rollout_greedy_peak(...)  -> g_random, g_greedy
   fidelity.py       # grounding_curve(), self_consistency(), fit_latent_bank(), ood_rate()  [model-level + per-tree]
   metrics.py        # compute_tree_metrics(tree, trace, phi, cfg) -> flat dict  (families A–E)
   run_tree.py       # build ONE tree for (plan_cfg, seed, init) -> metrics row (dict). Pure, deterministic given seed.
@@ -317,7 +317,7 @@ condition fixes.
   clean, self-consistent *collapse* signature across all families).
 - **M3 — sweep + config.** ☑ `run_sweep.py` + `config/{sweep,smoke}.yaml`. Verified locally: 6-tree
   smoke, disjoint 2-task array split, resume (0 rows on rerun), OFAT factor varies, metrics sane.
-  The smoke already reproduces the hypothesis (ctx_noise↑ → bci↓, val_std↑, ratio↓, g_policy→+).
+  The smoke already reproduces the hypothesis (ctx_noise↑ → bci↓, val_std↑, ratio↓, g_random→+).
 - **M4 — cluster.** ◐ `hpc/slurms/mcts_sweep.slurm` (parameterized template) + `study/README.md`
   written. **Blocked on:** filling the container/overlay paths (open #3) and a cluster timing run
   to set `--time`. Local full-config timing was impossible (shared 98GB GPU saturated by other jobs).
@@ -332,7 +332,7 @@ condition fixes.
 > **Empirical note (M2 smoke, first tree, short-horizon config).** The metrics fired
 > consistently: diversity collapsed (`bci=0.67`, `duplicate_rate=1.0`, `outcome_div≈0.006`),
 > values flat (`val_std=0.026`), selection noise-dominated (`exploit_explore_ratio=17.3`,
-> `visit_entropy=0.985`), planning gain ≈0 (`g_rand≈g_policy≈0`). The instrumentation
+> `visit_entropy=0.985`), planning gain ≈0 (`g_greedy≈g_random≈0`). The instrumentation
 > distinguishes the two L4 regimes via the ratio: ≫1 = flat-value/noise (seen here), ≪1 = greedy.
 
 ---
@@ -340,8 +340,8 @@ condition fixes.
 ## 10. Open questions
 
 **Resolved (2026-07-10):**
-1. ☑ **Outcome truth → in-model baselines.** No executor. Outcome = `g_rand` + `g_policy`
-   (in-model, equal budget) + seed variance (F1–F4). **F5 deferred** behind the `Executor` hook.
+1. ☑ **Outcome truth → in-model baselines.** No executor. Outcome = `g_greedy` + `g_random`
+   (in-model, matched lookahead) + seed variance (F1–F4). **F5 deferred** behind the `Executor` hook.
 2. ☑ **Cluster → NYU HPC (SLURM).** Write the array job; run in the Singularity+conda overlay.
 
 **Still open:**

@@ -8,10 +8,10 @@ on every chart:
 That's it. Making a new chart is a few lines of matplotlib on ``df[col]`` --- copy one
 of these as a template.
 
-    charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", "g_1shot")   # a knob sweep
-    charts.scatter(df, "edge_val_std", "g_1shot", color="ctx_noise")        # metric vs outcome
+    charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", "g_random")  # a knob sweep
+    charts.scatter(df, "edge_val_std", "g_random", color="ctx_noise")       # metric vs outcome
     charts.hist(df, "root_bci")                                             # a distribution
-    charts.corr_bars(df, "g_1shot")                                        # what predicts the outcome
+    charts.corr_bars(df, "g_random")                                       # what predicts the outcome
 """
 from __future__ import annotations
 
@@ -23,9 +23,9 @@ BLUE, RED, GREY = "#4c78a8", "#e45756", "#888888"
 # columns to exclude when ranking "what predicts the outcome" (metric_cols):
 _META = {"config_id", "config_tag", "window_idx", "t0", "init_id",   # ids / bookkeeping
          "plan_seed", "plan_secs", "dtype", "edge_mode"}
-_OUTCOMES = {"g_1shot", "g_shootN", "g_1shot_fair", "g_shootN_fair",  # the outcomes themselves
+_OUTCOMES = {"g_random", "g_greedy",                                  # the outcomes themselves
              "delta_over_root", "tree_peak", "root_reward",
-             "oneshot_peak", "shootN_peak", "oneshot_fair_peak", "shootN_fair_peak",
+             "random_peak", "greedy_peak",
              "best_node_value", "best_edge_val_on_plan", "best_edge_val_tree"}
 _OTHERS = {"n_forward"}                                               # compute cost, not a diagnostic
 # (derived success_<outcome> flags are also excluded, by name prefix, in metric_cols)

@@ -13,7 +13,7 @@ per tree, and writes CSV shards for analysis. Metrics/rationale:
 | `data.py` | sample reproducible initial contexts from real PushT shards |
 | `descriptors.py` | `StateDescriptor` — T-pose (PushT) + env-agnostic fallbacks |
 | `metrics.py` | `compute_tree_metrics` → ~47 tree metrics (families A–E + tree-internal F) |
-| `baselines.py` | in-model outcomes `g_shootN`, `g_1shot` |
+| `baselines.py` | in-model outcomes `g_random`, `g_greedy` |
 | `run_tree.py` | `run_one_tree` → one flat CSV row |
 | `run_sweep.py` | expand grid → job list → CSV shard (array-sliced, resumable) |
 | `curate.py` | descriptor-assisted proposer → diverse curated init set (YAML + contact sheet) |
@@ -75,7 +75,7 @@ accordingly. Rough plan-doc estimate: Tier-1 OFAT (~30 cfg × 20 init ≈ 600 tr
 
 ## Output
 `shard_<task>.csv`, one row per tree: `config_id, config_tag, window_idx, t0, init_id`, all
-`PlanConfig` factors, timing, outcome (`tree_peak, g_shootN, g_1shot, delta_over_root, …`), and every
+`PlanConfig` factors, timing, outcome (`tree_peak, g_random, g_greedy, delta_over_root, …`), and every
 tree metric. Concatenate shards for analysis.
 
 ## Analyse (after the sweep)
@@ -84,7 +84,7 @@ $PY -m dreamerv4uwm.planning.experiments.study.analysis.report \
     --input-dir /scratch/mcts_sweep/run1/results --out-dir /scratch/mcts_sweep/run1/analysis
 ```
 Produces `trees.parquet` (one row per tree), `overview.txt`, `correlations.csv` (each metric's
-Spearman with `g_1shot`), and `figures/` (a per-knob response curve, the predictor bars, an outcome
+Spearman with `g_random`), and `figures/` (a per-knob response curve, the predictor bars, an outcome
 histogram, the mechanism scatter). For richer stats (mutual information, partial correlation,
 gradient-boosted importance) run the `correlate` module; for the polished deck figures run `plots --deck`.
 

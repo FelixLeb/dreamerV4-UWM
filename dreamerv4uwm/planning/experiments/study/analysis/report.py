@@ -16,7 +16,7 @@ from . import dataset, charts
 KNOBS = ["horizon", "max_depth", "ctx_noise", "sim_horizon", "branching", "c_ucb"]
 
 
-def run(shards_dir, out_dir, outcome="g_1shot"):
+def run(shards_dir, out_dir, outcome="g_random"):
     od = Path(out_dir); figs = od / "figures"; figs.mkdir(parents=True, exist_ok=True)
 
     df = dataset.build(shards_dir, out=od / "trees.parquet")
@@ -39,7 +39,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-dir", required=True, help="dir with shard_*.csv")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--outcome", default="g_1shot")
+    ap.add_argument("--outcome", default="g_random")
     a = ap.parse_args(argv)
     run(a.input_dir, a.out_dir, a.outcome)
 

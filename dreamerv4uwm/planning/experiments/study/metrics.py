@@ -2,7 +2,7 @@
 
 ``compute_tree_metrics(planner, descriptor)`` returns a flat ``dict`` of scalars
 (one CSV row's worth) covering families A–E and the tree-internal part of F from
-``../mcts_study_plan.md``. Baselines (g_shootN, g_1shot) and the root reward live
+``../mcts_study_plan.md``. Baselines (g_random, g_greedy) and the root reward live
 in ``baselines.py`` / ``run_tree.py`` because they need the model; everything here
 is computed from the finished tree object (+ its ``trace`` for time-resolved
 metrics) and a pluggable ``StateDescriptor`` for diversity.
@@ -278,7 +278,7 @@ def _diversity(planner, descriptor) -> Dict[str, float]:
 
 def _outcome_internal(planner, result) -> Dict[str, float]:
     """Family F (tree-internal part only). The reward-vs-baseline gains that actually grade
-    the plan (``g_1shot`` etc.) need the world model and live in ``baselines.py``; here we
+    the plan (``g_random`` etc.) need the world model and live in ``baselines.py``; here we
     record only quantities readable straight off the finished tree / plan path."""
     out = {"best_node_value": float(planner._best_node().value) if planner.all_nodes else NAN}
     bp = (result or {}).get("best_path") or []       # nodes on the returned root->best path
