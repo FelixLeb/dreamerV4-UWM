@@ -61,6 +61,7 @@ base_plan:
   ctx_noise: 0.5
   ctx_noise_honest: true
   action_temp: 1.0
+  action_prior: normal      # action noise prior: normal (action_temp*N(0,I)) | uniform (std-matched)
   max_ctx: 16
 
 sweep:
@@ -71,6 +72,7 @@ sweep:
     sim_horizon:   [8, 16, 28]
     branching:     [3, 5, 8]
     action_temp:   [0.5, 1.0, 1.5]
+    action_prior:  [normal, uniform]
     c_ucb:         [0.5, 2.0, 8.0]
     max_depth:     [2, 3, 5]
     n_iterations:  [16, 32, 48]

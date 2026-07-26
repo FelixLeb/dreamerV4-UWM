@@ -41,6 +41,7 @@ base_plan:
   ctx_noise: 0.5
   ctx_noise_honest: true
   action_temp: 1.0
+  action_prior: normal     # normal (action_temp*N(0,I)) | uniform (std-matched); override: base_plan.action_prior=uniform
   max_ctx: 16
 
 sweep:

@@ -25,6 +25,11 @@ same levers:
 * ``action_temp`` — std of the action noise prior. Flow matching transports the
   prior ``N(0, I)`` to ``p(a|o)``; scaling the prior std is a temperature-like
   control. ``!= 1`` is mildly OOD (the model only ever saw std-1 priors).
+* ``action_prior`` — shape of that action noise prior: ``"normal"`` (default,
+  ``action_temp * N(0, I)``) or ``"uniform"`` (``U(-a, a)`` with ``a = action_temp *
+  sqrt(3)``, i.e. std-matched to the normal case). Uniform is a flat, bounded prior —
+  more OOD than the Gaussian one, an alternative lever on action diversity. Only affects
+  action-sampling rollouts (``policy`` / ``imagine``), not ``transition`` (given actions).
 * ``K`` — number of Euler integration steps.
 
 Convention reminder (matches ``sampling_new.py``): ``n`` is *noise level*
@@ -38,6 +43,7 @@ the bf16 world-model reconstruction error is within noise of fp32.
 """
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 from typing import Optional, Tuple
 
@@ -83,6 +89,25 @@ def _build_context(ctx_z, ctx_a, ctx_noise, ctx_noise_honest, N, gen):
     return z_ctx, ctx_a, obs_idx
 
 
+def _action_prior(B, H, n_act, *, action_temp, action_prior, device, generator):
+    """Sample the horizon **action** noise prior the flow integrates from.
+
+    * ``"normal"``  — ``action_temp * N(0, I)`` (std ``action_temp``); the prior the
+      denoiser was trained with. ``action_temp != 1`` is mildly OOD.
+    * ``"uniform"`` — ``U(-a, a)`` with ``a = action_temp * sqrt(3)``, so its std still
+      equals ``action_temp`` (temperature-matched to the normal case — a flat, bounded
+      prior instead of a Gaussian one). More OOD than the Gaussian prior (the flow only
+      ever saw ``N(0, I)``), but a different way to inject action diversity.
+    """
+    if action_prior == "normal":
+        return action_temp * torch.randn(B, H, n_act, device=device, generator=generator)
+    if action_prior == "uniform":
+        a = action_temp * math.sqrt(3.0)
+        u = torch.rand(B, H, n_act, device=device, generator=generator)   # U(0, 1)
+        return a * (2.0 * u - 1.0)                                         # U(-a, a), std = action_temp
+    raise ValueError(f"unknown action_prior={action_prior!r} (expected 'normal' or 'uniform')")
+
+
 # ---------------------------------------------------------------------------
 # policy mode :  p(a_{t:t+H} | o_{<=t})
 # ---------------------------------------------------------------------------
@@ -99,6 +124,7 @@ def policy(
     ctx_noise: float = 0.0,
     ctx_noise_honest: bool = True,
     action_temp: float = 1.0,
+    action_prior: str = "normal",
     dtype: Optional[torch.dtype] = torch.bfloat16,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
@@ -119,7 +145,8 @@ def policy(
     a = torch.empty(B, T, n_act, device=device)
     z[:, :Tc], a[:, :Tc] = z_ctx, a_ctx
     z[:, Tc:] = torch.randn(B, H, N_lat, D_lat, device=device, generator=generator)  # held at noise
-    a[:, Tc:] = action_temp * torch.randn(B, H, n_act, device=device, generator=generator)
+    a[:, Tc:] = _action_prior(B, H, n_act, action_temp=action_temp, action_prior=action_prior,
+                              device=device, generator=generator)
 
     step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
     is_hor = make_is_horizon(T, ctx_len=Tc, device=device)
@@ -218,6 +245,7 @@ def imagine(
     ctx_noise: float = 0.0,
     ctx_noise_honest: bool = True,
     action_temp: float = 1.0,
+    action_prior: str = "normal",
     dtype: Optional[torch.dtype] = torch.bfloat16,
     generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -241,7 +269,8 @@ def imagine(
     a = torch.empty(B, T, n_act, device=device)
     z[:, :Tc], a[:, :Tc] = z_ctx, a_ctx
     z[:, Tc:] = torch.randn(B, H, N_lat, D_lat, device=device, generator=generator)
-    a[:, Tc:] = action_temp * torch.randn(B, H, n_act, device=device, generator=generator)
+    a[:, Tc:] = _action_prior(B, H, n_act, action_temp=action_temp, action_prior=action_prior,
+                              device=device, generator=generator)
 
     step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
     is_hor = make_is_horizon(T, ctx_len=Tc, device=device)

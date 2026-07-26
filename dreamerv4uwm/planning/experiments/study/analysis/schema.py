@@ -15,8 +15,8 @@ META = ["config_id", "config_tag", "reward_kind", "descriptor_kind", "window_idx
 
 # swept knobs (independent variables)
 FACTORS = ["ctx_noise", "horizon", "sim_horizon", "branching", "action_temp",
-           "c_ucb", "max_depth", "n_iterations", "sim_rollouts", "K_steps",
-           "gamma", "max_ctx", "n_min", "ctx_noise_honest"]
+           "action_prior", "c_ucb", "max_depth", "n_iterations", "sim_rollouts",
+           "K_steps", "gamma", "max_ctx", "n_min", "ctx_noise_honest"]
 
 # dependent variables (did planning help?). *_fair = vs a baseline built the same
 # way as the plan (depth-deep, re-conditioned); the un-suffixed = vs a flat rollout.
@@ -127,6 +127,7 @@ DESCRIPTIONS = {
     "ctx_noise": "noise mixed into the observation context (0=clean) - the diversity lever",
     "ctx_noise_honest": "tell the model the true context-noise level (vs. claim 'clean')",
     "action_temp": "std of the action noise prior (sampling temperature)",
+    "action_prior": "action noise-prior distribution: normal (action_temp*N(0,I)) | uniform (std-matched U)",
     "max_ctx": "max context frames kept per node",
     # --- outcomes ---
     "tree_peak": "best single-frame reward over the frames of the RETURNED PLAN",

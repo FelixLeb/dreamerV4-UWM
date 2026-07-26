@@ -69,9 +69,10 @@ class PlanConfig:
     max_depth: int = 4            # cap on tree depth
     # --- rollout / bookkeeping ---
     K_steps: int = 6              # number of denoiser steps per rollout 
-    ctx_noise: float = 0.5        # diversity so pi_prior branches 
+    ctx_noise: float = 0.5        # diversity so pi_prior branches
     ctx_noise_honest: bool = True # False -> lie to the denoiser about the context noise
     action_temp: float = 1.0      # temperature for sampling actions from pi_prior
+    action_prior: str = "normal"  # action noise prior: "normal" (action_temp*N(0,I)) | "uniform" (std-matched)
     max_ctx: int = 16             # max context length (frames) to keep in the tree
     dtype: Optional[torch.dtype] = torch.bfloat16
 
@@ -170,7 +171,8 @@ class MCTS:
         elif c.edge_mode == "two_stage":
             a = R.policy(self.denoiser, node.ctx_z, node.ctx_a, H, B=B, K=c.K_steps,
                          ctx_noise=c.ctx_noise, ctx_noise_honest=c.ctx_noise_honest,
-                         action_temp=c.action_temp, dtype=c.dtype, generator=self.gen)
+                         action_temp=c.action_temp, action_prior=c.action_prior,
+                         dtype=c.dtype, generator=self.gen)
             z = R.transition(self.denoiser, node.ctx_z, node.ctx_a, a, K=c.K_steps,
                              ctx_noise=c.ctx_noise, ctx_noise_honest=c.ctx_noise_honest,
                              dtype=c.dtype, generator=self.gen)
@@ -179,7 +181,8 @@ class MCTS:
         else:  # joint imagination (default)
             out = R.imagine(self.denoiser, node.ctx_z, node.ctx_a, H, B=B, K=c.K_steps,
                             ctx_noise=c.ctx_noise, ctx_noise_honest=c.ctx_noise_honest,
-                            action_temp=c.action_temp, dtype=c.dtype, generator=self.gen)
+                            action_temp=c.action_temp, action_prior=c.action_prior,
+                            dtype=c.dtype, generator=self.gen)
         self.n_forward += 1
         return out
 

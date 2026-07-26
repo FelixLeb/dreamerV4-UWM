@@ -31,18 +31,18 @@ from ... import rollout as R
 
 @torch.no_grad()
 def _rollout_peak(denoiser, reward_fn, ctx_z, ctx_a, *, H, B, K, ctx_noise,
-                  ctx_noise_honest, action_temp, dtype, gen) -> float:
+                  ctx_noise_honest, action_temp, action_prior, dtype, gen) -> float:
     """Best single-frame reward over B rollouts of length H (one flat rollout each)."""
     z, _ = R.imagine(denoiser, ctx_z, ctx_a, H, B=B, K=K, ctx_noise=ctx_noise,
                      ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
-                     dtype=dtype, generator=gen)
+                     action_prior=action_prior, dtype=dtype, generator=gen)
     r = reward_fn(z)                       # (B, H)
     return float(r.max().item())
 
 
 @torch.no_grad()
 def _rollout_fair_peak(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K, ctx_noise,
-                       ctx_noise_honest, action_temp, dtype, max_ctx, gen) -> float:
+                       ctx_noise_honest, action_temp, action_prior, dtype, max_ctx, gen) -> float:
     """Best single-frame reward over B *no-search* rollouts built like the tree's plan.
 
     Each of the B rollouts runs ``depth`` edges of ``H`` frames, and after every edge
@@ -58,7 +58,7 @@ def _rollout_fair_peak(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K, ctx
     for _ in range(max(int(depth), 1)):
         z, a = R.imagine(denoiser, cz, ca, H, B=B, K=K, ctx_noise=ctx_noise,
                          ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
-                         dtype=dtype, generator=gen)          # (B,H,N,D), (B,H,n_act)
+                         action_prior=action_prior, dtype=dtype, generator=gen)   # (B,H,N,D), (B,H,n_act)
         best = max(best, float(reward_fn(z).max().item()))    # exclude start frame, like tree_peak
         cz = torch.cat([cz, z], dim=1)[:, -max_ctx:].contiguous()   # advance ctx (== _advance_ctx)
         ca = torch.cat([ca, a], dim=1)[:, -max_ctx:].contiguous()
@@ -80,7 +80,7 @@ def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: floa
     gen = torch.Generator(device=dev).manual_seed(seed)
     root_reward = float(reward_fn(ctx_z[:, -1:]).reshape(-1)[0].item())
     kw = dict(K=cfg.K_steps, ctx_noise=cfg.ctx_noise, ctx_noise_honest=cfg.ctx_noise_honest,
-              action_temp=cfg.action_temp, dtype=cfg.dtype, gen=gen)
+              action_temp=cfg.action_temp, action_prior=cfg.action_prior, dtype=cfg.dtype, gen=gen)
     out = {"root_reward": root_reward, "delta_over_root": tree_peak - root_reward}
 
     if flat:  # single sim_horizon rollout (cheap, unequal lookahead)
