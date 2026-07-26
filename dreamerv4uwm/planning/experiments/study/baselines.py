@@ -13,6 +13,14 @@ Since there is no closed-loop simulator, "did planning help?" is measured
   Same lookahead (``horizon*max_depth``) and same edge-by-edge, re-anchored
   construction as the plan, so ``g`` credits *search*, not horizon or roll-out style.
 
+**Caveat (edge_mode).** Both baseline families always build edges with the ``imagine``
+sampler (they respect the shared knobs ``ctx_noise`` / ``action_temp`` / ``action_prior``,
+but not ``edge_mode`` or the autoregressive-only ``action_noise``). So under
+``edge_mode='two_stage'`` or ``'autoregressive'`` the fair baseline still *imagines* each
+edge, and ``g_*_fair`` then also reflects the tree's edge-sampler choice, not search
+alone. If you want ``g_*_fair`` to isolate search under a non-default sampler, the fair
+baseline would need to build edges with that same sampler.
+
 Outputs (per tree):
   flat: ``g_shootN``, ``g_1shot``       (baselines ``shootN_peak``, ``oneshot_peak``)
   fair: ``g_shootN_fair``, ``g_1shot_fair`` (baselines ``shootN_fair_peak``, ``oneshot_fair_peak``)

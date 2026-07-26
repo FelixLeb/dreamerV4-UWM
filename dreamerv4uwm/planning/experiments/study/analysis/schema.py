@@ -11,11 +11,12 @@ import pandas as pd
 
 # identifiers / bookkeeping — never analysed as variables
 META = ["config_id", "config_tag", "reward_kind", "descriptor_kind", "window_idx",
-        "t0", "init_id", "plan_seed", "plan_secs", "dtype", "edge_mode"]
+        "t0", "init_id", "plan_seed", "plan_secs", "dtype"]
 
 # swept knobs (independent variables)
 FACTORS = ["ctx_noise", "horizon", "sim_horizon", "branching", "action_temp",
-           "action_prior", "c_ucb", "max_depth", "n_iterations", "sim_rollouts",
+           "action_prior", "action_noise", "action_noise_dist", "edge_mode",
+           "c_ucb", "max_depth", "n_iterations", "sim_rollouts",
            "K_steps", "gamma", "max_ctx", "n_min", "ctx_noise_honest"]
 
 # dependent variables (did planning help?). *_fair = vs a baseline built the same
@@ -111,7 +112,7 @@ DESCRIPTIONS = {
     "init_id": "index of the curated initial state (decision point)",
     "plan_seed": "RNG seed of the planner for this tree",
     "plan_secs": "wall-clock seconds spent building this tree",
-    "edge_mode": "edge generator: 'imagine' (joint action+state) or 'two_stage'",
+    "edge_mode": "edge sampler: 'imagine' (joint) | 'two_stage' (policy->WM whole horizon) | 'autoregressive' (step-by-step)",
     "dtype": "autocast dtype used for the rollouts (bfloat16)",
     # --- factors (the swept knobs) ---
     "horizon": "H - frames per EDGE rollout (how long each tree edge is)",
@@ -128,6 +129,8 @@ DESCRIPTIONS = {
     "ctx_noise_honest": "tell the model the true context-noise level (vs. claim 'clean')",
     "action_temp": "std of the action noise prior (sampling temperature)",
     "action_prior": "action noise-prior distribution: normal (action_temp*N(0,I)) | uniform (std-matched U)",
+    "action_noise": "(autoregressive edge only) magnitude of extra noise added to each policy action (0=none)",
+    "action_noise_dist": "(autoregressive edge only) shape of that added noise: normal | uniform (std-matched)",
     "max_ctx": "max context frames kept per node",
     # --- outcomes ---
     "tree_peak": "best single-frame reward over the frames of the RETURNED PLAN",

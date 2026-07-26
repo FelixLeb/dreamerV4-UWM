@@ -42,6 +42,8 @@ base_plan:
   ctx_noise_honest: true
   action_temp: 1.0
   action_prior: normal     # normal (action_temp*N(0,I)) | uniform (std-matched); override: base_plan.action_prior=uniform
+  action_noise: 0.0        # (edge_mode=autoregressive only) magnitude of noise ADDED to each policy action
+  action_noise_dist: normal # (edge_mode=autoregressive only) normal | uniform
   max_ctx: 16
 
 sweep:
