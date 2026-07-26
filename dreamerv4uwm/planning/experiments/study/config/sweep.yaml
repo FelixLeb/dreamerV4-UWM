@@ -3,7 +3,7 @@
 
 output_dir: ???            # REQUIRED, e.g. /scratch/<net_id>/mcts_sweep/run1
 seed: 0                    # (random mode only) seed for initial-context sampling
-n_random: 16              # baseline undirected rollouts for g_shootN
+n_random: 16              # rollouts for the greedy (best-of-N shooting) baseline
 
 # initial contexts: a curated set (recommended) or random sampling
 inits:
@@ -47,10 +47,10 @@ descriptor:
 
 # baseline PlanConfig; OFAT perturbs one factor at a time from here
 base_plan:
-  horizon: 20
+  horizon: 12               # 20
   branching: 5
   edge_mode: imagine
-  sim_horizon: 20
+  sim_horizon: 12           # 20
   sim_rollouts: 3
   n_iterations: 32
   c_ucb: 0.5
@@ -70,20 +70,18 @@ sweep:
   # Tier 1 — one factor at a time (interpretable main effects)
   ofat:
     ctx_noise:     [0.0, 0.3, 0.5, 0.7, 0.9]
-    horizon:       [6, 12, 20, 28]
-    sim_horizon:   [8, 16, 28]
+    horizon:       [6, 12, 20]
+    sim_horizon:   [4, 8, 12, 20]
     branching:     [3, 5, 8]
     action_temp:   [0.5, 1.0, 1.5]
     action_prior:  [normal, uniform]
-    edge_mode:     [imagine, two_stage, autoregressive]   # the edge sampler
+    # edge_mode:     [imagine, two_stage]   # fast samplers only
     c_ucb:         [0.5, 2.0, 8.0]
     max_depth:     [2, 3, 5]
     n_iterations:  [16, 32, 48]
-    # action_noise / action_noise_dist only take effect under edge_mode=autoregressive,
-    # so sweeping them from the imagine baseline is inert. To study them, run a sweep with
-    # base_plan.edge_mode=autoregressive and add e.g.:
-    #   action_noise:      [0.1, 0.3]
-    #   action_noise_dist: [normal, uniform]
+    # NOTE: the AUTOREGRESSIVE edge sampler (and its action_noise / action_noise_dist knobs)
+    # is swept SEPARATELY in config/sweep_autoregressive.yaml — it does ~2*horizon denoiser
+    # passes per edge (order minutes/tree, not seconds), so it's kept out of this run.
   # Tier 2 — random joint samples over the same grids (interactions + predictive model)
   random:
     n_samples: 0             # set e.g. 500 for the full Tier-2 run
