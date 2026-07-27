@@ -44,13 +44,17 @@ def despine(ax):
 
 def ofat(df, factor, col="g_random"):
     """(x, mean, sem) of ``col`` at each ``factor`` setting, over that factor's OFAT
-    slice (falls back to all rows when ``factor`` is not an OFAT axis)."""
+    slice (falls back to all rows when ``factor`` is not an OFAT axis). ``x`` is float for
+    a numeric factor, else the categorical labels (strings) — so this never crashes on a
+    string/bool knob like ``action_prior`` / ``edge_mode`` / ``ctx_noise_honest``."""
     m = df.config_tag.str.startswith(f"ofat.{factor}=") | (df.config_tag == "base")
     sub = df[m]
     if sub[factor].nunique() < 2:
         sub = df
-    g = sub.replace([np.inf, -np.inf], np.nan).groupby(factor)[col]
-    return g.mean().index.to_numpy(float), g.mean().to_numpy(float), g.sem().to_numpy(float)
+    g = sub.replace([np.inf, -np.inf], np.nan).groupby(factor, observed=True)[col]
+    xi = g.mean().index.to_numpy()
+    x = xi.astype(float) if np.issubdtype(xi.dtype, np.number) else xi
+    return x, g.mean().to_numpy(float), g.sem().to_numpy(float)
 
 
 def _save(fig, out):

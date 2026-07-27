@@ -9,6 +9,7 @@ That's it. Making a new chart is a few lines of matplotlib on ``df[col]`` --- co
 of these as a template.
 
     charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", "g_random")  # a knob sweep
+    charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", ["g_random", "g_greedy"])  # >1 outcome
     charts.scatter(df, "edge_val_std", "g_random", color="ctx_noise")       # metric vs outcome
     charts.hist(df, "root_bci")                                             # a distribution
     charts.corr_bars(df, "g_random")                                       # what predicts the outcome
@@ -66,13 +67,30 @@ def _done(ax, save, made):
 # --- charts -----------------------------------------------------------------
 
 def response(df, factor, y, ax=None, save=None):
-    """Mean +/- SEM of ``y`` at each value of ``factor`` (a line with error bars)."""
-    g = df.groupby(factor)[y]
+    """Mean +/- SEM of ``y`` at each value of ``factor``. A **numeric** factor draws a line
+    with error bars; a **categorical** (string/bool) factor draws error-bar points at
+    labelled tick positions (so `action_prior` / `edge_mode` / `ctx_noise_honest` plot too).
+
+    ``y`` may be a **single column** (one line, as before) or a **list of columns** — each is
+    drawn as its own labelled line with a legend, e.g. ``["g_random", "g_greedy"]`` to compare
+    outcomes on one axis (they share the ``factor`` grouping and x-axis)."""
+    ys = [y] if isinstance(y, str) else list(y)
     ax, made = _ax(ax, (5, 3.4))
-    ax.errorbar(g.mean().index, g.mean().to_numpy(), yerr=g.sem().to_numpy(),
-                marker="o", capsize=3, color=BLUE)
+    idx = df.groupby(factor, observed=True)[ys[0]].mean().index      # same x for every outcome
+    numeric = pd.api.types.is_numeric_dtype(idx)
+    xpos = idx.to_numpy(float) if numeric else list(range(len(idx)))
+    for i, yi in enumerate(ys):
+        g = df.groupby(factor, observed=True)[yi]
+        ax.errorbar(xpos, g.mean().to_numpy(float), yerr=g.sem().to_numpy(float),
+                    marker="o", capsize=3, ls=("-" if numeric else "none"),
+                    color=(BLUE if len(ys) == 1 else f"C{i}"), label=yi)
+    if not numeric:                          # categorical: string ticks at 0,1,2,...
+        ax.set_xticks(list(xpos), [str(v) for v in idx])
     ax.axhline(0, color=GREY, lw=0.8, ls="--")
-    ax.set(xlabel=factor, ylabel=y, title=f"{y} vs {factor}")
+    ax.set(xlabel=factor, ylabel=(ys[0] if len(ys) == 1 else "value"),
+           title=(f"{ys[0]} vs {factor}" if len(ys) == 1 else f"outcomes vs {factor}"))
+    if len(ys) > 1:
+        ax.legend(fontsize=8, frameon=False)
     return _done(ax, save, made)
 
 
