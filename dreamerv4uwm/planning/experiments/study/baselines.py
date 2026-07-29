@@ -7,10 +7,24 @@ and truncating to ``max_ctx``, exactly like MCTS ``_advance_ctx``) — so they s
 lookahead (``horizon*max_depth``) and edge-by-edge construction, and ``g`` credits *search*,
 not horizon or roll-out style. They differ only in how many rollouts they draw:
 
-* **random** (``_rollout_random_peak``) — a SINGLE depth-deep rollout: one sample per edge,
-  no selection. The undirected control ("act on the prior once, roll forward").
-* **greedy** (``_rollout_greedy_peak``) — the best of ``n_random`` depth-deep rollouts
-  (random shooting): draw N and keep the best. The "greedily pick the best of N" control.
+* **random** (``_rollout_random_peak`` / ``_rollout_random_last``) — a SINGLE depth-deep
+  rollout: one sample per edge, no selection. The undirected control ("act on the prior
+  once, roll forward").
+* **greedy** (``_rollout_greedy_peak`` / ``_rollout_greedy_last``) — the best of
+  ``n_random`` depth-deep rollouts (random shooting): draw N and keep the best. The
+  "greedily pick the best of N" control.
+
+Each control is read out under **two objectives**, because they answer different questions:
+
+* ``*_peak`` — best reward over ANY frame of the rollout (MPC-style, matching the tree's
+  best-prefix back-up), and
+* ``*_last`` — reward of the **final** state only ("where did you end up"), the natural
+  objective when the task is to *reach and hold* a configuration rather than to pass
+  through a good one. A plan that shoves the T across the centre and out again scores
+  well on ``peak`` and badly on ``last``.
+
+Both are computed from the SAME rollouts and the same reward evaluation, so the ``last``
+readout costs no extra decodes (the reward is already evaluated on every frame).
 
 **Caveat (edge_mode).** Both baselines build edges with the ``imagine`` sampler (they respect
 ``ctx_noise`` / ``action_temp`` / ``action_prior`` but not ``edge_mode`` or the
@@ -19,12 +33,19 @@ the baselines still *imagine* each edge, and ``g_random`` / ``g_greedy`` then al
 tree's edge-sampler choice, not search alone. To isolate search under a non-default sampler,
 the baselines would need to build edges with that same sampler.
 
-Outputs (per tree): ``g_random`` (baseline ``random_peak``), ``g_greedy`` (baseline
-``greedy_peak``), and ``delta_over_root``. All peaks are "best reward over any frame of the
-rollout" (MPC-style, matching the tree's best-prefix objective; the start/context frame is
-excluded, as in ``tree_peak``).
+Outputs (per tree): the baseline readouts ``random_peak`` / ``greedy_peak`` /
+``random_last`` / ``greedy_last``, the peak gains ``g_random`` / ``g_greedy`` (vs
+``tree_peak``), the terminal gains ``g_random_last`` / ``g_greedy_last`` (vs ``tree_last``),
+and ``delta_over_root``. The start/context frame is excluded from every readout, as in
+``tree_peak``.
+
+**Compare like with like.** A ``*_last`` baseline is only meaningful against the plan's
+*final* state (``tree_last``), never against ``tree_peak`` — mixing the two would score the
+planner on its best moment and the baseline on its last one.
 """
 from __future__ import annotations
+
+from typing import Tuple
 
 import torch
 
@@ -32,82 +53,101 @@ from ... import rollout as R
 
 
 @torch.no_grad()
-def _rollout_random_peak(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, K, ctx_noise,
-                         ctx_noise_honest, action_temp, action_prior, dtype, max_ctx, gen) -> float:
-    """Best single-frame reward over ONE no-search rollout built like the tree's plan.
+def _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K, ctx_noise,
+                           ctx_noise_honest, action_temp, action_prior, dtype, max_ctx,
+                           gen) -> Tuple[float, float]:
+    """Run ``B`` no-search depth-deep rollouts; return ``(peak, last)``.
 
-    A single depth-deep trajectory: ``depth`` edges of ``H`` frames, re-conditioning the
-    context after each edge (imagined states/actions appended, truncated to ``max_ctx`` —
-    mirroring MCTS ``_advance_ctx``). One rollout per edge, no selection, so this is the
-    *undirected* control at the plan's lookahead (``depth*H`` frames): the tree adds *search*
-    over it.
+    ``B`` independent depth-deep trajectories in parallel: ``depth`` edges of ``H`` frames,
+    each re-conditioned on its OWN imagination after every edge (states/actions appended,
+    truncated to ``max_ctx`` — mirroring MCTS ``_advance_ctx``). Same lookahead
+    (``depth*H``) and same edge-by-edge construction as the plan; no selection happens
+    between edges, so the only thing the tree adds on top is the *search*.
+
+    Two readouts off the same rollouts and the same reward evaluation:
+      ``peak`` — best reward over ANY frame, any edge, any of the ``B`` rollouts;
+      ``last`` — best reward over the ``B`` **final** states (last frame of the last edge).
+
+    ``B=1`` is the undirected "random" control; ``B=n_random`` is the "greedy" random-shooting
+    control. ``peak >= last`` always holds, since the terminal frames are a subset of all
+    frames.
     """
-    cz, ca = ctx_z, ctx_a                                       # B = 1 (single rollout)
-    best = float("-inf")
-    for _ in range(max(int(depth), 1)):
-        z, a = R.imagine(denoiser, cz, ca, H, B=1, K=K, ctx_noise=ctx_noise,
-                         ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
-                         action_prior=action_prior, dtype=dtype, generator=gen)   # (1,H,N,D)
-        best = max(best, float(reward_fn(z).max().item()))         # exclude start frame, like tree_peak
-        cz = torch.cat([cz, z], dim=1)[:, -max_ctx:].contiguous()  # advance ctx (== _advance_ctx)
-        ca = torch.cat([ca, a], dim=1)[:, -max_ctx:].contiguous()
-    return best
-
-
-@torch.no_grad()
-def _rollout_greedy_peak(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K, ctx_noise,
-                         ctx_noise_honest, action_temp, action_prior, dtype, max_ctx, gen) -> float:
-    """Best single-frame reward over B *no-search* depth-deep rollouts — random shooting.
-
-    Runs B independent depth-deep trajectories in parallel (each ``depth`` edges of ``H``
-    frames, re-conditioned on its OWN imagination, truncated to ``max_ctx`` like MCTS
-    ``_advance_ctx``) and keeps the best reward over all of them. Same lookahead and
-    construction as the plan; the only thing the tree adds is the *search* (which edge to
-    extend) beyond greedily taking the best of B shots.
-    """
-    cz = ctx_z.expand(B, -1, -1, -1).contiguous()   # (B, Tc, N, D)
+    cz = ctx_z.expand(B, -1, -1, -1).contiguous()    # (B, Tc, N, D)
     ca = ctx_a.expand(B, -1, -1).contiguous()        # (B, Tc, n_act)
-    best = float("-inf")
+    peak, last = float("-inf"), float("nan")
     for _ in range(max(int(depth), 1)):
         z, a = R.imagine(denoiser, cz, ca, H, B=B, K=K, ctx_noise=ctx_noise,
                          ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
                          action_prior=action_prior, dtype=dtype, generator=gen)   # (B,H,N,D)
-        best = max(best, float(reward_fn(z).max().item()))
-        cz = torch.cat([cz, z], dim=1)[:, -max_ctx:].contiguous()
+        r = reward_fn(z)                                           # (B,H) — the only decode
+        peak = max(peak, float(r.max().item()))                    # excludes the start frame, like tree_peak
+        last = float(r[:, -1].max().item())                        # this edge's terminal states; final edge wins
+        cz = torch.cat([cz, z], dim=1)[:, -max_ctx:].contiguous()  # advance ctx (== _advance_ctx)
         ca = torch.cat([ca, a], dim=1)[:, -max_ctx:].contiguous()
-    return best
+    return peak, last
+
+
+# --- the four named controls -------------------------------------------------------
+# Thin readouts over :func:`_rollout_peak_and_last`. Each call re-runs its own rollouts,
+# so use them when you want ONE number; ``compute_baselines`` instead takes both readouts
+# from a single run per control (half the model calls).
+
+def _rollout_random_peak(denoiser, reward_fn, ctx_z, ctx_a, **kw) -> float:
+    """Best reward over ANY frame of ONE no-search depth-deep rollout (undirected control)."""
+    return _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, B=1, **kw)[0]
+
+
+def _rollout_random_last(denoiser, reward_fn, ctx_z, ctx_a, **kw) -> float:
+    """Reward of the FINAL state of ONE no-search depth-deep rollout (undirected control)."""
+    return _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, B=1, **kw)[1]
+
+
+def _rollout_greedy_peak(denoiser, reward_fn, ctx_z, ctx_a, **kw) -> float:
+    """Best reward over ANY frame of ``B`` no-search depth-deep rollouts (random shooting)."""
+    return _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, **kw)[0]
+
+
+def _rollout_greedy_last(denoiser, reward_fn, ctx_z, ctx_a, **kw) -> float:
+    """Best reward over the FINAL states of ``B`` no-search depth-deep rollouts."""
+    return _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, **kw)[1]
 
 
 @torch.no_grad()
 def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: float,
-                      n_random: int = 16, seed: int = 12345, random: bool = True,
-                      greedy: bool = True) -> dict:
-    """Return the baseline peaks and planning gains for one tree.
+                      tree_last: float, n_random: int = 16, seed: int = 12345,
+                      random: bool = True, greedy: bool = True) -> dict:
+    """Return the baseline readouts and planning gains for one tree.
 
-    ``tree_peak`` is the planner's achieved peak reward (computed in run_tree). Two
-    matched-lookahead, no-search controls (both on by default):
+    ``tree_peak`` is the planner's achieved peak reward and ``tree_last`` the reward of its
+    plan's FINAL state — both computed in run_tree, and both **required**: each gain is only
+    meaningful against its own objective (``g_*`` off ``tree_peak``, ``g_*_last`` off
+    ``tree_last``), so there is no sensible default for either.
+
+    Two matched-lookahead, no-search controls (both on by default):
       ``random`` -> a single depth-deep re-conditioned rollout (undirected);
       ``greedy`` -> best of ``n_random`` depth-deep rollouts (random shooting).
+    Each control is run ONCE and read out twice (``*_peak`` and ``*_last``, see the module
+    docstring), so the terminal-objective baselines are free.
+
     ``greedy`` costs ~``n_random``x more decodes than ``random`` — disable it if you only want
     the cheap single-rollout comparison.
     """
     dev = ctx_z.device
     gen = torch.Generator(device=dev).manual_seed(seed)
     root_reward = float(reward_fn(ctx_z[:, -1:]).reshape(-1)[0].item())
-    kw = dict(K=cfg.K_steps, ctx_noise=cfg.ctx_noise, ctx_noise_honest=cfg.ctx_noise_honest,
-              action_temp=cfg.action_temp, action_prior=cfg.action_prior, dtype=cfg.dtype, gen=gen)
+    kw = dict(depth=cfg.max_depth, H=cfg.horizon, K=cfg.K_steps, ctx_noise=cfg.ctx_noise,
+              ctx_noise_honest=cfg.ctx_noise_honest, action_temp=cfg.action_temp,
+              action_prior=cfg.action_prior, dtype=cfg.dtype, max_ctx=cfg.max_ctx, gen=gen)
     out = {"root_reward": root_reward, "delta_over_root": tree_peak - root_reward}
 
     if random:  # one depth-deep re-conditioned rollout (undirected)
-        random_peak = _rollout_random_peak(denoiser, reward_fn, ctx_z, ctx_a,
-                                           depth=cfg.max_depth, H=cfg.horizon,
-                                           max_ctx=cfg.max_ctx, **kw)
-        out.update(random_peak=random_peak, g_random=tree_peak - random_peak)
+        peak, last = _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, B=1, **kw)
+        out.update(random_peak=peak, g_random=tree_peak - peak,
+                   random_last=last, g_random_last=tree_last - last)
 
     if greedy:  # best of n_random depth-deep rollouts (random shooting)
-        greedy_peak = _rollout_greedy_peak(denoiser, reward_fn, ctx_z, ctx_a,
-                                           depth=cfg.max_depth, H=cfg.horizon,
-                                           B=n_random, max_ctx=cfg.max_ctx, **kw)
-        out.update(greedy_peak=greedy_peak, g_greedy=tree_peak - greedy_peak)
+        peak, last = _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, B=n_random, **kw)
+        out.update(greedy_peak=peak, g_greedy=tree_peak - peak,
+                   greedy_last=last, g_greedy_last=tree_last - last)
 
     return out

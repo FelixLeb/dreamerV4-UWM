@@ -21,30 +21,35 @@ FACTORS = ["ctx_noise", "horizon", "sim_horizon", "branching", "action_temp",
 
 # dependent variables (did planning help?). Both baselines share the plan's lookahead &
 # construction (depth-deep, re-conditioned); g_random = vs ONE undirected rollout,
-# g_greedy = vs best-of-N random shooting.
-OUTCOMES = ["g_random", "g_greedy", "delta_over_root", "tree_peak"]
+# g_greedy = vs best-of-N random shooting. Each comes in two flavours: the PEAK objective
+# (best frame anywhere, MPC-style) and the LAST objective (the trajectory's final state).
+OUTCOMES = ["g_random", "g_greedy", "delta_over_root", "tree_peak",
+            "g_random_last", "g_greedy_last", "tree_last"]
 
 # outcome intermediates that are not themselves predictors
 _OUTCOME_AUX = ["root_reward", "random_peak", "greedy_peak", "best_node_value",
-                "best_edge_val_on_plan", "best_edge_val_tree"]
+                "best_edge_val_on_plan", "best_edge_val_tree",
+                "random_last", "greedy_last"]
 
 # gain outcomes: planning "succeeds" when these are positive (it beat the baseline).
-GAIN_OUTCOMES = ["g_random", "g_greedy", "delta_over_root"]
-PEAK_THRESHOLD = 0.7   # tree_peak >= this = reached a well-centred T (task success)
+GAIN_OUTCOMES = ["g_random", "g_greedy", "delta_over_root", "g_random_last", "g_greedy_last"]
+PEAK_THRESHOLD = 0.7   # tree_peak / tree_last >= this = reached a well-centred T (task success)
 
 
 def add_success(df: pd.DataFrame) -> List[str]:
     """Add a ``success_<outcome>`` flag for each outcome present. Gains succeed when
-    positive (planning helped over the baseline); ``tree_peak`` succeeds at the task
-    threshold (a well-centred T). Mutates ``df`` in place; returns the columns added."""
+    positive (planning helped over the matched baseline); ``tree_peak`` / ``tree_last``
+    succeed at the task threshold (a well-centred T — passed through, resp. ended on).
+    Mutates ``df`` in place; returns the columns added."""
     added = []
     for oc in GAIN_OUTCOMES:
         if oc in df.columns:
             df[f"success_{oc}"] = (df[oc] > 0).astype(int)
             added.append(f"success_{oc}")
-    if "tree_peak" in df.columns:
-        df["success_tree_peak"] = (df["tree_peak"] >= PEAK_THRESHOLD).astype(int)
-        added.append("success_tree_peak")
+    for oc in ("tree_peak", "tree_last"):
+        if oc in df.columns:
+            df[f"success_{oc}"] = (df[oc] >= PEAK_THRESHOLD).astype(int)
+            added.append(f"success_{oc}")
     return added
 
 # process metrics grouped by causal-chain link (plan §1). Only those present in the
@@ -139,11 +144,21 @@ DESCRIPTIONS = {
     "g_random": "tree_peak - random_peak: planning gain over a single undirected rollout at the plan's lookahead (horizon*max_depth, re-conditioned)",
     "g_greedy": "tree_peak - greedy_peak: search gain over best-of-N random shooting at the same lookahead",
     "delta_over_root": "tree_peak - root_reward: did the plan improve on the start state at all?",
+    # --- terminal-objective ("last") counterparts: score where the trajectory ENDS, not
+    # the best frame it passes through. Only ever compared like-with-like (last vs last).
+    "tree_last": "reward of the plan's FINAL state (last frame of its last edge)",
+    "random_last": "reward of the FINAL state of ONE depth-deep re-conditioned rollout (no search)",
+    "greedy_last": "best FINAL-state reward over N depth-deep re-conditioned rollouts (random shooting)",
+    "g_random_last": "tree_last - random_last: terminal-objective gain over a single undirected rollout",
+    "g_greedy_last": "tree_last - greedy_last: terminal-objective gain over best-of-N random shooting",
     # derived success flags (added by dataset.build via schema.add_success):
     "success_g_random": "derived label: 1 if g_random > 0 (planning beat a single undirected rollout)",
     "success_g_greedy": "derived label: 1 if g_greedy > 0 (search beat best-of-N random shooting)",
     "success_delta_over_root": "derived label: 1 if delta_over_root > 0 (plan beat the start state)",
-    "success_tree_peak": "derived label: 1 if tree_peak >= 0.7 (reached a well-centred T)",
+    "success_tree_peak": "derived label: 1 if tree_peak >= 0.7 (passed through a well-centred T)",
+    "success_g_random_last": "derived label: 1 if g_random_last > 0 (terminal objective, vs one rollout)",
+    "success_g_greedy_last": "derived label: 1 if g_greedy_last > 0 (terminal objective, vs best-of-N)",
+    "success_tree_last": "derived label: 1 if tree_last >= 0.7 (ENDED on a well-centred T)",
     "best_node_value": "highest backed-up MEAN VALUE among nodes (cumulative-sum scale)",
     "best_edge_val_tree": "max terminal edge reward found anywhere in the tree",
     "best_edge_val_on_plan": "max terminal edge reward along the returned plan path",
