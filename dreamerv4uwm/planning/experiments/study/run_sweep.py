@@ -269,7 +269,7 @@ def main(argv=None):
         n_done += 1
         if n_done % 10 == 0 or n_done == 1:
             print(f"[sweep] {n_done}/{len(jobs)} done | last={tag} "
-                  f"g_greedy={row.get('g_greedy'):+.3f} bci={row.get('root_bci')}", flush=True)
+                  f"g_greedy_peak={row.get('g_greedy_peak'):+.3f} bci={row.get('root_bci')}", flush=True)
 
     print(f"[sweep] task {args.task_id} finished: wrote {n_done} rows to {shard}", flush=True)
 

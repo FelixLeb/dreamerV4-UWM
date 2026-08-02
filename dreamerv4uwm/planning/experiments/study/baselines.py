@@ -29,12 +29,12 @@ readout costs no extra decodes (the reward is already evaluated on every frame).
 **Caveat (edge_mode).** Both baselines build edges with the ``imagine`` sampler (they respect
 ``ctx_noise`` / ``action_temp`` / ``action_prior`` but not ``edge_mode`` or the
 autoregressive-only ``action_noise``). So under ``edge_mode='two_stage'`` / ``'autoregressive'``
-the baselines still *imagine* each edge, and ``g_random`` / ``g_greedy`` then also reflect the
+the baselines still *imagine* each edge, and ``g_random_peak`` / ``g_greedy_peak`` then also reflect the
 tree's edge-sampler choice, not search alone. To isolate search under a non-default sampler,
 the baselines would need to build edges with that same sampler.
 
 Outputs (per tree): the baseline readouts ``random_peak`` / ``greedy_peak`` /
-``random_last`` / ``greedy_last``, the peak gains ``g_random`` / ``g_greedy`` (vs
+``random_last`` / ``greedy_last``, the peak gains ``g_random_peak`` / ``g_greedy_peak`` (vs
 ``tree_peak``), the terminal gains ``g_random_last`` / ``g_greedy_last`` (vs ``tree_last``),
 and ``delta_over_root``. The start/context frame is excluded from every readout, as in
 ``tree_peak``.
@@ -142,12 +142,12 @@ def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: floa
 
     if random:  # one depth-deep re-conditioned rollout (undirected)
         peak, last = _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, B=1, **kw)
-        out.update(random_peak=peak, g_random=tree_peak - peak,
+        out.update(random_peak=peak, g_random_peak=tree_peak - peak,
                    random_last=last, g_random_last=tree_last - last)
 
     if greedy:  # best of n_random depth-deep rollouts (random shooting)
         peak, last = _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, B=n_random, **kw)
-        out.update(greedy_peak=peak, g_greedy=tree_peak - peak,
+        out.update(greedy_peak=peak, g_greedy_peak=tree_peak - peak,
                    greedy_last=last, g_greedy_last=tree_last - last)
 
     return out

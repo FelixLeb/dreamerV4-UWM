@@ -114,7 +114,7 @@ def factor_outcome_table(df, factors=None, outcomes=None) -> pd.DataFrame:
                                           ascending=[True, False]).reset_index(drop=True)
 
 
-def feature_importance(df, outcome="g_random", metrics=None, n_estimators=300) -> pd.DataFrame:
+def feature_importance(df, outcome="g_random_peak", metrics=None, n_estimators=300) -> pd.DataFrame:
     """GBR permutation importance + standardized OLS beta for `outcome`."""
     from sklearn.ensemble import GradientBoostingRegressor
     from sklearn.inspection import permutation_importance
@@ -144,7 +144,7 @@ def feature_importance(df, outcome="g_random", metrics=None, n_estimators=300) -
     return tab.sort_values("gbr_importance", ascending=False).reset_index(drop=True)
 
 
-def per_regime(df, metric, outcome="g_random", regime="c_ucb", n_bins=3) -> pd.DataFrame:
+def per_regime(df, metric, outcome="g_random_peak", regime="c_ucb", n_bins=3) -> pd.DataFrame:
     """Spearman(metric, outcome) within bins of a regime column."""
     d = df.copy()
     if d[regime].nunique() <= n_bins:
@@ -166,12 +166,12 @@ def analyze(df) -> dict:
     return {
         "metric_outcome": metric_outcome_table(df),
         "factor_outcome": factor_outcome_table(df),
-        "importance_g_random": feature_importance(df, "g_random"),
-        "importance_g_greedy": feature_importance(df, "g_greedy"),
+        "importance_g_random_peak": feature_importance(df, "g_random_peak"),
+        "importance_g_greedy_peak": feature_importance(df, "g_greedy_peak"),
     }
 
 
-def headline(tables: dict, outcome="g_random", k=12) -> str:
+def headline(tables: dict, outcome="g_random_peak", k=12) -> str:
     mo = tables["metric_outcome"]
     top = mo[mo.outcome == outcome].head(k)
     lines = [f"Top {k} early-warning metrics for {outcome} (|Spearman|, MI, partial|factors):"]
@@ -190,7 +190,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     df = load_shards(args.input_dir)
     tables = analyze(df)
-    print(headline(tables, "g_random"))
+    print(headline(tables, "g_random_peak"))
     if args.out_dir:
         from pathlib import Path
         od = Path(args.out_dir); od.mkdir(parents=True, exist_ok=True)

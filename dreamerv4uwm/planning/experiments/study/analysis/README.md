@@ -82,10 +82,10 @@ Every chart is `fn(df, cols…, ax=None, save=None)` and returns a matplotlib `A
 from …analysis import dataset, charts
 df = dataset.load("trees.parquet")
 
-charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", "g_random")  # a knob sweep (mean ± SEM)
-charts.scatter(df, "edge_val_std", "g_random", color="ctx_noise")       # a metric vs the outcome
+charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", "g_random_peak")  # a knob sweep (mean ± SEM)
+charts.scatter(df, "edge_val_std", "g_random_peak", color="ctx_noise")       # a metric vs the outcome
 charts.hist(df, "root_bci")                                            # a distribution
-charts.corr_bars(df, "g_random")                                       # what predicts the outcome
+charts.corr_bars(df, "g_random_peak")                                       # what predicts the outcome
 ```
 
 Two conveniences worth knowing:
@@ -137,7 +137,7 @@ python -m …analysis.dataset --input-dir <run>/results --out <run>/analysis/tre
 
 **Make your own chart** — copy a template from `charts.py`, e.g. a knob curve for a different outcome:
 ```python
-charts.response(charts.ofat(df, "sim_horizon"), "sim_horizon", "g_greedy", save="my.png")
+charts.response(charts.ofat(df, "sim_horizon"), "sim_horizon", "g_greedy_peak", save="my.png")
 ```
 
 **A grid of every knob at once**
@@ -146,7 +146,7 @@ import matplotlib.pyplot as plt
 knobs = ["horizon", "max_depth", "ctx_noise", "sim_horizon", "branching", "c_ucb"]
 fig, axes = plt.subplots(2, 3, figsize=(13, 6))
 for ax, k in zip(axes.ravel(), knobs):
-    charts.response(charts.ofat(df, k), k, "g_random", ax=ax)
+    charts.response(charts.ofat(df, k), k, "g_random_peak", ax=ax)
 fig.tight_layout()
 ```
 
@@ -168,7 +168,7 @@ python -m …analysis.plots --parquet <run>/analysis/trees.parquet --deck
 | `dataset` | `trees.parquet` |
 | `report` | `trees.parquet`, `overview.txt`, `correlations.csv`, `figures/{predictors,outcome,mechanism,knob_<k>}.png` |
 | `plots --deck` | `fig_{knob_effects,knob_curves,ctxnoise,predictors,mechanism}.{pdf,png}`, `key_numbers.txt` |
-| `correlate --out-dir` | `metric_outcome.csv`, `factor_outcome.csv`, `importance_g_random.csv`, `importance_g_greedy.csv` |
+| `correlate --out-dir` | `metric_outcome.csv`, `factor_outcome.csv`, `importance_g_random_peak.csv`, `importance_g_greedy_peak.csv` |
 
 See **`METRICS_GUIDE.md` §7–§8** for how to read each of these outputs.
 

@@ -13,7 +13,8 @@ from . import mcts, rollout, reward
 from .rollout import policy, transition, imagine
 from .reward import (RewardFn, RewardModel, ZeroReward, GoalLatentReward,
                      CallableReward, TCenterReward, TCenterStraightReward,
-                     TCenterAngleReward, score_loc, score_t_centered,
+                     TCenterAngleReward, DINOGoalReward, load_dino,
+                     score_loc, score_t_centered,
                      score_t_centered_straight, score_t_centered_angle, annotate_t)
 from .mcts import MCTS, PlanConfig, Node
 
@@ -22,6 +23,7 @@ __all__ = [
     "policy", "transition", "imagine",
     "RewardFn", "RewardModel", "ZeroReward", "GoalLatentReward", "CallableReward",
     "TCenterReward", "TCenterStraightReward", "TCenterAngleReward",
+    "DINOGoalReward", "load_dino",
     "score_loc", "score_t_centered", "score_t_centered_straight",
     "score_t_centered_angle", "annotate_t",
     "MCTS", "PlanConfig", "Node",

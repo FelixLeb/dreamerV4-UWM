@@ -2,7 +2,7 @@
 
 ``compute_tree_metrics(planner, descriptor)`` returns a flat ``dict`` of scalars
 (one CSV row's worth) covering families A–E and the tree-internal part of F from
-``../mcts_study_plan.md``. Baselines (g_random, g_greedy) and the root reward live
+``../mcts_study_plan.md``. Baselines (g_random_peak, g_greedy_peak) and the root reward live
 in ``baselines.py`` / ``run_tree.py`` because they need the model; everything here
 is computed from the finished tree object (+ its ``trace`` for time-resolved
 metrics) and a pluggable ``StateDescriptor`` for diversity.
@@ -126,14 +126,17 @@ def _structural(planner) -> Dict[str, float]:
     n = len(nodes)
     depths = np.array([nd.depth for nd in nodes], float)
     visits = np.array([nd.n_visit for nd in nodes], float)
-    max_depth = float(depths.max()) if n else NAN
+    # NB: ``max_depth_realised``, NOT ``max_depth`` — the latter is the PlanConfig *knob* (the
+    # cap), and run_tree merges the config row and the metrics row into one flat dict. Reusing
+    # the name silently overwrote the knob with this measurement.
+    depth_realised = float(depths.max()) if n else NAN
     # visit-weighted mean depth: where the search actually spent its budget (~1 = never looks ahead)
     mean_vdepth = float((visits * depths).sum() / visits.sum()) if visits.sum() > 0 else NAN
 
     expanded = [nd for nd in nodes if nd.children]
     # realized branching: mean # of *visited* children per expanded node (vs the nominal `branching`)
     realized_b = float(np.mean([sum(c.n_visit > 0 for c in nd.children) for nd in expanded])) if expanded else NAN
-    geom_b = float(n ** (1.0 / max_depth)) if max_depth and max_depth > 0 else NAN
+    geom_b = float(n ** (1.0 / depth_realised)) if depth_realised and depth_realised > 0 else NAN
 
     sizes = [_subtree_size(c) for c in root.children] if root else []   # subtree size under each root arm
     return {
@@ -141,7 +144,7 @@ def _structural(planner) -> Dict[str, float]:
         "n_forward": float(planner.n_forward),                          # world-model calls (cost proxy)
         "n_expanded": float(len(expanded)),
         "expansion_efficiency": float((n - 1) / max(planner.n_forward, 1)),  # new structure bought per forward
-        "max_depth": max_depth,
+        "max_depth_realised": depth_realised,   # deepest node reached (<= the max_depth knob)
         "mean_visited_depth": mean_vdepth,
         "eff_branching_realized": realized_b,
         "eff_branching_geom": geom_b,
@@ -278,7 +281,7 @@ def _diversity(planner, descriptor) -> Dict[str, float]:
 
 def _outcome_internal(planner, result) -> Dict[str, float]:
     """Family F (tree-internal part only). The reward-vs-baseline gains that actually grade
-    the plan (``g_random`` etc.) need the world model and live in ``baselines.py``; here we
+    the plan (``g_random_peak`` etc.) need the world model and live in ``baselines.py``; here we
     record only quantities readable straight off the finished tree / plan path."""
     out = {"best_node_value": float(planner._best_node().value) if planner.all_nodes else NAN}
     bp = (result or {}).get("best_path") or []       # nodes on the returned root->best path

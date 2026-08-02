@@ -20,10 +20,10 @@ FACTORS = ["ctx_noise", "horizon", "sim_horizon", "branching", "action_temp",
            "K_steps", "gamma", "max_ctx", "n_min", "ctx_noise_honest"]
 
 # dependent variables (did planning help?). Both baselines share the plan's lookahead &
-# construction (depth-deep, re-conditioned); g_random = vs ONE undirected rollout,
-# g_greedy = vs best-of-N random shooting. Each comes in two flavours: the PEAK objective
+# construction (depth-deep, re-conditioned); g_random_peak = vs ONE undirected rollout,
+# g_greedy_peak = vs best-of-N random shooting. Each comes in two flavours: the PEAK objective
 # (best frame anywhere, MPC-style) and the LAST objective (the trajectory's final state).
-OUTCOMES = ["g_random", "g_greedy", "delta_over_root", "tree_peak",
+OUTCOMES = ["g_random_peak", "g_greedy_peak", "delta_over_root", "tree_peak",
             "g_random_last", "g_greedy_last", "tree_last"]
 
 # outcome intermediates that are not themselves predictors
@@ -32,7 +32,7 @@ _OUTCOME_AUX = ["root_reward", "random_peak", "greedy_peak", "best_node_value",
                 "random_last", "greedy_last"]
 
 # gain outcomes: planning "succeeds" when these are positive (it beat the baseline).
-GAIN_OUTCOMES = ["g_random", "g_greedy", "delta_over_root", "g_random_last", "g_greedy_last"]
+GAIN_OUTCOMES = ["g_random_peak", "g_greedy_peak", "delta_over_root", "g_random_last", "g_greedy_last"]
 PEAK_THRESHOLD = 0.7   # tree_peak / tree_last >= this = reached a well-centred T (task success)
 
 
@@ -69,8 +69,9 @@ LINKS = {
     "L4_selection": ["exploit_explore_ratio", "mean_explore_term", "visit_entropy",
                      "commit_top1", "visit_value_corr", "entropy_auc",
                      "reco_agreement", "selection_depth_exploration"],
+    # NB "max_depth_realised" (measured) is the metric; "max_depth" (the cap) is a FACTOR.
     "L5_structure": ["subtree_size_gini", "mean_visited_depth", "eff_branching_realized",
-                     "eff_branching_geom", "max_depth", "n_nodes", "n_expanded",
+                     "eff_branching_geom", "max_depth_realised", "n_nodes", "n_expanded",
                      "expansion_efficiency", "best_action_switches",
                      "root_value_stability"],
 }
@@ -127,7 +128,7 @@ DESCRIPTIONS = {
     "c_ucb": "UCT exploration constant",
     "gamma": "per-frame discount inside a simulation rollout",
     "n_min": "min visits for a node to be a valid returned solution",
-    "max_depth": "cap on tree depth",
+    "max_depth": "cap on tree depth (the KNOB; see max_depth_realised for what was reached)",
     "K_steps": "denoiser Euler integration steps per rollout",
     "ctx_noise": "noise mixed into the observation context (0=clean) - the diversity lever",
     "ctx_noise_honest": "tell the model the true context-noise level (vs. claim 'clean')",
@@ -141,8 +142,8 @@ DESCRIPTIONS = {
     "root_reward": "reward of the start state (last context frame)",
     "random_peak": "best reward over ONE depth-deep re-conditioned rollout (plan lookahead, one sample per edge, no search)",
     "greedy_peak": "best reward over N depth-deep re-conditioned rollouts (random shooting, best-of-N)",
-    "g_random": "tree_peak - random_peak: planning gain over a single undirected rollout at the plan's lookahead (horizon*max_depth, re-conditioned)",
-    "g_greedy": "tree_peak - greedy_peak: search gain over best-of-N random shooting at the same lookahead",
+    "g_random_peak": "tree_peak - random_peak: planning gain over a single undirected rollout at the plan's lookahead (horizon*max_depth, re-conditioned)",
+    "g_greedy_peak": "tree_peak - greedy_peak: search gain over best-of-N random shooting at the same lookahead",
     "delta_over_root": "tree_peak - root_reward: did the plan improve on the start state at all?",
     # --- terminal-objective ("last") counterparts: score where the trajectory ENDS, not
     # the best frame it passes through. Only ever compared like-with-like (last vs last).
@@ -152,8 +153,8 @@ DESCRIPTIONS = {
     "g_random_last": "tree_last - random_last: terminal-objective gain over a single undirected rollout",
     "g_greedy_last": "tree_last - greedy_last: terminal-objective gain over best-of-N random shooting",
     # derived success flags (added by dataset.build via schema.add_success):
-    "success_g_random": "derived label: 1 if g_random > 0 (planning beat a single undirected rollout)",
-    "success_g_greedy": "derived label: 1 if g_greedy > 0 (search beat best-of-N random shooting)",
+    "success_g_random_peak": "derived label: 1 if g_random_peak > 0 (planning beat a single undirected rollout)",
+    "success_g_greedy_peak": "derived label: 1 if g_greedy_peak > 0 (search beat best-of-N random shooting)",
     "success_delta_over_root": "derived label: 1 if delta_over_root > 0 (plan beat the start state)",
     "success_tree_peak": "derived label: 1 if tree_peak >= 0.7 (passed through a well-centred T)",
     "success_g_random_last": "derived label: 1 if g_random_last > 0 (terminal objective, vs one rollout)",
@@ -167,9 +168,10 @@ DESCRIPTIONS = {
     "n_forward": "batched world-model calls used (compute-cost proxy)",
     "n_expanded": "nodes that were given children",
     "expansion_efficiency": "(n_nodes-1)/n_forward: how much compute bought new structure",
+    "max_depth_realised": "deepest node depth actually reached (<= the max_depth knob)",
     "mean_visited_depth": "visit-weighted mean node depth; ~1 = shallow, never looks ahead",
     "eff_branching_realized": "mean #children with >=1 visit per expanded node (vs nominal B)",
-    "eff_branching_geom": "n_nodes^(1/max_depth): geometric branching estimate",
+    "eff_branching_geom": "n_nodes^(1/max_depth_realised): geometric branching estimate",
     "root_width": "number of root children (= branching)",
     "subtree_size_gini": "Gini of root-children subtree sizes; 0 = uniform bush, high = selective",
     "plan_len": "number of edges in the returned plan",

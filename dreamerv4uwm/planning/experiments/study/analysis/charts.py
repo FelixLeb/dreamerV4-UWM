@@ -8,11 +8,11 @@ on every chart:
 That's it. Making a new chart is a few lines of matplotlib on ``df[col]`` --- copy one
 of these as a template.
 
-    charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", "g_random")  # a knob sweep
-    charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", ["g_random", "g_greedy"])  # >1 outcome
-    charts.scatter(df, "edge_val_std", "g_random", color="ctx_noise")       # metric vs outcome
+    charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", "g_random_peak")  # a knob sweep
+    charts.response(charts.ofat(df, "ctx_noise"), "ctx_noise", ["g_random_peak", "g_greedy_peak"])  # >1 outcome
+    charts.scatter(df, "edge_val_std", "g_random_peak", color="ctx_noise")       # metric vs outcome
     charts.hist(df, "root_bci")                                             # a distribution
-    charts.corr_bars(df, "g_random")                                       # what predicts the outcome
+    charts.corr_bars(df, "g_random_peak")                                       # what predicts the outcome
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ BLUE, RED, GREY = "#4c78a8", "#e45756", "#888888"
 # columns to exclude when ranking "what predicts the outcome" (metric_cols):
 _META = {"config_id", "config_tag", "window_idx", "t0", "init_id",   # ids / bookkeeping
          "plan_seed", "plan_secs", "dtype", "edge_mode"}
-_OUTCOMES = {"g_random", "g_greedy",                                  # the outcomes themselves
+_OUTCOMES = {"g_random_peak", "g_greedy_peak",                                  # the outcomes themselves
              "delta_over_root", "tree_peak", "root_reward",
              "random_peak", "greedy_peak",
              "best_node_value", "best_edge_val_on_plan", "best_edge_val_tree"}
@@ -72,7 +72,7 @@ def response(df, factor, y, ax=None, save=None):
     labelled tick positions (so `action_prior` / `edge_mode` / `ctx_noise_honest` plot too).
 
     ``y`` may be a **single column** (one line, as before) or a **list of columns** — each is
-    drawn as its own labelled line with a legend, e.g. ``["g_random", "g_greedy"]`` to compare
+    drawn as its own labelled line with a legend, e.g. ``["g_random_peak", "g_greedy_peak"]`` to compare
     outcomes on one axis (they share the ``factor`` grouping and x-axis)."""
     ys = [y] if isinstance(y, str) else list(y)
     ax, made = _ax(ax, (5, 3.4))

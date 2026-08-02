@@ -35,7 +35,7 @@ def load(parquet) -> pd.DataFrame:
     return pd.read_parquet(parquet)
 
 
-def overview(df, outcome="g_random") -> str:
+def overview(df, outcome="g_random_peak") -> str:
     """A short text summary: sizes, ``outcome`` success rate, and any mostly-empty columns."""
     lines = [f"{len(df)} trees  |  {df.config_id.nunique()} configs  |  {df.init_id.nunique()} inits"]
     sc = f"success_{outcome}"
@@ -53,7 +53,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Build the sweep parquet from shard CSVs.")
     ap.add_argument("--input-dir", required=True, help="dir containing shard_*.csv")
     ap.add_argument("--out", required=True, help="output parquet path")
-    ap.add_argument("--outcome", default="g_random", help="which outcome's success rate to summarise")
+    ap.add_argument("--outcome", default="g_random_peak", help="which outcome's success rate to summarise")
     a = ap.parse_args(argv)
     df = build(a.input_dir, out=a.out)
     print(overview(df, a.outcome))

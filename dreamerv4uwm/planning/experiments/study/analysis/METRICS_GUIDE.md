@@ -19,7 +19,7 @@ Every row of `trees_all.parquet` / `shard_*.csv` is **one MCTS tree**. Its colum
 - **Process metrics** — properties measured *on the finished tree*: diversity, value spread, how
   visits were allocated, tree shape. These are the *candidate predictors* — cheap signals you could
   read online to tell if a tree is planning well.
-- **Outcomes** — did planning actually help (`g_random`, `g_greedy`, …). The *dependent* variables.
+- **Outcomes** — did planning actually help (`g_random_peak`, `g_greedy_peak`, …). The *dependent* variables.
 
 The analysis asks: **which process metrics (and which knobs) predict good outcomes?**
 
@@ -65,16 +65,16 @@ rollout. They differ only in **how many rollouts** they draw.
 | `root_reward` | reward of the **start** state (last context frame) | the starting point |
 | `random_peak` | best reward over **one** depth-deep re-conditioned rollout (one sample per edge) | undirected control, no search |
 | `greedy_peak` | best reward over `n_random` depth-deep re-conditioned rollouts | random shooting, best-of-N |
-| **`g_random`** | `tree_peak − random_peak` | **planning gain vs a single undirected rollout — the headline** |
-| **`g_greedy`** | `tree_peak − greedy_peak` | search gain vs best-of-N random shooting |
+| **`g_random_peak`** | `tree_peak − random_peak` | **planning gain vs a single undirected rollout — the headline** |
+| **`g_greedy_peak`** | `tree_peak − greedy_peak` | search gain vs best-of-N random shooting |
 | `delta_over_root` | `tree_peak − root_reward` | did the plan improve on the start at all? |
-| `success_<gain>` (e.g. `success_g_random`) | `1 if <gain> > 0` | one binary label per gain outcome (derived by `dataset.build`) |
+| `success_<gain>` (e.g. `success_g_random_peak`) | `1 if <gain> > 0` | one binary label per gain outcome (derived by `dataset.build`) |
 | `success_tree_peak` | `1 if tree_peak ≥ 0.7` | reached a well-centred T (derived) |
 
-**`g_random` is the main target.** `g ≤ 0` is the precise statement of "planning did nothing a
+**`g_random_peak` is the main target.** `g ≤ 0` is the precise statement of "planning did nothing a
 no-search rollout of the same lookahead couldn't do." Both baselines share the plan's lookahead
 (`horizon×max_depth`) and edge-by-edge, re-anchored construction, so `g` isolates the *search* (which
-edge to extend), not a horizon or roll-out-style advantage. `g_greedy ≤ 0` is the stronger signal: the
+edge to extend), not a horizon or roll-out-style advantage. `g_greedy_peak ≤ 0` is the stronger signal: the
 search didn't even beat **best-of-N random shooting** — the classic sign of *incoherent* edges (diverse
 but useless).
 
@@ -118,10 +118,10 @@ root expansion only, where the decision lives).
 | `n_forward` | batched world-model calls (cost proxy) | — |
 | `n_expanded` | nodes that were given children | — |
 | `expansion_efficiency` | `(n_nodes−1)/n_forward` | high = compute bought new structure |
-| `max_depth` | deepest node depth reached | deeper = looked further ahead |
+| `max_depth_realised` | deepest node depth actually reached (<= the `max_depth` knob) | deeper = looked further ahead |
 | `mean_visited_depth` | visit-weighted mean depth `ΣNᵥ·depthᵥ / ΣNᵥ` | grows with search ↔ **stuck near 1** (never commits deep) |
 | `eff_branching_realized` | mean #children with ≥1 visit, per expanded node | vs nominal `branching`; gap = wasted edges |
-| `eff_branching_geom` | `n_nodes^(1/max_depth)` | geometric branching estimate |
+| `eff_branching_geom` | `n_nodes^(1/max_depth_realised)` | geometric branching estimate |
 | `root_width` | #root children (= `branching`) | — |
 | `subtree_size_gini` | Gini of the root children's **subtree sizes** ∈[0,1] | **high = selective** (mass on good lines) ↔ 0 = uniform bush (no discrimination) |
 
@@ -188,7 +188,7 @@ K_steps, ctx_noise, ctx_noise_honest, action_temp, max_ctx`.
 `report.py` writes, per run, into `<run>/analysis/`:
 
 - **`overview.txt`** — sanity: `rows / configs / inits`, the outcome's `success rate` (e.g.
-  `g_random success rate`), and any heavily-NaN columns (a metric undefined for many trees).
+  `g_random_peak success rate`), and any heavily-NaN columns (a metric undefined for many trees).
 - **`correlations.csv`** — the **headline**: each process metric and knob's Spearman correlation with
   the chosen outcome, sorted. Read strength by \|ρ\| (see §4); this is the table behind
   `figures/predictors.png`.
@@ -203,7 +203,7 @@ The optional `correlate.py` (run separately) adds three richer tables:
   (monotone strength), `mi` (any-shape strength), `partial` (strength beyond the knobs), and its causal
   `link`. *Which cheap tree signals foretell whether planning worked.* Prefer metrics whose `partial`
   stays high (genuine online signals) and whose `link` you can act on.
-- **`importance_g_random.csv` / `importance_g_greedy.csv`** — gradient-boosted permutation importance +
+- **`importance_g_random_peak.csv` / `importance_g_greedy_peak.csv`** — gradient-boosted permutation importance +
   standardized OLS beta, using all metrics jointly (captures nonlinear + interaction value).
 
 ---
@@ -215,9 +215,9 @@ The optional `correlate.py` (run separately) adds three richer tables:
 - **`knob_<k>.png`** (e.g. `knob_ctx_noise.png`) — the outcome's **mean ± SEM vs one swept knob**, over
   that knob's OFAT slice. Read the *shape*:
   - *monotone* (e.g. `bci` ↓ as `ctx_noise` ↑) = a clean lever;
-  - *inverted-U* (e.g. `g_random` peaks mid-range) = a sweet spot — where non-monotone effects that
+  - *inverted-U* (e.g. `g_random_peak` peaks mid-range) = a sweet spot — where non-monotone effects that
     correlations miss become visible;
-  - *cliff* (e.g. `g_greedy` crashing at high noise) = a regime boundary.
+  - *cliff* (e.g. `g_greedy_peak` crashing at high noise) = a regime boundary.
   The most information-dense view on OFAT data.
 - **`predictors.png`** — horizontal bars: Spearman of each metric with the outcome, **red = −, blue = +**,
   strongest \|corr\| on top. Who predicts the outcome and in which direction.
@@ -228,15 +228,15 @@ The optional `correlate.py` (run separately) adds three richer tables:
 
 **Deck figures** (`plots.make_deck`, polished, in `../presentation/figures/`):
 
-- **`fig_knob_effects`** — effect size (max − min mean `g_random` across a knob's settings) per knob,
+- **`fig_knob_effects`** — effect size (max − min mean `g_random_peak` across a knob's settings) per knob,
   each bar labelled with its curve shape (`monotone` / `inverted-U` / `~flat`). Which knobs move planning.
 - **`fig_knob_curves`** — the 2×2 response curves (`horizon`, `max_depth`, `ctx_noise`, `sim_horizon`).
 - **`fig_ctxnoise`** — the headline story: `root_bci` rises with noise (more diverse edges) while
-  `g_random` / `g_greedy` **peak then cliff** (usefulness has a sweet spot).
-- **`fig_predictors`** — top per-tree predictors of `g_random`, bars **coloured by causal link (L1–L5)**,
+  `g_random_peak` / `g_greedy_peak` **peak then cliff** (usefulness has a sweet spot).
+- **`fig_predictors`** — top per-tree predictors of `g_random_peak`, bars **coloured by causal link (L1–L5)**,
   with the **partial** correlation (controlling for all knobs) overlaid as a diamond. Which *links*
   dominate, and which signals survive controlling for the config.
-- **`fig_mechanism`** — `edge_val_std` → mean `g_random` (left) and → planning-**success rate** (right):
+- **`fig_mechanism`** — `edge_val_std` → mean `g_random_peak` (left) and → planning-**success rate** (right):
   reward-diverse edges give better *and* more reliable planning.
 
 ---
@@ -252,7 +252,7 @@ The optional `correlate.py` (run separately) adds three richer tables:
 | `commit_top1`, `subtree_size_gini` | high | low (uniform) |
 | `exploit_explore_ratio` | moderate | ≫1 (noise) or ≪1 (greedy) |
 | `mean_visited_depth` | grows with budget | pinned ~1 |
-| `g_random`, `g_greedy` | > 0 | ≤ 0 |
+| `g_random_peak`, `g_greedy_peak` | > 0 | ≤ 0 |
 
 ---
 
@@ -260,7 +260,7 @@ The optional `correlate.py` (run separately) adds three richer tables:
 
 1. **OFAT dilutes pooled factor correlations.** A knob varied in only a few configs sits at baseline in
    most rows → weak pooled ρ even for a real effect. Use response curves / per-factor slices.
-2. **Non-monotone effects hide from Spearman.** `ctx_noise` has an inverted-U on `g_random`; its ρ≈0 but
+2. **Non-monotone effects hide from Spearman.** `ctx_noise` has an inverted-U on `g_random_peak`; its ρ≈0 but
    the *curve* and MI reveal it. Always cross-check MI and the response figure.
 3. **Cumsum value scale.** `val_std`/`Q` grow with `sim_horizon`; they mean "discrimination" only at
    fixed scale. Across `sim_horizon`, higher `val_std` can coincide with *worse* outcomes.

@@ -24,10 +24,11 @@ Two families here (for now):
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Callable, Optional, Protocol, Tuple, runtime_checkable
+from typing import Callable, Optional, Protocol, Tuple, Union, runtime_checkable
 
 import numpy as np
 import torch
+import torch.nn.functional as Fnn
 import cv2
 
 
@@ -520,3 +521,195 @@ class TCenterAngleReward(TCenterReward):
         rgb = self._rgb_batch(z[:, None])[0]
         score, dbg = score_t_centered_angle(rgb, **self.score_kwargs)
         return score, dbg, rgb
+
+# ===========================================================================
+# task-agnostic: distance to a goal in a frozen DINO embedding space
+# ===========================================================================
+
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def load_dino(name: str = "dinov2_vits14", device=None, repo: str = "facebookresearch/dinov2"):
+    """Load a frozen DINOv2 backbone from ``torch.hub`` (eval, no grads).
+
+    ``dinov2_vit{s,b,l,g}14`` — ``s`` (384-d, ~21M params) is plenty here and the cheapest.
+    Needs network access on first call (then cached in ``~/.cache/torch/hub``); on an offline
+    cluster, load the model yourself and pass the module to :class:`DINOGoalReward` directly.
+    """
+    model = torch.hub.load(repo, name)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model.eval().to(device) if device is not None else model.eval()
+
+
+class DINOGoalReward:
+    """Reward = closeness to a **goal image** in a frozen DINO embedding space.
+
+    Task-agnostic counterpart of :class:`TCenterReward`: instead of a hand-designed pixel
+    heuristic, score each state by how close its decoded frame is to a goal frame in the
+    representation of a self-supervised encoder. Nothing here knows about PushT, so moving to
+    a new environment is a change of *goal*, not of code.
+
+    Pipeline per state: ``latent -> tokenizer.decode -> resize+ImageNet-normalise -> DINO
+    -> distance to the goal embedding -> reward``.
+
+    Parameters
+    ----------
+    goal_z / goal_rgb / goal_feat
+        The goal, given exactly one of three ways: a clean **latent** ``(N_lat, D_lat)`` (the
+        usual case — encode a real target frame), an **RGB** ``uint8 (H, W, 3)`` image, or a
+        precomputed **embedding**. A latent goal is decoded and embedded once, at construction.
+    decode_fn / tokenizer
+        Same contract as :class:`TCenterReward` — either a ``lat (M,1,N,D) -> img (M,1,3,H,W)``
+        callable or a tokenizer whose ``decode`` is used under autocast.
+    model
+        A hub name (loaded via :func:`load_dino`) or an already-constructed ``nn.Module``.
+        Pass the module on offline machines.
+    feature : {'patch', 'cls', 'patch_mean'}
+        Which DINO output to compare. **``patch`` (default)** keeps the full patch grid, so the
+        embedding is *spatially* sensitive — moving the object changes it, which is what a
+        planning objective needs. ``cls`` is the compact global token (semantic, but trained to
+        be crop-invariant, so it can be nearly blind to *where* the object is). ``patch_mean``
+        pools the patches and likewise discards layout.
+    metric : {'cosine', 'l2'}
+        ``cosine`` = ``1 - cos`` on the flattened feature (in ``[0, 2]``, well-behaved in high
+        dimension). ``l2`` = Euclidean distance divided by ``sqrt(dim)`` (an RMS per-coordinate
+        distance, so the scale does not drift with ``feature`` or backbone width).
+    mode : {'gauss', 'neg'}
+        How distance becomes reward. ``gauss`` -> ``exp(-1/2 (d/sigma)^2)`` in ``[0, 1]``,
+        matching the scale of the T rewards so ``c_ucb`` keeps its meaning — **recommended**.
+        ``neg`` -> ``-d / scale``, unbounded below.
+
+    Notes
+    -----
+    * ``sigma`` must be calibrated for the chosen ``feature``/``metric``: use
+      :meth:`distances` on a batch of real latents and set ``sigma`` near the median (see
+      :meth:`suggest_sigma`). A badly-scaled ``sigma`` gives a flat reward — precisely the
+      ``val_std -> 0`` pathology the diagnostics look for.
+    * Cost is one decode **plus** one DINO forward per evaluated state. Unlike the OpenCV
+      T-segmentation this stays on the GPU, so despite the extra network it is usually not
+      slower end-to-end.
+    """
+
+    def __init__(self, *, goal_z: Optional[torch.Tensor] = None,
+                 goal_rgb: Optional[np.ndarray] = None,
+                 goal_feat: Optional[torch.Tensor] = None,
+                 decode_fn=None, tokenizer=None,
+                 model: Union[str, torch.nn.Module] = "dinov2_vits14",
+                 feature: str = "patch", metric: str = "cosine", mode: str = "gauss",
+                 sigma: float = 0.25, scale: float = 1.0, resize: int = 224,
+                 dtype: Optional[torch.dtype] = torch.bfloat16,
+                 max_batch: int = 32, device=None):
+        if decode_fn is None and tokenizer is None:
+            raise ValueError("provide decode_fn or tokenizer")
+        if sum(g is not None for g in (goal_z, goal_rgb, goal_feat)) != 1:
+            raise ValueError("provide exactly one of goal_z / goal_rgb / goal_feat")
+        if feature not in ("patch", "cls", "patch_mean"):
+            raise ValueError(f"unknown feature={feature!r} (expected patch|cls|patch_mean)")
+        if metric not in ("cosine", "l2"):
+            raise ValueError(f"unknown metric={metric!r} (expected cosine|l2)")
+        if mode not in ("gauss", "neg"):
+            raise ValueError(f"unknown mode={mode!r} (expected gauss|neg)")
+
+        self._decode_fn, self.tokenizer = decode_fn, tokenizer
+        self.feature, self.metric, self.mode = feature, metric, mode
+        self.sigma, self.scale = float(sigma), float(scale)
+        self.resize, self.dtype, self.max_batch = int(resize), dtype, int(max_batch)
+
+        if device is None:
+            device = (next(tokenizer.parameters()).device if tokenizer is not None
+                      else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = torch.device(device)
+        # DINOv2 patches are 14x14: the input side must be a multiple of 14 (224 = 16 patches).
+        if self.resize % 14:
+            raise ValueError(f"resize={self.resize} must be a multiple of 14 for DINOv2")
+        self.model = (load_dino(model, device=self.device) if isinstance(model, str)
+                      else model.eval().to(self.device))
+
+        m = torch.tensor(_IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
+        s = torch.tensor(_IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
+        self._mean, self._std = m, s
+
+        if goal_feat is not None:
+            self.goal_feat = goal_feat.to(self.device).reshape(1, -1).float()
+        elif goal_rgb is not None:
+            img = torch.from_numpy(np.ascontiguousarray(goal_rgb)).permute(2, 0, 1)[None]
+            self.goal_feat = self._embed(img.float().to(self.device) / 255.0)
+        else:
+            g = goal_z.detach()
+            while g.dim() > 2:                       # (1,1,N,D) / (1,N,D) -> (N,D)
+                g = g.squeeze(0)
+            self.goal_feat = self._embed(self._decode(g[None, None]))
+        self.dim = int(self.goal_feat.shape[-1])
+
+    # ---- plumbing ---------------------------------------------------------
+    def _decode(self, lat: torch.Tensor) -> torch.Tensor:      # (m,1,N,D) -> (m,3,H,W) in [0,1]
+        if self._decode_fn is not None:
+            return self._decode_fn(lat)[:, 0]
+        ctx = (torch.autocast(device_type="cuda", dtype=self.dtype)
+               if (self.device.type == "cuda" and self.dtype) else nullcontext())
+        with torch.no_grad(), ctx:
+            return self.tokenizer.decode(lat.to(self.device)).float().clamp(0, 1)[:, 0]
+
+    @torch.no_grad()
+    def _embed(self, imgs: torch.Tensor) -> torch.Tensor:      # (m,3,H,W) in [0,1] -> (m, dim)
+        x = imgs.to(self.device).float().clamp(0, 1)
+        if x.shape[-1] != self.resize or x.shape[-2] != self.resize:
+            x = Fnn.interpolate(x, (self.resize, self.resize), mode="bilinear", align_corners=False)
+        x = (x - self._mean) / self._std
+        ctx = (torch.autocast(device_type="cuda", dtype=self.dtype)
+               if (self.device.type == "cuda" and self.dtype) else nullcontext())
+        with ctx:
+            out = (self.model.forward_features(x) if hasattr(self.model, "forward_features")
+                   else self.model(x))
+        if isinstance(out, dict):                              # DINOv2 forward_features
+            f = (out["x_norm_clstoken"] if self.feature == "cls"
+                 else out["x_norm_patchtokens"])               # (m, n_patches, d)
+        else:
+            f = out
+        f = f.float()
+        if self.feature == "patch_mean" and f.dim() == 3:
+            f = f.mean(1)
+        return f.reshape(f.shape[0], -1)                       # flatten the patch grid if present
+
+    def _dist(self, feat: torch.Tensor) -> torch.Tensor:       # (m, dim) -> (m,)
+        g = self.goal_feat.expand_as(feat)
+        if self.metric == "cosine":
+            return 1.0 - Fnn.cosine_similarity(feat, g, dim=-1)          # in [0, 2]
+        return (feat - g).norm(dim=-1) / (feat.shape[-1] ** 0.5)         # RMS per-coordinate
+
+    # ---- the reward contract ----------------------------------------------
+    @torch.no_grad()
+    def __call__(self, z: torch.Tensor) -> torch.Tensor:
+        d = self.distances(z)
+        r = (torch.exp(-0.5 * (d / self.sigma) ** 2) if self.mode == "gauss"
+             else -d / self.scale)
+        return r.to(device=z.device, dtype=torch.float32).reshape(z.shape[:-2])
+
+    @torch.no_grad()
+    def distances(self, z: torch.Tensor) -> torch.Tensor:
+        """Raw goal distances for states ``z (..., N_lat, D_lat)`` -> ``(prod(...),)``.
+        Use this to calibrate ``sigma`` (see :meth:`suggest_sigma`)."""
+        flat = z.reshape(-1, z.shape[-2], z.shape[-1])
+        out = [self._dist(self._embed(self._decode(flat[s:s + self.max_batch][:, None])))
+               for s in range(0, flat.shape[0], self.max_batch)]
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def suggest_sigma(self, z: torch.Tensor, quantile: float = 0.5) -> float:
+        """A starting ``sigma``: the given quantile of goal distances over a batch of *real*
+        latents. At ``sigma = median`` the reward spans roughly ``[0.6, 1]`` over the states
+        you actually visit — enough spread for the values to separate."""
+        return float(self.distances(z).quantile(quantile).item())
+
+    # convenience for notebooks, mirroring the T rewards
+    @torch.no_grad()
+    def score_latent(self, z_1frame: torch.Tensor) -> Tuple[float, dict, np.ndarray]:
+        """z (N,D) or (1,1,N,D) -> (score, debug, rgb_uint8)."""
+        z = z_1frame.reshape(1, z_1frame.shape[-2], z_1frame.shape[-1])
+        img = self._decode(z[:, None])
+        d = float(self._dist(self._embed(img))[0].item())
+        score = float(np.exp(-0.5 * (d / self.sigma) ** 2)) if self.mode == "gauss" else -d / self.scale
+        rgb = (img[0].permute(1, 2, 0).clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+        return score, dict(distance=d, score=score, feature=self.feature, metric=self.metric), rgb
