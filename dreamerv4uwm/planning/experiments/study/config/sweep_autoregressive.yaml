@@ -74,6 +74,8 @@ base_plan:
   ctx_noise_honest: true
   action_temp: 1.0
   action_prior: normal      # flow prior shape: normal (action_temp*N(0,I)) | uniform (std-matched)
+  state_prior: normal       # obs noise prior the horizon state starts from, unit-scale
+                            #   (no state_temp): normal N(0,I) | uniform (std-matched)
   action_noise: 0.3         # added-action-noise magnitude (base > 0 so the dist OFAT below is live)
   action_noise_dist: normal # shape of the added noise: normal | uniform (std-matched)
   max_ctx: 16
@@ -88,6 +90,7 @@ sweep:
     ctx_noise:         [0.0, 0.5, 0.9]         # obs-context diversity lever
     action_temp:       [0.5, 1.0, 1.5]         # flow-prior dispersion
     action_prior:      [normal, uniform]       # flow-prior shape
+    state_prior:       [normal, uniform]       # obs-prior shape
     # `horizon` is left OUT of the OFAT on purpose: it scales AR cost ~linearly and would
     # make some configs much slower. Add `horizon: [8, 12, 20]` if you want it, and budget
     # `--time` for the longest.

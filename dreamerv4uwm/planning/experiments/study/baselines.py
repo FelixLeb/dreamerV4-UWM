@@ -27,8 +27,8 @@ Both are computed from the SAME rollouts and the same reward evaluation, so the 
 readout costs no extra decodes (the reward is already evaluated on every frame).
 
 **Caveat (edge_mode).** Both baselines build edges with the ``imagine`` sampler (they respect
-``ctx_noise`` / ``action_temp`` / ``action_prior`` but not ``edge_mode`` or the
-autoregressive-only ``action_noise``). So under ``edge_mode='two_stage'`` / ``'autoregressive'``
+``ctx_noise`` / ``action_temp`` / ``action_prior`` / ``state_prior`` but not ``edge_mode`` or
+the autoregressive-only ``action_noise``). So under ``edge_mode='two_stage'`` / ``'autoregressive'``
 the baselines still *imagine* each edge, and ``g_random_peak`` / ``g_greedy_peak`` then also reflect the
 tree's edge-sampler choice, not search alone. To isolate search under a non-default sampler,
 the baselines would need to build edges with that same sampler.
@@ -54,8 +54,8 @@ from ... import rollout as R
 
 @torch.no_grad()
 def _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K, ctx_noise,
-                           ctx_noise_honest, action_temp, action_prior, dtype, max_ctx,
-                           gen) -> Tuple[float, float]:
+                           ctx_noise_honest, action_temp, action_prior, state_prior, dtype,
+                           max_ctx, gen) -> Tuple[float, float]:
     """Run ``B`` no-search depth-deep rollouts; return ``(peak, last)``.
 
     ``B`` independent depth-deep trajectories in parallel: ``depth`` edges of ``H`` frames,
@@ -78,7 +78,8 @@ def _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, *, depth, H, B, K,
     for _ in range(max(int(depth), 1)):
         z, a = R.imagine(denoiser, cz, ca, H, B=B, K=K, ctx_noise=ctx_noise,
                          ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
-                         action_prior=action_prior, dtype=dtype, generator=gen)   # (B,H,N,D)
+                         action_prior=action_prior, state_prior=state_prior,
+                         dtype=dtype, generator=gen)                              # (B,H,N,D)
         r = reward_fn(z)                                           # (B,H) — the only decode
         peak = max(peak, float(r.max().item()))                    # excludes the start frame, like tree_peak
         last = float(r[:, -1].max().item())                        # this edge's terminal states; final edge wins
@@ -137,7 +138,8 @@ def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: floa
     root_reward = float(reward_fn(ctx_z[:, -1:]).reshape(-1)[0].item())
     kw = dict(depth=cfg.max_depth, H=cfg.horizon, K=cfg.K_steps, ctx_noise=cfg.ctx_noise,
               ctx_noise_honest=cfg.ctx_noise_honest, action_temp=cfg.action_temp,
-              action_prior=cfg.action_prior, dtype=cfg.dtype, max_ctx=cfg.max_ctx, gen=gen)
+              action_prior=cfg.action_prior, state_prior=cfg.state_prior,
+              dtype=cfg.dtype, max_ctx=cfg.max_ctx, gen=gen)
     out = {"root_reward": root_reward, "delta_over_root": tree_peak - root_reward}
 
     if random:  # one depth-deep re-conditioned rollout (undirected)

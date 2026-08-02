@@ -16,13 +16,19 @@ from . import schema
 
 def build(shards_dir, out=None) -> pd.DataFrame:
     """Concatenate all ``shard_*.csv`` in ``shards_dir`` into one dataframe (one row per
-    tree), drop duplicate ``(config_id, init_id)`` rows, add a ``success_<outcome>`` flag
-    for each outcome (see ``schema.add_success``), and optionally save a parquet at ``out``."""
+    tree), drop duplicate ``(config_id, init_id, plan_seed)`` rows, add a ``success_<outcome>``
+    flag for each outcome (see ``schema.add_success``), and optionally save a parquet at ``out``.
+
+    ``plan_seed`` is part of the identity: with ``n_seeds > 1`` the sweep runs several planner
+    replicates on the SAME (config, init), and they differ only by that column. Deduplicating
+    on ``(config_id, init_id)`` alone would silently discard every replicate but the first.
+    Shards predating ``n_seeds`` carry ``plan_seed == init_id``, so the key degrades cleanly."""
     files = sorted(glob.glob(str(Path(shards_dir) / "shard_*.csv")))
     if not files:
         raise FileNotFoundError(f"no shard_*.csv found in {shards_dir}")
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-    df = df.drop_duplicates(["config_id", "init_id"]).reset_index(drop=True)
+    key = [c for c in ("config_id", "init_id", "plan_seed") if c in df.columns]
+    df = df.drop_duplicates(key).reset_index(drop=True)
     schema.add_success(df)
     if out is not None:
         Path(out).parent.mkdir(parents=True, exist_ok=True)

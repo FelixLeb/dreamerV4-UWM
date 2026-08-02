@@ -35,6 +35,16 @@ same levers:
   more OOD than the Gaussian one, an alternative lever on action diversity. Affects
   action-sampling rollouts (``policy`` / ``imagine`` / ``autoregressive``), not
   ``transition`` (given actions).
+* ``state_prior`` — the same shape choice for the **observation** noise prior the
+  horizon state starts from: ``"normal"`` (default, ``N(0, I)`` — what the denoiser was
+  trained to transport) or ``"uniform"`` (``U(-sqrt(3), sqrt(3))``, std-matched). There is
+  no ``state_temp`` counterpart to ``action_temp``: the state prior is always unit-scale,
+  so this knob changes the prior's *shape* only. It affects every primitive — in
+  ``transition`` / ``imagine`` the state prior is integrated to clean, and in ``policy``
+  the horizon state is *held* at this prior, so it is what the model reads as "the future
+  is unknown". Note the latent is high-dimensional (``N_lat*D_lat``, 8192 here), where a
+  Gaussian and a std-matched uniform have near-identical norm concentration; expect a
+  weaker effect than the action-side counterpart, and read a null result as such.
 * ``action_noise`` / ``action_noise_dist`` — (``autoregressive`` only) magnitude and shape
   (``"normal"`` / ``"uniform"``) of extra noise **added** to each policy action, on top of
   the policy's own stochasticity. ``0`` = none.
@@ -97,10 +107,12 @@ def _build_context(ctx_z, ctx_a, ctx_noise, ctx_noise_honest, N, gen):
     return z_ctx, ctx_a, obs_idx
 
 
-def _scaled_noise(B, H, n_act, *, scale, dist, device, generator):
-    """``scale`` x std-matched noise. Used both as the action **prior** the flow
-    integrates from (``policy`` / ``imagine``) and as **additive** action-exploration
-    noise (``autoregressive``).
+def _scaled_noise(shape, *, scale, dist, device, generator):
+    """``scale`` x std-matched noise of shape ``shape``. Used for every noise prior in
+    this module: the action **prior** the flow integrates from (``policy`` / ``imagine``,
+    scaled by ``action_temp``), the **state** prior (``transition`` / ``imagine``, always
+    unit-scale — there is no ``state_temp``), and the **additive** action-exploration
+    noise of ``autoregressive``.
 
     * ``"normal"``  — ``scale * N(0, I)`` (std ``scale``); the prior the denoiser was
       trained with (as a prior, ``scale != 1`` is mildly OOD).
@@ -109,10 +121,10 @@ def _scaled_noise(B, H, n_act, *, scale, dist, device, generator):
       a Gaussian one).
     """
     if dist == "normal":
-        return scale * torch.randn(B, H, n_act, device=device, generator=generator)
+        return scale * torch.randn(shape, device=device, generator=generator)
     if dist == "uniform":
         a = scale * math.sqrt(3.0)
-        u = torch.rand(B, H, n_act, device=device, generator=generator)   # U(0, 1)
+        u = torch.rand(shape, device=device, generator=generator)          # U(0, 1)
         return a * (2.0 * u - 1.0)                                         # U(-a, a), std = scale
     raise ValueError(f"unknown noise dist={dist!r} (expected 'normal' or 'uniform')")
 
@@ -134,6 +146,7 @@ def policy(
     ctx_noise_honest: bool = True,
     action_temp: float = 1.0,
     action_prior: str = "normal",
+    state_prior: str = "normal",
     dtype: Optional[torch.dtype] = torch.bfloat16,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
@@ -141,6 +154,10 @@ def policy(
     ``p(a_{t:t+H} | o_{<=t})``. The horizon **state** is held at pure noise
     throughout (we don't claim to know the future observations), so only the
     actions are meaningful. Returns ``a_hor`` of shape ``(B, H, n_act)``.
+
+    ``state_prior`` shapes that held-at-noise horizon state; it is never integrated here,
+    but it *is* fed to the denoiser at every step, so it still perturbs the sampled
+    actions.
     """
     N, N_lat, D_lat, n_act = _dims(denoiser)
     device = ctx_z.device
@@ -153,8 +170,9 @@ def policy(
     z = torch.empty(B, T, N_lat, D_lat, device=device)
     a = torch.empty(B, T, n_act, device=device)
     z[:, :Tc], a[:, :Tc] = z_ctx, a_ctx
-    z[:, Tc:] = torch.randn(B, H, N_lat, D_lat, device=device, generator=generator)  # held at noise
-    a[:, Tc:] = _scaled_noise(B, H, n_act, scale=action_temp, dist=action_prior,
+    z[:, Tc:] = _scaled_noise((B, H, N_lat, D_lat), scale=1.0, dist=state_prior,   # held at noise
+                              device=device, generator=generator)
+    a[:, Tc:] = _scaled_noise((B, H, n_act), scale=action_temp, dist=action_prior,
                               device=device, generator=generator)
 
     step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
@@ -194,12 +212,17 @@ def transition(
     *,
     ctx_noise: float = 0.0,
     ctx_noise_honest: bool = True,
+    state_prior: str = "normal",
     dtype: Optional[torch.dtype] = torch.bfloat16,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """Roll the world model forward under a **given** clean action sequence.
     Horizon actions are held clean; horizon state integrates from noise to
     clean. Returns predicted ``z_hor`` of shape ``(B, H, N_lat, D_lat)``.
+
+    ``state_prior`` selects the shape of the noise prior that integration starts from
+    (``"normal"`` | std-matched ``"uniform"``). There is no action-prior knob here — the
+    actions are given.
     """
     N, N_lat, D_lat, n_act = _dims(denoiser)
     device = ctx_z.device
@@ -213,7 +236,8 @@ def transition(
     z = torch.empty(B, T, N_lat, D_lat, device=device)
     a = torch.empty(B, T, n_act, device=device)
     z[:, :Tc], a[:, :Tc] = z_ctx, a_ctx
-    z[:, Tc:] = torch.randn(B, H, N_lat, D_lat, device=device, generator=generator)
+    z[:, Tc:] = _scaled_noise((B, H, N_lat, D_lat), scale=1.0, dist=state_prior,
+                              device=device, generator=generator)
     a[:, Tc:] = actions.to(device=device, dtype=a.dtype)      # given, held clean
 
     step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
@@ -255,6 +279,7 @@ def imagine(
     ctx_noise_honest: bool = True,
     action_temp: float = 1.0,
     action_prior: str = "normal",
+    state_prior: str = "normal",
     dtype: Optional[torch.dtype] = torch.bfloat16,
     generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -265,6 +290,9 @@ def imagine(
     This is the planner's edge generator ``pi_prior``: a single object that is
     simultaneously a stochastic policy and its own forward model. Returns
     ``(z_hor, a_hor)`` with shapes ``(B, H, N_lat, D_lat)`` and ``(B, H, n_act)``.
+
+    Both priors are selectable here: ``action_prior`` (scaled by ``action_temp``) and
+    ``state_prior`` (unit-scale), each ``"normal"`` or std-matched ``"uniform"``.
     """
     N, N_lat, D_lat, n_act = _dims(denoiser)
     device = ctx_z.device
@@ -277,8 +305,9 @@ def imagine(
     z = torch.empty(B, T, N_lat, D_lat, device=device)
     a = torch.empty(B, T, n_act, device=device)
     z[:, :Tc], a[:, :Tc] = z_ctx, a_ctx
-    z[:, Tc:] = torch.randn(B, H, N_lat, D_lat, device=device, generator=generator)
-    a[:, Tc:] = _scaled_noise(B, H, n_act, scale=action_temp, dist=action_prior,
+    z[:, Tc:] = _scaled_noise((B, H, N_lat, D_lat), scale=1.0, dist=state_prior,
+                              device=device, generator=generator)
+    a[:, Tc:] = _scaled_noise((B, H, n_act), scale=action_temp, dist=action_prior,
                               device=device, generator=generator)
 
     step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
@@ -324,6 +353,7 @@ def autoregressive(
     ctx_noise_honest: bool = True,
     action_temp: float = 1.0,
     action_prior: str = "normal",
+    state_prior: str = "normal",
     action_noise: float = 0.0,
     action_noise_dist: str = "normal",
     dtype: Optional[torch.dtype] = torch.bfloat16,
@@ -344,6 +374,9 @@ def autoregressive(
     scaled_noise(action_noise, action_noise_dist)``, with ``action_noise_dist`` in
     ``{'normal', 'uniform'}`` (std-matched, see :func:`_scaled_noise`). ``0`` = none.
 
+    ``action_prior`` / ``state_prior`` are forwarded unchanged to both sub-calls, so the
+    prior shapes apply at every one of the ``H`` steps.
+
     Cost: ``2*H`` primitive rollout calls per edge (an ``H``-frame ``policy`` + ``H``-frame
     ``transition`` would be ``2``), so this is the most expensive edge sampler. ``ctx_noise``
     is applied at every step to the current (growing) context; for a clean-memory rollout
@@ -360,14 +393,16 @@ def autoregressive(
         # 1. one action from the policy (horizon 1; the policy's own future state is noise)
         a1 = policy(denoiser, cz, ca, 1, B=B, K=K, ctx_noise=ctx_noise,
                     ctx_noise_honest=ctx_noise_honest, action_temp=action_temp,
-                    action_prior=action_prior, dtype=dtype, generator=generator)   # (B,1,n_act)
+                    action_prior=action_prior, state_prior=state_prior,
+                    dtype=dtype, generator=generator)   # (B,1,n_act)
         # 2. optional additive exploration noise on the sampled action
         if action_noise and action_noise > 0.0:
-            a1 = a1 + _scaled_noise(B, 1, n_act, scale=action_noise, dist=action_noise_dist,
+            a1 = a1 + _scaled_noise((B, 1, n_act), scale=action_noise, dist=action_noise_dist,
                                     device=device, generator=generator)
         # 3. world-model step to the next state given that action (horizon 1)
         z1 = transition(denoiser, cz, ca, a1, K=K, ctx_noise=ctx_noise,
-                        ctx_noise_honest=ctx_noise_honest, dtype=dtype, generator=generator)  # (B,1,N,D)
+                        ctx_noise_honest=ctx_noise_honest, state_prior=state_prior,
+                        dtype=dtype, generator=generator)  # (B,1,N,D)
         z_out[:, h], a_out[:, h] = z1[:, 0], a1[:, 0]
         # 4. append the realized (state, action) and advance the context
         cz = torch.cat([cz, z1], dim=1)

@@ -43,7 +43,26 @@ $PY -m ...run_sweep --config .../config/sweep.yaml --task-id 0 --num-tasks 1 \
     output_dir=/scratch/mcts_run1 sweep.random.n_samples=0
 ```
 CLI overrides are OmegaConf dotlist (`key=value`), e.g. `n_inits=10 base_plan.horizon=28`.
-Re-running the same task resumes (already-done `(config_id, init_id)` rows skipped).
+Re-running the same task resumes (already-done `(config_id, init_id, plan_seed)` rows skipped).
+
+### Tiers and replicates
+- `sweep.ofat` — the OFAT **star**: one factor at a time from `base_plan`. Main effects.
+- `sweep.random.n_samples` — Tier-2 points drawn independently per factor, filling the
+  **interior** of the space. Needed for interactions, and worth several axis points per tree
+  to a surrogate model. Stage a run by appending `sweep.random.n_samples=0` for the OFAT tier
+  first, then re-running without it (resume adds only the new rows).
+- `n_seeds` — planner-RNG replicates per (config, init); `1` (default) means `plan_seed ==
+  init_id`, exactly the historic behaviour. Raising it re-plans the *same* start state under
+  independent planner draws, which is what separates config quality from seed luck. Adding
+  seeds to a finished run is just a re-run with a higher `n_seeds`.
+
+**Seed-variance run** (size the planner-RNG noise once, on the base config only):
+```bash
+$PY -m ...run_sweep --config .../config/sweep.yaml --task-id 0 --num-tasks 1 \
+    output_dir=<OUT>/seedvar sweep.ofat=null n_seeds=4
+```
+`sweep.ofat=null` collapses the grid to `base` alone (and disables the random tier). Note
+`sweep.ofat={}` does **not** work — OmegaConf merges an empty dict as a no-op.
 
 ## Run on NYU HPC (SLURM)
 `../../hpc/slurms/mcts_sweep.slurm` — array job, one GPU/task, each task loads the model

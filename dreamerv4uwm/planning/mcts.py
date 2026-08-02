@@ -73,6 +73,7 @@ class PlanConfig:
     ctx_noise_honest: bool = True # False -> lie to the denoiser about the context noise
     action_temp: float = 1.0      # temperature for sampling actions from pi_prior
     action_prior: str = "normal"  # action noise prior: "normal" (action_temp*N(0,I)) | "uniform" (std-matched)
+    state_prior: str = "normal"   # obs noise prior (unit-scale, no state_temp): "normal" | "uniform" (std-matched)
     action_noise: float = 0.0     # (edge_mode=autoregressive) magnitude of extra noise ADDED to each policy action
     action_noise_dist: str = "normal"  # (edge_mode=autoregressive) shape of that added noise: "normal" | "uniform"
     max_ctx: int = 16             # max context length (frames) to keep in the tree
@@ -175,16 +176,17 @@ class MCTS:
             a = R.policy(self.denoiser, node.ctx_z, node.ctx_a, H, B=B, K=c.K_steps,
                          ctx_noise=c.ctx_noise, ctx_noise_honest=c.ctx_noise_honest,
                          action_temp=c.action_temp, action_prior=c.action_prior,
-                         dtype=c.dtype, generator=self.gen)
+                         state_prior=c.state_prior, dtype=c.dtype, generator=self.gen)
             z = R.transition(self.denoiser, node.ctx_z, node.ctx_a, a, K=c.K_steps,
                              ctx_noise=c.ctx_noise, ctx_noise_honest=c.ctx_noise_honest,
-                             dtype=c.dtype, generator=self.gen)
+                             state_prior=c.state_prior, dtype=c.dtype, generator=self.gen)
             out = (z, a)
             self.n_forward += 2                                  # policy + transition
         elif c.edge_mode == "autoregressive":
             out = R.autoregressive(self.denoiser, node.ctx_z, node.ctx_a, H, B=B, K=c.K_steps,
                                    ctx_noise=c.ctx_noise, ctx_noise_honest=c.ctx_noise_honest,
                                    action_temp=c.action_temp, action_prior=c.action_prior,
+                                   state_prior=c.state_prior,
                                    action_noise=c.action_noise, action_noise_dist=c.action_noise_dist,
                                    dtype=c.dtype, generator=self.gen)
             self.n_forward += 2 * H                              # H*(policy + transition)
@@ -192,7 +194,7 @@ class MCTS:
             out = R.imagine(self.denoiser, node.ctx_z, node.ctx_a, H, B=B, K=c.K_steps,
                             ctx_noise=c.ctx_noise, ctx_noise_honest=c.ctx_noise_honest,
                             action_temp=c.action_temp, action_prior=c.action_prior,
-                            dtype=c.dtype, generator=self.gen)
+                            state_prior=c.state_prior, dtype=c.dtype, generator=self.gen)
             self.n_forward += 1
         return out
 

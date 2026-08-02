@@ -15,7 +15,7 @@ META = ["config_id", "config_tag", "reward_kind", "descriptor_kind", "window_idx
 
 # swept knobs (independent variables)
 FACTORS = ["ctx_noise", "horizon", "sim_horizon", "branching", "action_temp",
-           "action_prior", "action_noise", "action_noise_dist", "edge_mode",
+           "action_prior", "state_prior", "action_noise", "action_noise_dist", "edge_mode",
            "c_ucb", "max_depth", "n_iterations", "sim_rollouts",
            "K_steps", "gamma", "max_ctx", "n_min", "ctx_noise_honest"]
 
@@ -134,6 +134,7 @@ DESCRIPTIONS = {
     "ctx_noise_honest": "tell the model the true context-noise level (vs. claim 'clean')",
     "action_temp": "std of the action noise prior (sampling temperature)",
     "action_prior": "action noise-prior distribution: normal (action_temp*N(0,I)) | uniform (std-matched U)",
+    "state_prior": "obs noise-prior distribution the horizon state starts from: normal N(0,I) | uniform (std-matched, unit scale)",
     "action_noise": "(autoregressive edge only) magnitude of extra noise added to each policy action (0=none)",
     "action_noise_dist": "(autoregressive edge only) shape of that added noise: normal | uniform (std-matched)",
     "max_ctx": "max context frames kept per node",

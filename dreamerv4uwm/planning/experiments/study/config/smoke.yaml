@@ -42,6 +42,8 @@ base_plan:
   ctx_noise_honest: true
   action_temp: 1.0
   action_prior: normal     # normal (action_temp*N(0,I)) | uniform (std-matched); override: base_plan.action_prior=uniform
+  state_prior: normal       # obs noise prior the horizon state starts from, unit-scale
+                            #   (no state_temp): normal N(0,I) | uniform (std-matched)
   action_noise: 0.0        # (edge_mode=autoregressive only) magnitude of noise ADDED to each policy action
   action_noise_dist: normal # (edge_mode=autoregressive only) normal | uniform
   max_ctx: 16
@@ -49,5 +51,6 @@ base_plan:
 sweep:
   ofat:
     ctx_noise: [0.0, 0.7]     # base(0.5) + 2 perturbations = 3 configs
+    state_prior: [uniform]    # +1 config: exercises the new knob end-to-end
   random:
     n_samples: 0

@@ -6,10 +6,17 @@ dotlist overrides plus ``--task-id/--num-tasks`` for array slicing. We deliberat
 do NOT use ``@hydra.main`` here so the model's own Hydra compose
 (``model.load_world_model``) doesn't collide with an outer Hydra context.
 
-Job list = (config × initial-context), identical across all array tasks (built
-from fixed seeds), then strided by ``task_id`` so each task gets a balanced mix.
-Each task appends to ``shard_<task_id>.csv`` and skips ``(config_id, init_id)``
-rows already present (resume).
+Job list = (config × initial-context × planner-seed replicate), identical across all
+array tasks (built from fixed seeds), then strided by ``task_id`` so each task gets a
+balanced mix. Each task appends to ``shard_<task_id>.csv`` and skips
+``(config_id, init_id, plan_seed)`` rows already present (resume).
+
+``n_seeds`` (default 1) sets the number of planner-RNG replicates per (config, init).
+With 1 the plan seed *is* the init id, exactly as before; with more, each replicate
+re-plans the SAME start state under an independent planner draw, which is what lets the
+analysis separate config quality from planner-seed luck. Shards written before this
+option existed resume correctly (their ``plan_seed`` equals their ``init_id``, i.e. the
+replicate-0 key).
 
 Run:
     python -m dreamerv4uwm.planning.experiments.study.run_sweep \
@@ -84,6 +91,19 @@ def make_plan_cfg(base: dict, override: dict) -> PlanConfig:
     return PlanConfig(**kw)
 
 
+# Planner-seed replicates. The stride only has to keep replicate seeds away from the
+# init-id range (0..n_inits) and from run_tree's baseline seed offset (plan_seed + 100003);
+# 1e6 does both with room to spare.
+_SEED_STRIDE = 1_000_000
+
+
+def plan_seed_for(init_id: int, rep: int) -> int:
+    """Planner RNG seed for replicate ``rep`` of ``init_id``. ``rep=0`` returns ``init_id``
+    unchanged, so ``n_seeds=1`` reproduces the pre-``n_seeds`` behaviour bit-for-bit and
+    existing shards stay resumable."""
+    return int(init_id) + int(rep) * _SEED_STRIDE
+
+
 # ---------------------------------------------------------------------------
 # reward selection
 # ---------------------------------------------------------------------------
@@ -154,12 +174,17 @@ def build_descriptor(desc_cfg, decode, reward_kind, seg_kw):
 # ---------------------------------------------------------------------------
 
 def _done_keys(path: Path) -> set:
+    """``(config_id, init_id, plan_seed)`` of every row already in the shard. Shards written
+    before ``n_seeds`` existed carry ``plan_seed == init_id``, which is exactly the
+    replicate-0 key, so they resume unchanged (the fallback covers a shard with no such
+    column at all)."""
     if not path.exists():
         return set()
     done = set()
     with open(path, newline="") as f:
         for r in csv.DictReader(f):
-            done.add((int(r["config_id"]), int(r["init_id"])))
+            seed = r.get("plan_seed") or r["init_id"]
+            done.add((int(r["config_id"]), int(r["init_id"]), int(float(seed))))
     return done
 
 
@@ -238,25 +263,29 @@ def main(argv=None):
         inits = sample_initial_contexts(dataset, tokenizer, n=int(cfg.n_inits), Tc=int(cfg.Tc),
                                         device=device, n_actions=dims["n_actions"], seed=int(cfg.seed))
 
+    n_seeds = max(1, int(cfg.get("n_seeds", 1)))
     base = OmegaConf.to_container(cfg.base_plan, resolve=True)
     configs = build_configs(base, OmegaConf.to_container(cfg.sweep, resolve=True))
-    jobs = [(ci, tag, ov, init) for ci, (tag, ov) in enumerate(configs) for init in inits]
+    # replicates innermost -> with n_seeds=1 the job list is byte-identical to the old one
+    jobs = [(ci, tag, ov, init, plan_seed_for(init["init_id"], rep))
+            for ci, (tag, ov) in enumerate(configs) for init in inits for rep in range(n_seeds)]
     jobs = jobs[args.task_id::args.num_tasks]
     if args.limit:
         jobs = jobs[: args.limit]
-    print(f"[sweep] {len(configs)} configs x {len(inits)} inits -> {len(jobs)} jobs for this task", flush=True)
+    print(f"[sweep] {len(configs)} configs x {len(inits)} inits x {n_seeds} seed(s) "
+          f"-> {len(jobs)} jobs for this task", flush=True)
 
     shard = out_dir / f"shard_{args.task_id:04d}.csv"
     done = _done_keys(shard)
     fieldnames: List[str] = None
     n_done = 0
-    for ci, tag, ov, init in jobs:
-        if (ci, init["init_id"]) in done:
+    for ci, tag, ov, init, plan_seed in jobs:
+        if (ci, init["init_id"], plan_seed) in done:
             continue
         plan_cfg = make_plan_cfg(base, ov)
         row = run_one_tree(
             denoiser=denoiser, reward_fn=reward, descriptor=descriptor, plan_cfg=plan_cfg,
-            ctx_z=init["ctx_z"], ctx_a=init["ctx_a"], plan_seed=int(init["init_id"]),
+            ctx_z=init["ctx_z"], ctx_a=init["ctx_a"], plan_seed=plan_seed,
             meta=dict(config_id=ci, config_tag=tag, reward_kind=reward_kind,
                       descriptor_kind=descriptor_kind, window_idx=init["window_idx"],
                       t0=init["t0"], init_id=init["init_id"]),

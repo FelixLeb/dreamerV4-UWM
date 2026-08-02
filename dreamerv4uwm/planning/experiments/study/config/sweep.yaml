@@ -4,6 +4,10 @@
 output_dir: ???            # REQUIRED, e.g. /scratch/<net_id>/mcts_sweep/run1
 seed: 0                    # (random mode only) seed for initial-context sampling
 n_random: 16              # rollouts for the greedy (best-of-N shooting) baseline
+n_seeds: 1                 # planner-RNG replicates per (config, init). 1 = plan_seed == init_id
+                           # (historic behaviour). >1 adds independent planner draws on the SAME
+                           # start state, which is what separates "this config is good" from "this
+                           # config drew a lucky seed" -- see the seed-variance recipe in README.
 
 # initial contexts: a curated set (recommended) or random sampling
 inits:
@@ -62,9 +66,11 @@ base_plan:
   ctx_noise_honest: true
   action_temp: 1.0
   action_prior: normal      # action noise prior: normal (action_temp*N(0,I)) | uniform (std-matched)
+  state_prior: normal       # obs noise prior the horizon state starts from, unit-scale (no state_temp):
+                            #   normal N(0,I) | uniform (std-matched U(-sqrt3, sqrt3))
   action_noise: 0.0         # (edge_mode=autoregressive only) magnitude of noise ADDED to each policy action
   action_noise_dist: normal # (edge_mode=autoregressive only) shape of that added noise: normal | uniform
-  max_ctx: 16
+  max_ctx: 8
 
 sweep:
   # Tier 1 — one factor at a time (interpretable main effects)
@@ -75,6 +81,7 @@ sweep:
     branching:     [3, 5, 8]
     action_temp:   [0.5, 1.0, 1.5]
     action_prior:  [normal, uniform]
+    state_prior:   [normal, uniform]
     # edge_mode:     [imagine, two_stage]   # fast samplers only
     c_ucb:         [0.5, 2.0, 8.0]
     max_depth:     [2, 3, 5]
@@ -82,7 +89,14 @@ sweep:
     # NOTE: the AUTOREGRESSIVE edge sampler (and its action_noise / action_noise_dist knobs)
     # is swept SEPARATELY in config/sweep_autoregressive.yaml — it does ~2*horizon denoiser
     # passes per edge (order minutes/tree, not seconds), so it's kept out of this run.
-  # Tier 2 — random joint samples over the same grids (interactions + predictive model)
+  # Tier 2 — random joint samples over the same grids (interactions + predictive model).
+  # Each sample draws every factor independently from its grid above, so these points fill the
+  # INTERIOR of the space, unlike the OFAT star (which only walks the axes through base_plan).
+  # That interior coverage is what makes interactions identifiable and what a Bayesian-optimisation
+  # surrogate needs: per tree it is worth several axis points to a GP.
   random:
-    n_samples: 0             # set e.g. 500 for the full Tier-2 run
+    n_samples: 50            # ~50 = a good BO warm start; 500 = the full Tier-2 run of the plan doc
     seed: 0
+# STAGING (recommended): run the OFAT tier first and check the *_last noise floor before
+# committing the bigger half --- append `sweep.random.n_samples=0` to the CLI for stage 1,
+# then re-run the same command without it (already-done rows are skipped on resume).

@@ -65,6 +65,8 @@ base_plan:
   ctx_noise_honest: true
   action_temp: 1.0
   action_prior: uniform     # <-- the whole point: UNIFORM (std-matched) prior instead of normal
+  state_prior: uniform       # obs noise prior the horizon state starts from, unit-scale
+                            #   (no state_temp): normal N(0,I) | uniform (std-matched)
   action_noise: 0.0         # (edge_mode=autoregressive only) magnitude of noise ADDED to each policy action
   action_noise_dist: normal # (edge_mode=autoregressive only) shape of that added noise: normal | uniform
   max_ctx: 8
@@ -77,6 +79,7 @@ sweep:
     sim_horizon:   [4, 8, 12, 20]
     branching:     [3, 5, 8]
     action_temp:   [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
+    # state_prior:   [normal, uniform]
     # edge_mode:     [imagine, two_stage]   # fast samplers only
     c_ucb:         [0.0, 0.5, 1.0, 2.0, 8.0, 16.0]
     max_depth:     [2, 3, 5]
