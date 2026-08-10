@@ -52,7 +52,10 @@ python -m …analysis.plots --parquet <run>/analysis/trees.parquet --deck
 ```
 
 Interactive exploration is the notebook — open **[`explore_results.ipynb`](explore_results.ipynb)**,
-point its first cell at a `trees.parquet`, and run down. It only uses `dataset` + `charts` + `schema`.
+point its first cell at a run (`RUN = "<run>"`) and run down. Its `load_run` helper reads
+`<run>/analysis/trees.parquet` when that cache exists and otherwise builds it from the shards
+and writes it, so it works on a fresh sweep too. Pick the objective with `OBJ = "peak" | "last"`.
+It only uses `dataset` + `charts` + `schema` (plus `optimize.plan_frames` for the compute section).
 
 ---
 

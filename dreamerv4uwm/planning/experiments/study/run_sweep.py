@@ -70,6 +70,26 @@ def build_configs(base: dict, sweep: dict) -> List[Tuple[str, dict]]:
     return configs
 
 
+def load_round_configs(path: Path) -> List[Tuple[str, dict]]:
+    """Read a Bayesian-optimisation round file (written by ``optimize.py``) as a config list.
+
+    Format: ``meta.round`` plus a ``configs:`` list, each entry a tag and the PlanConfig
+    fields. Non-PlanConfig keys the optimiser records for provenance (``predicted_mean``,
+    ``plan_frames``, ...) are ignored here but stay in the file.
+
+    ``config_id`` is offset by ``1000 * meta.round`` so rounds written to the SAME output_dir
+    cannot collide: without it, round 2's ``config_id=0`` would match round 1's already-done
+    key and every row would be skipped as a resume hit.
+    """
+    spec = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
+    rnd = int((spec.get("meta") or {}).get("round", 0))
+    out = []
+    for i, c in enumerate(spec["configs"]):
+        tag = str(c.get("tag", f"bo.r{rnd}.{i}"))
+        out.append((tag, {k: v for k, v in c.items() if k in _PLAN_FIELDS}))
+    return out, rnd * 1000
+
+
 def _eq(a, b):
     try:
         return abs(float(a) - float(b)) < 1e-12
@@ -265,9 +285,21 @@ def main(argv=None):
 
     n_seeds = max(1, int(cfg.get("n_seeds", 1)))
     base = OmegaConf.to_container(cfg.base_plan, resolve=True)
-    configs = build_configs(base, OmegaConf.to_container(cfg.sweep, resolve=True))
+    # config list: the OFAT/random grid (default) or an explicit list from a BO round file
+    cfg_spec = cfg.get("configs", None)
+    cfg_mode = str(cfg_spec.mode) if (cfg_spec and "mode" in cfg_spec) else "grid"
+    ci_offset = 0
+    if cfg_mode == "file":
+        cpath = Path(str(cfg_spec.path))
+        if not cpath.is_absolute():
+            cpath = Path(args.config).resolve().parent / cpath
+        configs, ci_offset = load_round_configs(cpath)
+        print(f"[sweep] configs from {cpath} ({len(configs)} configs, config_id offset {ci_offset})",
+              flush=True)
+    else:
+        configs = build_configs(base, OmegaConf.to_container(cfg.sweep, resolve=True))
     # replicates innermost -> with n_seeds=1 the job list is byte-identical to the old one
-    jobs = [(ci, tag, ov, init, plan_seed_for(init["init_id"], rep))
+    jobs = [(ci + ci_offset, tag, ov, init, plan_seed_for(init["init_id"], rep))
             for ci, (tag, ov) in enumerate(configs) for init in inits for rep in range(n_seeds)]
     jobs = jobs[args.task_id::args.num_tasks]
     if args.limit:

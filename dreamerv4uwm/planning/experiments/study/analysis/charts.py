@@ -17,6 +17,7 @@ of these as a template.
 from __future__ import annotations
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 BLUE, RED, GREY = "#4c78a8", "#e45756", "#888888"
@@ -27,7 +28,11 @@ _META = {"config_id", "config_tag", "window_idx", "t0", "init_id",   # ids / boo
 _OUTCOMES = {"g_random_peak", "g_greedy_peak",                                  # the outcomes themselves
              "delta_over_root", "tree_peak", "root_reward",
              "random_peak", "greedy_peak",
-             "best_node_value", "best_edge_val_on_plan", "best_edge_val_tree"}
+             "best_node_value", "best_edge_val_on_plan", "best_edge_val_tree",
+             # terminal-objective counterparts — outcomes, NOT predictors: left in, they
+             # rank near-1 against their own peak twin and crowd out the real signals.
+             # Keep in sync with schema.OUTCOMES / schema._OUTCOME_AUX.
+             "tree_last", "random_last", "greedy_last", "g_random_last", "g_greedy_last"}
 _OTHERS = {"n_forward"}                                               # compute cost, not a diagnostic
 # (derived success_<outcome> flags are also excluded, by name prefix, in metric_cols)
 
@@ -66,27 +71,44 @@ def _done(ax, save, made):
 
 # --- charts -----------------------------------------------------------------
 
-def response(df, factor, y, ax=None, save=None):
+def response(df, factor, y, ax=None, save=None, zero_line=None):
     """Mean +/- SEM of ``y`` at each value of ``factor``. A **numeric** factor draws a line
     with error bars; a **categorical** (string/bool) factor draws error-bar points at
     labelled tick positions (so `action_prior` / `edge_mode` / `ctx_noise_honest` plot too).
 
     ``y`` may be a **single column** (one line, as before) or a **list of columns** — each is
     drawn as its own labelled line with a legend, e.g. ``["g_random_peak", "g_greedy_peak"]`` to compare
-    outcomes on one axis (they share the ``factor`` grouping and x-axis)."""
+    outcomes on one axis (they share the ``factor`` grouping and x-axis).
+
+    ``zero_line`` draws the y=0 reference. Default ``None`` = **auto**: only when the plotted
+    means straddle 0, i.e. for the *gains*, where 0 means "no better than the baseline". For a
+    bounded process metric (``visit_entropy`` in [0,1]) or an absolute reward (``tree_last``) a
+    0 line is meaningless and squashes the curve into the top of the axes. Force with
+    ``True`` / ``False``."""
     ys = [y] if isinstance(y, str) else list(y)
     ax, made = _ax(ax, (5, 3.4))
     idx = df.groupby(factor, observed=True)[ys[0]].mean().index      # same x for every outcome
     numeric = pd.api.types.is_numeric_dtype(idx)
     xpos = idx.to_numpy(float) if numeric else list(range(len(idx)))
+    means = []
     for i, yi in enumerate(ys):
         g = df.groupby(factor, observed=True)[yi]
-        ax.errorbar(xpos, g.mean().to_numpy(float), yerr=g.sem().to_numpy(float),
+        m = g.mean().to_numpy(float)
+        means.append(m)
+        ax.errorbar(xpos, m, yerr=g.sem().to_numpy(float),
                     marker="o", capsize=3, ls=("-" if numeric else "none"),
                     color=(BLUE if len(ys) == 1 else f"C{i}"), label=yi)
     if not numeric:                          # categorical: string ticks at 0,1,2,...
         ax.set_xticks(list(xpos), [str(v) for v in idx])
-    ax.axhline(0, color=GREY, lw=0.8, ls="--")
+    if zero_line is None:                    # auto: only where 0 is a meaningful reference
+        # a GAIN has a meaningful zero (= the matched baseline) even when the whole curve
+        # sits above it, so go by name first (same rule as plots._is_gain / schema.GAIN_OUTCOMES);
+        # otherwise fall back to "the data actually crosses 0".
+        allm = np.concatenate(means)
+        zero_line = (any(c.startswith(("g_", "delta_")) for c in ys)
+                     or bool(np.nanmin(allm) < 0 < np.nanmax(allm)))
+    if zero_line:
+        ax.axhline(0, color=GREY, lw=0.8, ls="--")
     ax.set(xlabel=factor, ylabel=(ys[0] if len(ys) == 1 else "value"),
            title=(f"{ys[0]} vs {factor}" if len(ys) == 1 else f"outcomes vs {factor}"))
     if len(ys) > 1:
