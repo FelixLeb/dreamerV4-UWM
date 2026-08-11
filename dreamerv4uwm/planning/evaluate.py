@@ -39,6 +39,15 @@ Outputs (per tree): the baseline readouts ``random_peak`` / ``greedy_peak`` /
 and ``delta_over_root``. The start/context frame is excluded from every readout, as in
 ``tree_peak``.
 
+The tree-side numbers these are scored against — ``tree_peak`` and ``tree_last`` — come from
+:func:`plan_peak` / :func:`plan_last`, which read them off the planner's returned ``plan_z``.
+So the whole comparison for one tree is::
+
+    out = MCTS(denoiser, reward_fn, cfg, seed=s).plan(ctx_z, ctx_a)
+    row = compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg,
+                            tree_peak=plan_peak(reward_fn, out),
+                            tree_last=plan_last(reward_fn, out))
+
 **Compare like with like.** A ``*_last`` baseline is only meaningful against the plan's
 *final* state (``tree_last``), never against ``tree_peak`` — mixing the two would score the
 planner on its best moment and the baseline on its last one.
@@ -49,7 +58,7 @@ from typing import Tuple
 
 import torch
 
-from ... import rollout as R
+from . import rollout as R
 
 
 @torch.no_grad()
@@ -113,6 +122,40 @@ def _rollout_greedy_last(denoiser, reward_fn, ctx_z, ctx_a, **kw) -> float:
     return _rollout_peak_and_last(denoiser, reward_fn, ctx_z, ctx_a, **kw)[1]
 
 
+# --- the tree side of the comparison -----------------------------------------------
+# The two numbers the baselines above are scored against, read straight off the planner's
+# returned ``plan_z`` (the state plan root -> best node, shape ``(n_edges, H, N, D)``).
+# Both return NaN when the planner produced no plan, so a degenerate tree yields NaN gains
+# rather than raising.
+
+@torch.no_grad()
+def plan_peak(reward_fn, out: dict) -> float:
+    """Best single-frame reward over ANY frame of the returned plan.
+
+    The tree-side counterpart of the ``*_peak`` baselines. ``out`` is the dict returned by
+    ``MCTS.plan``. Excludes the start/context frame (it is not part of ``plan_z``), matching
+    :func:`_rollout_peak_and_last`.
+    """
+    pz = out.get("plan_z")                       # (n_edges, H, N, D)
+    if pz is None:
+        return float("nan")
+    N, D = pz.shape[-2], pz.shape[-1]
+    return float(reward_fn(pz.reshape(-1, N, D)).max().item())
+
+
+@torch.no_grad()
+def plan_last(reward_fn, out: dict) -> float:
+    """Reward of the plan's FINAL state — the last frame of its last edge.
+
+    The terminal-objective counterpart of :func:`plan_peak` ("where the plan ends up" vs
+    "the best moment it passes through"), to be compared against the ``*_last`` baselines.
+    """
+    pz = out.get("plan_z")                       # (n_edges, H, N, D)
+    if pz is None:
+        return float("nan")
+    return float(reward_fn(pz[-1, -1:]).reshape(-1)[0].item())
+
+
 @torch.no_grad()
 def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: float,
                       tree_last: float, n_random: int = 16, seed: int = 12345,
@@ -120,9 +163,10 @@ def compute_baselines(denoiser, reward_fn, ctx_z, ctx_a, cfg, *, tree_peak: floa
     """Return the baseline readouts and planning gains for one tree.
 
     ``tree_peak`` is the planner's achieved peak reward and ``tree_last`` the reward of its
-    plan's FINAL state — both computed in run_tree, and both **required**: each gain is only
-    meaningful against its own objective (``g_*`` off ``tree_peak``, ``g_*_last`` off
-    ``tree_last``), so there is no sensible default for either.
+    plan's FINAL state — get both from :func:`plan_peak` / :func:`plan_last`. Both are
+    **required**: each gain is only meaningful against its own objective (``g_*`` off
+    ``tree_peak``, ``g_*_last`` off ``tree_last``), so there is no sensible default for
+    either.
 
     Two matched-lookahead, no-search controls (both on by default):
       ``random`` -> a single depth-deep re-conditioned rollout (undirected);

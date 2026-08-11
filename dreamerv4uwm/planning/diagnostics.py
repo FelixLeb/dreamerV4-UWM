@@ -1,15 +1,27 @@
-"""State descriptors ``phi(state)`` for diversity metrics.
+"""State descriptors ``phi(state)`` for diversity metrics — **DEBUGGING ONLY**.
 
-Diversity of the *raw* tokenised latent is not meaningful here (distance
-concentration in ~8k dims + task-irrelevant nuisance variance). We therefore
-measure diversity in a low-dimensional, task-grounded descriptor of the
-**decoded** state. See ``../../mcts_planning_diagnostics.tex`` (Family D) and
-``../mcts_study_plan.md`` (§2.D) for the rationale.
+.. warning::
+
+   Descriptor space is **not** part of the planning pipeline and must not become part
+   of it. These maps exist to *inspect* a finished search after the fact — "did the tree
+   actually reach distinguishable states, or did every sibling edge collapse onto the same
+   trajectory?" — and nothing in ``rollout.py`` / ``mcts.py`` / ``reward.py`` imports them.
+
+   The reason is that ``phi`` is hand-built around one task: decode the frame, segment the
+   red T, read its pose. A planner that searched, selected, or scored in that space would
+   be solving PushT by construction instead of using the world model, and none of it would
+   survive a change of environment. The search stays in latent space; ``phi`` is only ever
+   a measuring instrument pointed at what the search did.
+
+Diversity of the *raw* tokenised latent is not meaningful here either (distance
+concentration in ~8k dims + task-irrelevant nuisance variance), which is why the
+diagnostics drop to a low-dimensional, task-grounded descriptor of the **decoded** state
+rather than measuring in the latent directly.
 
 A ``StateDescriptor`` maps a batch of terminal latents ``(M, N_lat, D_lat)`` to
 features ``(M, d)`` plus a ``found`` mask ``(M,)`` (False = descriptor undefined
-for that state, e.g. no T visible). Everything downstream (``metrics.py``) is
-written against this interface, so a new environment/reward is a descriptor swap.
+for that state, e.g. no T visible). Diversity metrics are written against this
+interface, so diagnosing a new environment/reward is a descriptor swap.
 
 Implementations:
 * ``TPoseDescriptor``     — PushT / ``TCenterReward``: decode + segment the red T,
@@ -35,14 +47,16 @@ try:
 except Exception:  # pragma: no cover - cv2 optional for non-pushT descriptors
     cv2 = None
 
-from ...reward import score_t_centered, _t_heading
+from .reward import score_t_centered, _t_heading
 
 
 class StateDescriptor:
-    """Protocol: ``__call__(term_lat) -> (features (M,d) float32, found (M,) bool)``."""
+    """Protocol: ``__call__(term_lat) -> (features (M,d) float32, found (M,) bool)``.
+
+    Diagnostics only — never plan or select in this space (see the module docstring)."""
 
     dim: int = 0
-    dup_eps: float = 0.05  # near-duplicate threshold in feature space (see metrics.duplicate_rate)
+    dup_eps: float = 0.05  # near-duplicate threshold in feature space (for duplicate-rate metrics)
 
     def __call__(self, term_lat: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
         raise NotImplementedError
@@ -136,7 +150,7 @@ class THeadingDescriptor(TPoseDescriptor):
     ``[-pi/2, pi/2]``, so an upright and an upside-down T map to the **same** value and a
     180-degree flip contributes **zero** to the diversity distance. This descriptor
     instead uses the full **heading** ``phi`` from :func:`_t_heading` (the same
-    up/down-resolved angle :class:`~...reward.TCenterAngleReward` scores), encoded as a
+    up/down-resolved angle :class:`~.reward.TCenterAngleReward` scores), encoded as a
     circular pair::
 
         phi_feat = (cx, cy [, w*cos(phi), w*sin(phi)] [, sqrt_area])

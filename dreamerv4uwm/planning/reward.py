@@ -29,7 +29,11 @@ from typing import Callable, Optional, Protocol, Tuple, Union, runtime_checkable
 import numpy as np
 import torch
 import torch.nn.functional as Fnn
-import cv2
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - only the pixel/task rewards need it
+    cv2 = None
 
 
 # ===========================================================================
