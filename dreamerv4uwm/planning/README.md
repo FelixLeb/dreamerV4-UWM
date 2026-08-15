@@ -20,19 +20,23 @@ Three core modules — the planner and nothing else:
 | file | what it is |
 |---|---|
 | [`rollout.py`](rollout.py) | The **edge samplers**. Four batched primitives over one flow-matching idea, sharing one set of diversity knobs. |
+| [`rollout_stoch.py`](rollout_stoch.py) | The same samplers with **noise refreshment (churn)** — the fix for sibling-edge collapse. Same denoiser-forward count; `churn=0` reproduces `rollout.py` exactly. |
 | [`reward.py`](reward.py) | The **objective** — what makes one imagined state better than another. |
 | [`mcts.py`](mcts.py) | The **search**. WorldPlanner-style UCT over latent states. |
 
-Three modules around it:
+Four modules around it:
 
 | file | what it is |
 |---|---|
 | [`world.py`](world.py) | **Setup**: load denoiser + tokenizer, build a `decode_fn`, source initial contexts from real demos. |
 | [`evaluate.py`](evaluate.py) | **Readouts**: what a plan achieved (`plan_peak` / `plan_last`) and the no-search controls to measure it against (`compute_baselines`). |
+| [`diversity.py`](diversity.py) | **Edge diversity**: how many *distinct* children an expansion actually produced (Vendi Score, RE3 k-NN entropy, self-consistency fidelity). |
 | [`diagnostics.py`](diagnostics.py) | **Debugging only**: task-specific state descriptors for inspecting a finished search. Never used inside the planner. |
 
-Plus [`notebooks/`](notebooks/) (one experiment per notebook) and
-[`visualization/`](visualization/) (trace → manimgl video).
+Plus [`notebooks/`](notebooks/) (one experiment per notebook),
+[`visualization/`](visualization/) (trace → manimgl video), and
+[`edge-diversity.tex`](edge-diversity.tex) — the research plan for the sibling-collapse
+problem, which is what `rollout_stoch.py` and `diversity.py` implement the first step of.
 
 Importing `dreamerv4uwm.planning` pulls in only the three core modules — `world`
 (hydra + datasets) and `diagnostics` (cv2) are imported explicitly, so the planner stays

@@ -18,7 +18,7 @@ For every tree node we decode its world-model **state** to a pushT image; for
 every edge we decode its short **policy/world-model rollout** to a filmstrip.
 We also replay the event stream to attach a *running* metrics snapshot (visit
 entropy, value spread, edge-reward std, commit fraction) to each backprop, so
-the manim dashboard can update live. The scene ``viz_mcts_pushT_manim_v2.py``
+the manim dashboard can update live. The scene ``viz_mcts_pushT_manim.py``
 replays each trace.
 
 Output (next to this file):
@@ -195,7 +195,7 @@ def annotate_running_metrics(trace, nodes, root_id):
 
 
 # ---------------------------------------------------------------------------
-def build_regime(name, denoiser, decode, reward, cz, ca, n_act):
+def build_regime(name, denoiser, decode, reward, cz, ca):
     knobs = {**REGIMES[name]}
     cfg_plan = PlanConfig(**{**BASE, **knobs})
     print(f"\n=== {name} ===  cfg: ctx_noise={cfg_plan.ctx_noise} H={cfg_plan.horizon} "
@@ -308,7 +308,7 @@ def main():
     reward = TCenterReward(decode_fn=decode, **SCORE_KW)
 
     for name in REGIMES:
-        build_regime(name, denoiser, decode, reward, cz, ca, cfg.denoiser.n_actions)
+        build_regime(name, denoiser, decode, reward, cz, ca)
     print("\nall traces written.")
 
 
