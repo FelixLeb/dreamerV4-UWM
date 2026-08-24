@@ -35,7 +35,7 @@ try:
 except Exception:  # pragma: no cover - cv2 optional for non-pushT descriptors
     cv2 = None
 
-from ...reward import score_t_centered, _t_heading
+from ...reward import score_t_centered, _t_heading, score_t_centered_angle
 
 
 class StateDescriptor:
@@ -170,7 +170,7 @@ class THeadingDescriptor(TPoseDescriptor):
             H, W = rgb.shape[1], rgb.shape[2]
             side = float(np.sqrt(H * W))
             for k in range(rgb.shape[0]):
-                _, dbg = score_t_centered(rgb[k], **self.score_kwargs)
+                _, dbg = score_t_centered_angle(rgb[k], **self.score_kwargs)
                 phi = _t_heading(dbg["mask"]) if dbg.get("found") else float("nan")
                 # undefined pose: no T, or a mask too degenerate for a stable heading
                 if not dbg.get("found") or (self.use_theta and not np.isfinite(phi)):
