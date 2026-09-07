@@ -16,9 +16,9 @@ collapsed children look *identical* and stay amber.
 
 Render (pick a trace via MCTS_TRACE), headless:
     MCTS_TRACE=mcts_trace_branchable.json \
-        xvfb-run -a manimgl viz_mcts_pushT_manim_v2.py MCTSTreeScene -w --hd --file_name mcts_branchable
+        xvfb-run -a manimgl viz_mcts_pushT_manim.py MCTSTreeScene -w --hd --file_name mcts_branchable
     MCTS_TRACE=mcts_trace_collapsed.json  \
-        xvfb-run -a manimgl viz_mcts_pushT_manim_v2.py MCTSTreeScene -w --hd --file_name mcts_collapsed
+        xvfb-run -a manimgl viz_mcts_pushT_manim.py MCTSTreeScene -w --hd --file_name mcts_collapsed
 """
 import json
 import os

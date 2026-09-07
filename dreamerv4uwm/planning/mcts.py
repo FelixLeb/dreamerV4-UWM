@@ -33,6 +33,10 @@ highest **average** value among nodes visited more than ``n_min`` times.
 The planner can emit a structured **trace** (``trace=True``) that records every
 selection / expansion / simulation / backpropagation event, consumed by the
 manimgl visualization (``viz_mcts_manim.py``).
+
+Independently of that, every selection decision is always logged to
+``planner.ucb_log`` — one row per candidate child per scoring, splitting UCB1
+into its ``exploit`` and ``explore`` terms.
 """
 from __future__ import annotations
 
@@ -143,6 +147,8 @@ class MCTS:
         self._next_id = 0
         self.tracing = bool(trace)
         self.trace: dict = {"nodes": {}, "events": []} if trace else None
+        self._iter = 0                # index of the iteration being run (for ucb_log)
+        self.ucb_log: List[dict] = []  # one row per (child, scoring) — see _select
 
     # ---- node bookkeeping ---------------------------------------------------
     def _new_node(self, ctx_z, ctx_a, depth, parent=None,
@@ -205,21 +211,57 @@ class MCTS:
         return cz[:, -m:].contiguous(), ca[:, -m:].contiguous()
 
     # ---- 1. selection -------------------------------------------------------
-    def _ucb1(self, child: Node, parent: Node) -> float:
+    def _ucb1_terms(self, child: Node, parent: Node) -> Tuple[float, float]:
+        """The two halves of UCB1 for ``child``: ``(exploit, explore)``.
+
+        An unvisited child is scored ``+inf`` by the "try every arm once" rule;
+        for it ``exploit`` is undefined (``nan``) and ``explore`` is ``inf``.
+        """
         if child.n_visit == 0:
-            return float("inf")                          # visit every child once first
+            return float("nan"), float("inf")
         exploit = child.V_total / child.n_visit
         explore = self.cfg.c_ucb * math.sqrt(
             math.log(max(parent.n_visit, 1)) / child.n_visit)
+        return exploit, explore
+
+    def _ucb1(self, child: Node, parent: Node) -> float:
+        if child.n_visit == 0:
+            return float("inf")                          # visit every child once first
+        exploit, explore = self._ucb1_terms(child, parent)
         return exploit + explore
 
+    def _log_ucb(self, parent: Node, terms, scores, chosen: int):
+        """Record one selection decision: the UCB1 terms of *every* candidate child.
+
+        Appends one row per child to ``self.ucb_log``. The visit counts are the
+        ones the decision was actually made with (i.e. *before* this iteration's
+        backpropagation), which is what makes the log replayable as "term vs
+        n_visit" for any node.
+        """
+        for i, (ch, (exploit, explore)) in enumerate(zip(parent.children, terms)):
+            self.ucb_log.append(dict(
+                iter=self._iter, depth=ch.depth,
+                parent=parent.id, node=ch.id,
+                n_visit=ch.n_visit, parent_n_visit=parent.n_visit,
+                V_total=ch.V_total,
+                exploit=exploit, explore=explore, ucb=scores[i],
+                selected=(i == chosen)))
+
     def _select(self) -> List[Node]:
-        """Descend root -> leaf by max UCB1; return the path (inclusive)."""
+        """Descend root -> leaf by max UCB1; return the path (inclusive).
+
+        Every child scored on the way down is written to ``self.ucb_log``, so the
+        exploit / explore split of each decision can be replayed afterwards.
+        """
         path = [self.root]
         node = self.root
         while node.children:
-            scores = [self._ucb1(ch, node) for ch in node.children]
-            node = node.children[int(_argmax(scores))]
+            terms = [self._ucb1_terms(ch, node) for ch in node.children]
+            scores = [float("inf") if ch.n_visit == 0 else ex + xp
+                      for ch, (ex, xp) in zip(node.children, terms)]
+            k = int(_argmax(scores))
+            self._log_ucb(node, terms, scores, k)
+            node = node.children[k]
             path.append(node)
         if self.tracing:
             self._log(type="select", path=[n.id for n in path])
@@ -289,16 +331,20 @@ class MCTS:
             ``n_forward``  — batched denoiser calls used.
         """
         m = self.cfg.max_ctx
+        self.ucb_log = []
         self.root = self._new_node(ctx_z[:, -m:].clone(), ctx_a[:, -m:].clone(), depth=0)
         self._expand(self.root)
         if self.tracing:
             self._log(type="root", node=self.root.id)
         for i in range(self.cfg.n_iterations):
+            self._iter = i
             self._iteration()
             if verbose and (i + 1) % max(1, self.cfg.n_iterations // 5) == 0:
                 print(f"  iter {i+1:3d}/{self.cfg.n_iterations}  "
                       f"nodes={len(self.all_nodes)}  forwards={self.n_forward}")
 
+        if self.tracing:
+            self.trace["ucb"] = self.ucb_log
         best = self._best_node()
         plan_nodes = self._path_to(best)
         plan_a = torch.stack([n.edge_a for n in plan_nodes], 0) if plan_nodes else None
@@ -310,7 +356,8 @@ class MCTS:
             root=self.root, n_forward=self.n_forward,
             root_child_stats=[(c.n_visit, c.value) for c in self.root.children],
             # --- MCTS extras ---
-            plan_a=plan_a, plan_z=plan_z, best_node=best, trace=self.trace)
+            plan_a=plan_a, plan_z=plan_z, best_node=best, trace=self.trace,
+            ucb_log=self.ucb_log)
 
     def _best_node(self) -> Node:
         """Node with the highest average value among those visited > n_min times."""
@@ -318,6 +365,24 @@ class MCTS:
         if not cand:
             cand = [n for n in self.all_nodes if n.n_visit > 0 and n.parent is not None]
         return max(cand, key=lambda n: n.value)
+
+    # ---- UCB1 term history --------------------------------------------------
+    def ucb_series(self, node: "int | Node") -> dict:
+        """Every UCB1 scoring of one node, oldest first, as a dict of lists.
+
+        Keys: ``iter``, ``n_visit``, ``parent_n_visit``, ``V_total``, ``exploit``,
+        ``explore``, ``ucb``, ``selected``. One entry per time the node's parent
+        was on a selection path (its terms are only recomputed then), so
+        ``n_visit`` is non-decreasing but repeats while the node is passed over.
+
+        Plot ``explore`` / ``exploit`` against ``n_visit`` (or ``iter``) to see
+        the bonus decay and the value estimate settle.
+        """
+        nid = node.id if isinstance(node, Node) else int(node)
+        rows = [r for r in self.ucb_log if r["node"] == nid]
+        keys = ("iter", "n_visit", "parent_n_visit", "V_total",
+                "exploit", "explore", "ucb", "selected")
+        return {k: [r[k] for r in rows] for k in keys}
 
     def _path_to(self, node: Node) -> List[Node]:
         """List of nodes from the first edge under the root down to ``node``."""

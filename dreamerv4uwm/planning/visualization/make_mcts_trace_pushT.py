@@ -18,7 +18,7 @@ For every tree node we decode its world-model **state** to a pushT image; for
 every edge we decode its short **policy/world-model rollout** to a filmstrip.
 We also replay the event stream to attach a *running* metrics snapshot (visit
 entropy, value spread, edge-reward std, commit fraction) to each backprop, so
-the manim dashboard can update live. The scene ``viz_mcts_pushT_manim_v2.py``
+the manim dashboard can update live. The scene ``viz_mcts_pushT_manim.py``
 replays each trace.
 
 Output (next to this file):
@@ -42,41 +42,49 @@ from torch.nn.functional import interpolate
 from hydra import initialize_config_dir, compose
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(os.path.dirname(_HERE))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from dreamerv4uwm.models.utils import load_tokenizer, load_denoiser
 from dreamerv4uwm.datasets import ShardedHDF5Dataset
 from dreamerv4uwm.planning.mcts import MCTS, PlanConfig
-from dreamerv4uwm.planning.reward import TCenterReward, score_t_centered
+from dreamerv4uwm.planning.reward import TCenterAngleReward, TCenterReward, score_t_centered, score_t_centered_angle
 
 # --- checkpoints / data (local runtime; see local-runtime-bf16 memory) -------
 CFG_DIR = os.path.join(_REPO, "scripts", "config")
-DYN_CKPT = "/home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/blockcausal/pushT-post-train/97500.pt"
+# DYN_CKPT = "/home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/blockcausal/pushT-post-train/97500.pt"
+DYN_CKPT = '/home/mim-server/projects/felix/checkpoints/wamcl-pushT-15k.pt'
 TOK_CKPT = "/home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/tokenizer/pushT.pt"
 DATA = "/home/mim-server/datasets/pushT/h5/play"
 
 # --- notebook start context: window 1234, decision at frame t0+T_ctx ---------
-WINDOW_SEED, T0, T_CTX = 1234, 50, 8
-SCORE_KW = dict(center_xy=(0.5, 0.5), sigma=0.25)
+WINDOW_SEED, T0, T_CTX = 1111, 24, 1
+SCORE_KW = dict(center_xy=(0.5, 0.5), sigma=0.25, target_heading_deg=90.0,
+                combine='weighted_sum')  #dict(center_xy=(0.5, 0.5), sigma=0.25)
 THUMB = 132          # node thumbnail px
 STRIP_FRAMES = 8     # frames kept in an edge filmstrip
 STRIP_H = 96         # filmstrip row height px
 
 # shared search budget; only the two knobs below differ between regimes
-BASE = dict(branching=5, max_depth=3, sim_rollouts=3, action_temp=1.0,
-            n_iterations=12, K_steps=6, gamma=0.98, c_ucb=0.5, n_min=0, max_ctx=24)
+# BASE = dict(branching=5, max_depth=3, sim_rollouts=3, action_temp=1.0,
+#             n_iterations=12, K_steps=6, gamma=0.98, c_ucb=0.5, n_min=0, max_ctx=24)
+
+BASE = dict(horizon=16, branching=5, max_depth=5, sim_horizon=16, sim_rollouts=3,
+                      n_iterations=36, c_ucb=0.5, gamma=0.98, n_min=0, K_steps=8,
+                      ctx_noise=0.0, action_temp=1.0, max_ctx=3)
+
 REGIMES = {
-    "branchable": dict(horizon=28, sim_horizon=28, ctx_noise=0.7),
-    "collapsed":  dict(horizon=6,  sim_horizon=6,  ctx_noise=0.0),
+    # "branchable": dict(horizon=28, sim_horizon=28, ctx_noise=0.7),
+    # "collapsed":  dict(horizon=6,  sim_horizon=6,  ctx_noise=0.0),
+    "explore_vs_exploit": dict(),
 }
-VERDICT = {
-    "branchable": "Sibling edges reach DIFFERENT states -> UCB can choose. "
-                  "The tree branches, commits to the best child, and plans deep.",
-    "collapsed":  "Sibling edges COLLAPSE to the same state -> UCB is blind. "
-                  "Visits spread uniformly, values are flat: no real search.",
-}
+# VERDICT = {
+#     "branchable": "Sibling edges reach DIFFERENT states -> UCB can choose. "
+#                   "The tree branches, commits to the best child, and plans deep.",
+#     "collapsed":  "Sibling edges COLLAPSE to the same state -> UCB is blind. "
+#                   "Visits spread uniformly, values are flat: no real search.",
+# }
 
 device = torch.device("cuda:0")
 
@@ -215,7 +223,7 @@ def build_regime(name, denoiser, decode, reward, cz, ca, n_act):
     start_state = cz[0, -1]
     start_rgb = _to_u8(decode(start_state[None, None])[0, 0])
     _save(start_rgb, os.path.join(frame_dir, "start.png"), (THUMB, THUMB))
-    start_reward = float(score_t_centered(start_rgb, **SCORE_KW)[0])
+    start_reward = float(score_t_centered_angle(start_rgb, **SCORE_KW)[0])
 
     # decode every node state + edge rollout; stash per-node scalars
     for n in planner.all_nodes:
@@ -240,7 +248,7 @@ def build_regime(name, denoiser, decode, reward, cz, ca, n_act):
     best = out["best_node"]
     best_rgb = _to_u8(decode((best.edge_z[-1])[None, None])[0, 0])
     _save(best_rgb, os.path.join(frame_dir, "best.png"), (THUMB, THUMB))
-    best_reward = float(score_t_centered(best_rgb, **SCORE_KW)[0])
+    best_reward = float(score_t_centered_angle(best_rgb, **SCORE_KW)[0])
 
     # final whole-tree metrics
     ch = planner.root.children
@@ -251,7 +259,7 @@ def build_regime(name, denoiser, decode, reward, cz, ca, n_act):
     plan_path = [nd.id for nd in planner._path_to(best)]
 
     trace["meta"] = dict(
-        regime=name, verdict=VERDICT[name],
+        regime=name, #verdict=VERDICT[name],
         root=root_id, best_node=best.id, plan_path=plan_path,
         n_nodes=len(planner.all_nodes), n_forward=planner.n_forward,
         max_reached_depth=max(depths),
@@ -305,7 +313,7 @@ def main():
         latents = tokenizer.encode(imgs).float()
     cz = latents[:, T0:T0 + T_CTX].clone()
     ca = b["action"][:, :cfg.denoiser.n_actions][None, T0:T0 + T_CTX].to(device).clone()
-    reward = TCenterReward(decode_fn=decode, **SCORE_KW)
+    reward = TCenterAngleReward(decode_fn=decode, **SCORE_KW)
 
     for name in REGIMES:
         build_regime(name, denoiser, decode, reward, cz, ca, cfg.denoiser.n_actions)
